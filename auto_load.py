@@ -38,13 +38,19 @@ def register():
 
 def unregister():
     for cls in reversed(ordered_classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
 
     for module in modules:
         if module.__name__ == __name__:
             continue
         if hasattr(module, "unregister"):
-            module.unregister()
+            try:
+                module.unregister()
+            except Exception:
+                pass
 
 
 # Import modules
@@ -62,6 +68,8 @@ def iter_submodules(path, package_name):
 
 def iter_submodule_names(path, root=""):
     for _, module_name, is_package in pkgutil.iter_modules([str(path)]):
+        if module_name.startswith("test_"):
+            continue
         if is_package:
             sub_path = path / module_name
             sub_root = root + module_name + "."

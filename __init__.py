@@ -12,14 +12,14 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 bl_info = {
-    "name": "Science_blocks",
+    "name": "Science Blocks",
     "author": "Vimuth Wickramasinghe",
-    "description": "Use particle simulation and creates real scientific values and reports.",
-    "blender": (2, 80, 0),
-    "version": (0, 0, 1),
-    "location": "",
-    "warning": "This tool can break depending on the value you enter for the simulation",
-    "category": "Generic",
+    "description": "Industrial Discrete Element Method (DEM) particle physics engine, kinematic transmission nodes, and telemetry for planetary ball mills.",
+    "blender": (4, 0, 0),
+    "version": (1, 0, 0),
+    "location": "View3D > Sidebar > Science Blocks",
+    "warning": "",
+    "category": "Physics",
 }
 
 from . import auto_load
