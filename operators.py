@@ -1,0 +1,1433 @@
+import bpy
+from bpy.app.handlers import persistent
+import sys
+import site
+import importlib.util
+import json
+import os
+import math
+import mathutils
+import bmesh
+import subprocess
+from . import dem_solver
+
+
+def ensure_user_site_in_path():
+    """Ensure user site-packages is included in sys.path so libraries like SciPy are visible in Blender."""
+    try:
+        user_site = site.getusersitepackages()
+        if user_site and os.path.exists(user_site) and user_site not in sys.path:
+            sys.path.append(user_site)
+            importlib.invalidate_caches()
+    except Exception:
+        pass
+
+
+# Ensure user site is available upon module import
+ensure_user_site_in_path()
+
+
+def is_blend_file_saved() -> bool:
+    """Check if the active .blend file has been saved to disk."""
+    return bool(bpy.data.filepath and bpy.data.filepath.strip())
+
+
+def get_blend_file_directory() -> str:
+    """Return the folder path where the active .blend file is saved."""
+    if is_blend_file_saved():
+        return os.path.dirname(os.path.abspath(bpy.data.filepath))
+    return ""
+
+
+def get_effective_config_dir() -> str:
+    """Return the blend file directory if saved, else fallback to addon directory."""
+    blend_dir = get_blend_file_directory()
+    if blend_dir:
+        return blend_dir
+    return os.path.abspath(os.path.dirname(__file__))
+
+
+def get_blender_python_executable() -> str:
+    """Find the Python executable bundled inside Blender."""
+    candidates = [
+        os.path.join(sys.exec_prefix, "bin", "python.exe"),
+        os.path.join(sys.exec_prefix, "python.exe"),
+        os.path.join(sys.exec_prefix, "bin", "python3"),
+        os.path.join(sys.exec_prefix, "python3"),
+        sys.executable,
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return sys.executable
+
+
+@persistent
+def on_blend_save_or_load(dummy):
+    """Automatically synchronizes config_save_dir whenever a .blend file is saved or loaded."""
+    blend_dir = get_blend_file_directory()
+    if blend_dir:
+        try:
+            for scene in bpy.data.scenes:
+                props = getattr(scene, "science_blocks_props", None)
+                if props:
+                    props.config_save_dir = blend_dir
+        except Exception:
+            pass
+
+
+class SCIENCE_BLOCKS_OT_init_environment(bpy.types.Operator):
+    """Verify and initialize the local Python environment for DEM simulation."""
+    bl_idname = "science_blocks.init_environment"
+    bl_label = "Initialize Python Environment"
+    bl_description = "Check and initialize the embedded Python environment with NumPy and SciPy"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        # Ensure user site packages are accessible
+        ensure_user_site_in_path()
+
+        # Update blend file save directory
+        props.config_save_dir = get_effective_config_dir()
+        props.python_system_version = f"Python {sys.version.split()[0]} ({sys.platform})"
+
+        props.pkg_numpy_installed = bool(importlib.util.find_spec("numpy"))
+        props.pkg_scipy_installed = bool(importlib.util.find_spec("scipy"))
+        props.pkg_pandas_installed = bool(importlib.util.find_spec("pandas"))
+        props.pkg_matplotlib_installed = bool(importlib.util.find_spec("matplotlib"))
+
+        if props.pkg_numpy_installed and props.pkg_scipy_installed:
+            props.env_initialized = True
+            props.env_status_message = "Python environment verified & ready (NumPy + SciPy loaded)."
+            self.report({"INFO"}, "Science Blocks: Scientific Python environment verified successfully.")
+        elif props.pkg_numpy_installed:
+            props.env_initialized = True
+            props.env_status_message = "NumPy DEM engine verified & ready. (SciPy optional)."
+            self.report({"INFO"}, "Science Blocks: NumPy verified & ready.")
+        else:
+            props.env_initialized = False
+            props.env_status_message = "NumPy is missing. Click 'Install Missing Packages' below."
+            self.report({"WARNING"}, "Science Blocks: NumPy not found in Blender Python.")
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_install_packages(bpy.types.Operator):
+    """Install or upgrade required scientific packages (NumPy, SciPy) in Blender's Python via pip."""
+    bl_idname = "science_blocks.install_packages"
+    bl_label = "Install Required Packages (pip)"
+    bl_description = "Automatically install missing scientific packages into Blender's Python"
+
+    def execute(self, context):
+        py_exe = get_blender_python_executable()
+        self.report({"INFO"}, "Science Blocks: Checking pip and installing NumPy / SciPy...")
+
+        try:
+            # 1. Ensure pip is present
+            subprocess.run([py_exe, "-m", "ensurepip", "--user"], check=False)
+            subprocess.run([py_exe, "-m", "ensurepip"], check=False)
+
+            # 2. Try user-mode install first to avoid Program Files permission errors
+            cmd_user = [py_exe, "-m", "pip", "install", "--user", "--upgrade", "numpy", "scipy"]
+            res = subprocess.run(cmd_user, capture_output=True, text=True)
+
+            # Fallback to standard install if user-mode wasn't accepted
+            if res.returncode != 0:
+                cmd_std = [py_exe, "-m", "pip", "install", "--upgrade", "numpy", "scipy"]
+                res = subprocess.run(cmd_std, capture_output=True, text=True)
+
+            ensure_user_site_in_path()
+            importlib.invalidate_caches()
+
+            if res.returncode == 0:
+                self.report({"INFO"}, "Science Blocks: Scientific packages successfully installed!")
+                bpy.ops.science_blocks.init_environment()
+            else:
+                err_msg = res.stderr[:150] if res.stderr else "Unknown pip error"
+                self.report({"WARNING"}, f"pip installation issue: {err_msg}")
+        except Exception as e:
+            self.report({"ERROR"}, f"Installation failed: {str(e)}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_save_setup(bpy.types.Operator):
+    """Save the planetary mill setup configuration into the same directory as the Blender file."""
+    bl_idname = "science_blocks.save_setup"
+    bl_label = "Save Setup (.json)"
+    bl_description = "Save current planetary mill configuration JSON in the Blender file folder"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        is_saved = is_blend_file_saved()
+        folder = get_blend_file_directory() if is_saved else get_effective_config_dir()
+        filepath = os.path.join(folder, "planetary_mill_config.json")
+
+        # Extract RPM and gear ratio from node tree if present
+        sun_rpm = 200.0
+        jar_rpm = -300.0
+        gear_ratio = 1.5
+        invert_dir = True
+        if props.active_node_tree:
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksRPMValueNode":
+                    sun_rpm = node.rpm_constant
+                elif node.bl_idname == "ScienceBlocksGearRatioNode":
+                    gear_ratio = node.gear_ratio
+                    invert_dir = node.invert_direction
+                    ratio = node.gear_ratio if node.calc_mode == "RATIO" else (node.teeth_in / max(1, node.teeth_out))
+                    if invert_dir:
+                        ratio = -ratio
+                    jar_rpm = sun_rpm * ratio
+
+        config_data = {
+            "version": "1.0",
+            "blend_file_path": bpy.data.filepath,
+            "config_directory": folder,
+            "sun_wheel_object": props.sun_wheel_obj.name if props.sun_wheel_obj else "",
+            "jar_chamber_object": props.jar_chamber_obj.name if props.jar_chamber_obj else "",
+            "node_kinematics": {
+                "sun_rpm": sun_rpm,
+                "jar_rpm": jar_rpm,
+                "gear_ratio": gear_ratio,
+                "invert_direction": invert_dir,
+            },
+            "dem_parameters": {
+                "ball_count": props.dem_ball_count,
+                "ball_radius_mm": props.dem_ball_radius_mm,
+                "ball_density": props.dem_ball_density,
+                "restitution": props.dem_restitution,
+                "sim_frames": props.dem_sim_frames,
+            },
+            "kinematics": {
+                "live_motion_preview": props.live_motion_preview,
+                "motion_time_scale": props.motion_time_scale,
+            },
+            "telemetry_results": {
+                "is_simulated": props.dem_is_simulated,
+                "total_impacts": props.dem_total_impacts,
+                "collision_frequency_hz": props.dem_collision_freq_hz,
+                "mean_impact_energy_j": props.dem_mean_impact_energy_j,
+                "max_impact_energy_j": props.dem_max_impact_energy_j,
+                "power_watts": props.dem_power_watts,
+            },
+            "mill_dimensions": {
+                "dimension_mode": props.mill_dimension_mode,
+                "sun_radius": props.mill_sun_radius,
+                "jar_radius": props.mill_jar_radius,
+                "jar_height": props.mill_jar_height,
+            },
+            "environment": {
+                "orientation": props.mill_orientation,
+                "gravity": props.mill_gravity_value,
+                "medium": props.dem_environment,
+                "slurry_viscosity": props.dem_slurry_viscosity,
+                "slurry_density": props.dem_slurry_density,
+            },
+            "side_inspection": {
+                "active": props.show_side_jar_view,
+                "auto_show_on_select": props.side_jar_auto_show_on_select,
+                "display_mode": props.side_jar_display_mode,
+                "transparency": props.side_jar_transparency,
+                "gravity_axis": props.side_jar_gravity_axis,
+                "offset_x": props.side_jar_offset_x,
+            },
+        }
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=4)
+            props.config_save_dir = folder
+            if is_saved:
+                self.report({"INFO"}, f"Science Blocks: Saved configuration to '{filepath}' (same folder as .blend file).")
+            else:
+                self.report({"WARNING"}, f"Blender file is unsaved. Saved configuration to '{filepath}'. Save your .blend file (Ctrl+S) to store alongside it.")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to save configuration: {str(e)}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_load_setup(bpy.types.Operator):
+    """Load the planetary mill setup configuration from the Blender file directory."""
+    bl_idname = "science_blocks.load_setup"
+    bl_label = "Load Setup (.json)"
+    bl_description = "Load planetary mill configuration from JSON file in the Blender file folder"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        folder = get_blend_file_directory() if is_blend_file_saved() else get_effective_config_dir()
+        filepath = os.path.join(folder, "planetary_mill_config.json")
+
+        if not os.path.exists(filepath):
+            # Check fallback directory as well
+            fallback = os.path.join(get_effective_config_dir(), "planetary_mill_config.json")
+            if os.path.exists(fallback):
+                filepath = fallback
+            else:
+                self.report({"WARNING"}, f"Configuration not found at '{filepath}'. Please save setup first.")
+                return {"CANCELLED"}
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+
+            dem_params = config_data.get("dem_parameters", {})
+            props.dem_ball_count = dem_params.get("ball_count", props.dem_ball_count)
+            props.dem_ball_radius_mm = dem_params.get("ball_radius_mm", props.dem_ball_radius_mm)
+            props.dem_ball_density = dem_params.get("ball_density", props.dem_ball_density)
+            props.dem_restitution = dem_params.get("restitution", props.dem_restitution)
+            props.dem_sim_frames = dem_params.get("sim_frames", props.dem_sim_frames)
+
+            sun_name = config_data.get("sun_wheel_object")
+            if sun_name and sun_name in bpy.data.objects:
+                props.sun_wheel_obj = bpy.data.objects[sun_name]
+
+            jar_name = config_data.get("jar_chamber_object")
+            if jar_name and jar_name in bpy.data.objects:
+                props.jar_chamber_obj = bpy.data.objects[jar_name]
+
+            # Restore node tree values if available
+            node_kin = config_data.get("node_kinematics", {})
+            if props.active_node_tree and node_kin:
+                for node in props.active_node_tree.nodes:
+                    if node.bl_idname == "ScienceBlocksRPMValueNode" and "sun_rpm" in node_kin:
+                        node.rpm_constant = float(node_kin["sun_rpm"])
+                    elif node.bl_idname == "ScienceBlocksGearRatioNode":
+                        if "gear_ratio" in node_kin:
+                            node.gear_ratio = float(node_kin["gear_ratio"])
+                        if "invert_direction" in node_kin:
+                            node.invert_direction = bool(node_kin["invert_direction"])
+
+            # Restore telemetry if present
+            telem = config_data.get("telemetry_results", {})
+            if telem.get("is_simulated", False):
+                props.dem_is_simulated = True
+                props.dem_total_impacts = telem.get("total_impacts", 0)
+                props.dem_collision_freq_hz = telem.get("collision_frequency_hz", 0.0)
+                props.dem_mean_impact_energy_j = telem.get("mean_impact_energy_j", 0.0)
+                props.dem_max_impact_energy_j = telem.get("max_impact_energy_j", 0.0)
+                props.dem_power_watts = telem.get("power_watts", 0.0)
+
+            # Restore mill geometry dimensions
+            m_dims = config_data.get("mill_dimensions", {})
+            if m_dims:
+                props.mill_dimension_mode = m_dims.get("dimension_mode", props.mill_dimension_mode)
+                props.mill_sun_radius = m_dims.get("sun_radius", props.mill_sun_radius)
+                props.mill_jar_radius = m_dims.get("jar_radius", props.mill_jar_radius)
+                props.mill_jar_height = m_dims.get("jar_height", props.mill_jar_height)
+
+            # Restore operating environment & medium
+            env = config_data.get("environment", {})
+            if env:
+                props.mill_orientation = env.get("orientation", props.mill_orientation)
+                props.mill_gravity_value = env.get("gravity", props.mill_gravity_value)
+                props.dem_environment = env.get("medium", props.dem_environment)
+                props.dem_slurry_viscosity = env.get("slurry_viscosity", props.dem_slurry_viscosity)
+                props.dem_slurry_density = env.get("slurry_density", props.dem_slurry_density)
+
+            # Restore side inspection preferences
+            side = config_data.get("side_inspection", {})
+            if side:
+                props.show_side_jar_view = side.get("active", props.show_side_jar_view)
+                props.side_jar_auto_show_on_select = side.get("auto_show_on_select", props.side_jar_auto_show_on_select)
+                props.side_jar_display_mode = side.get("display_mode", props.side_jar_display_mode)
+                props.side_jar_transparency = side.get("transparency", props.side_jar_transparency)
+                props.side_jar_gravity_axis = side.get("gravity_axis", props.side_jar_gravity_axis)
+                props.side_jar_offset_x = side.get("offset_x", props.side_jar_offset_x)
+
+            props.config_save_dir = os.path.dirname(filepath)
+            self.report({"INFO"}, f"Science Blocks: Loaded configuration from '{filepath}'.")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to load configuration: {str(e)}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+
+class SCIENCE_BLOCKS_OT_toggle_animation(bpy.types.Operator):
+    """Play or pause viewport animation."""
+    bl_idname = "science_blocks.toggle_animation"
+    bl_label = "Play / Pause Animation"
+    bl_description = "Toggle animation playback in the 3D viewport"
+
+    def execute(self, context):
+        try:
+            bpy.ops.screen.animation_play()
+        except Exception:
+            pass
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_reset_animation(bpy.types.Operator):
+    """Rewind viewport animation to frame 1 and restore base rest poses."""
+    bl_idname = "science_blocks.reset_animation"
+    bl_label = "Rewind to Start"
+    bl_description = "Rewind playback to the start frame and restore rest poses"
+
+    def execute(self, context):
+        context.scene.frame_set(context.scene.frame_start)
+        from . import nodes
+        nodes.evaluate_kinematics_frame(context.scene)
+        arrow = bpy.data.objects.get("Gravity_Force_Arrow")
+        if arrow:
+            arrow.rotation_mode = "XYZ"
+            arrow.rotation_euler = (0.0, 0.0, 0.0)
+        context.view_layer.update()
+        self.report({"INFO"}, "Science Blocks: Rewound to start frame & rest pose restored.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_capture_base_rotation(bpy.types.Operator):
+    """Capture current 3D object orientation as the base rest pose."""
+    bl_idname = "science_blocks.capture_base_rotation"
+    bl_label = "Capture Base Rest Rotation"
+    bl_description = "Capture current object orientation as the rest pose base angles"
+
+    node_name: bpy.props.StringProperty(name="Node Name", default="")
+
+    def execute(self, context):
+        tree = getattr(getattr(context, "space_data", None), "node_tree", None)
+        if not tree and hasattr(context.scene, "science_blocks_props"):
+            tree = context.scene.science_blocks_props.active_node_tree
+
+        target_node = None
+        if tree and self.node_name and self.node_name in tree.nodes:
+            target_node = tree.nodes[self.node_name]
+        elif tree and hasattr(tree.nodes, "active"):
+            target_node = tree.nodes.active
+
+        if not target_node:
+            for grp in bpy.data.node_groups:
+                if grp.bl_idname == "ScienceBlocksNodeTree" and self.node_name in grp.nodes:
+                    target_node = grp.nodes[self.node_name]
+                    break
+
+        if not target_node or not hasattr(target_node, "get_target_object"):
+            self.report({"WARNING"}, "No valid rotation node found.")
+            return {"CANCELLED"}
+
+        obj = target_node.get_target_object()
+        if not obj:
+            self.report({"WARNING"}, "No 3D object assigned to node.")
+            return {"CANCELLED"}
+
+        target_node.base_rot_x = math.degrees(obj.rotation_euler.x)
+        target_node.base_rot_y = math.degrees(obj.rotation_euler.y)
+        target_node.base_rot_z = math.degrees(obj.rotation_euler.z)
+        target_node.has_captured_base = True
+        self.report({"INFO"}, f"Captured Rest Pose: ({target_node.base_rot_x:.1f}°, {target_node.base_rot_y:.1f}°, {target_node.base_rot_z:.1f}°)")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_open_node_editor(bpy.types.Operator):
+    """Switch an area or focus the Science Blocks Node Editor."""
+    bl_idname = "science_blocks.open_node_editor"
+    bl_label = "View Planetary Node Editor"
+    bl_description = "Open or focus the Science Blocks Node Editor"
+
+    def execute(self, context):
+        node_area = None
+        for area in context.screen.areas:
+            if area.type == "NODE_EDITOR":
+                node_area = area
+                break
+
+        props = getattr(context.scene, "science_blocks_props", None)
+
+        if node_area:
+            space = node_area.spaces.active
+            space.tree_type = "ScienceBlocksNodeTree"
+            if props and props.active_node_tree:
+                space.node_tree = props.active_node_tree
+            self.report({"INFO"}, "Science Blocks: Focused Node Editor.")
+            return {"FINISHED"}
+
+        for area in context.screen.areas:
+            if area.type in {"TIMELINE", "DOPESHEET_EDITOR", "CONSOLE", "INFO"}:
+                area.type = "NODE_EDITOR"
+                space = area.spaces.active
+                space.tree_type = "ScienceBlocksNodeTree"
+                if props and props.active_node_tree:
+                    space.node_tree = props.active_node_tree
+                self.report({"INFO"}, "Science Blocks: Switched dock area to Node Editor.")
+                return {"FINISHED"}
+
+        self.report({"INFO"}, "Science Blocks: Switch any viewport area to 'Node Editor' and select 'Science Blocks Nodes' in header.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_load_planetary_template(bpy.types.Operator):
+    """Build a complete Planetary Mill system with 3D models and wired Node Editor graph."""
+    bl_idname = "science_blocks.load_planetary_template"
+    bl_label = "Load Planetary Mill Template"
+    bl_description = "Spawn Sun Wheel, Jar Chamber, and Watchdog Host, and wire the complete node graph"
+
+    def execute(self, context):
+        # 1. Spawn Sun Wheel Plate
+        bpy.ops.mesh.primitive_cylinder_add(radius=2.0, depth=0.2, location=(0, 0, 0))
+        sun_wheel = context.active_object
+        sun_wheel.name = "Sun_Wheel_Plate"
+
+        # Sun Wheel visual indicator marker
+        bpy.ops.mesh.primitive_cube_add(size=0.2, location=(1.8, 0, 0.15))
+        sun_marker = context.active_object
+        sun_marker.name = "Sun_Indicator_Marker"
+        sun_marker.parent = sun_wheel
+        sun_marker.matrix_parent_inverse = sun_wheel.matrix_world.inverted()
+
+        # 2. Spawn Grinding Jar Chamber (at radius R = 1.3m)
+        bpy.ops.mesh.primitive_cylinder_add(radius=0.45, depth=1.1, location=(1.3, 0, 0.65))
+        jar_chamber = context.active_object
+        jar_chamber.name = "Jar_Chamber"
+        jar_chamber.parent = sun_wheel
+        jar_chamber.matrix_parent_inverse = sun_wheel.matrix_world.inverted()
+
+        # Jar visual directional pointer arm
+        bpy.ops.mesh.primitive_cube_add(size=0.15, scale=(2.5, 0.5, 0.5), location=(1.6, 0, 1.2))
+        jar_pointer = context.active_object
+        jar_pointer.name = "Jar_Direction_Pointer"
+        jar_pointer.parent = jar_chamber
+        jar_pointer.matrix_parent_inverse = jar_chamber.matrix_world.inverted()
+
+        # 3. Create Internal Watchdog Domain Cube (Host for simulation solver bounds)
+        bpy.ops.mesh.primitive_cube_add(size=4.8, location=(0, 0, 0.7))
+        watchdog_cube = context.active_object
+        watchdog_cube.name = "Watchdog_Domain_Cube"
+        watchdog_cube.display_type = "WIRE"
+        watchdog_cube.hide_render = True
+
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props:
+            props.sun_wheel_obj = sun_wheel
+            props.jar_chamber_obj = jar_chamber
+            props.live_motion_preview = True
+
+        # 4. Generate Movement Simulation Node Graph
+        tree = bpy.data.node_groups.new(name="Planetary_Mill_Simulation", type="ScienceBlocksNodeTree")
+        if props:
+            props.active_node_tree = tree
+
+        # Node A: Sun Wheel Object Input
+        node_sun_obj = tree.nodes.new("ScienceBlocksObjectNode")
+        node_sun_obj.label = "Sun Wheel (Mechanism)"
+        node_sun_obj.location = (-750, 300)
+        node_sun_obj.target_object = sun_wheel
+        node_sun_obj.object_role = "SUN_WHEEL"
+
+        # Node B: Jar Chamber Object Input
+        node_jar_obj = tree.nodes.new("ScienceBlocksObjectNode")
+        node_jar_obj.label = "Grinding Jar (Chamber)"
+        node_jar_obj.location = (-750, -100)
+        node_jar_obj.target_object = jar_chamber
+        node_jar_obj.object_role = "JAR"
+
+        # Node C: Variable RPM Source (200 RPM)
+        node_rpm = tree.nodes.new("ScienceBlocksRPMValueNode")
+        node_rpm.label = "Drive Speed (200 RPM)"
+        node_rpm.location = (-750, 100)
+        node_rpm.rpm_constant = 200.0
+
+        # Node D: Gear Transmission (1.5x Invert -> 300 RPM CCW)
+        node_gear = tree.nodes.new("ScienceBlocksGearRatioNode")
+        node_gear.label = "Transmission (1.5x Invert)"
+        node_gear.location = (-480, 50)
+        node_gear.gear_ratio = 1.5
+        node_gear.invert_direction = True
+
+        # Node E: Sun Wheel Rotation Node (CW) with captured rest pose
+        node_rot_sun = tree.nodes.new("ScienceBlocksRotationNode")
+        node_rot_sun.label = "Sun Wheel Rotation (CW)"
+        node_rot_sun.location = (-200, 250)
+        node_rot_sun.target_object = sun_wheel
+        node_rot_sun.direction = "CW"
+        node_rot_sun.rotation_axis = "Z"
+        node_rot_sun.base_rot_x = math.degrees(sun_wheel.rotation_euler.x)
+        node_rot_sun.base_rot_y = math.degrees(sun_wheel.rotation_euler.y)
+        node_rot_sun.base_rot_z = math.degrees(sun_wheel.rotation_euler.z)
+        node_rot_sun.has_captured_base = True
+
+        # Node F: Jar Chamber Counter-Rotation Node (CCW) with captured rest pose
+        node_rot_jar = tree.nodes.new("ScienceBlocksRotationNode")
+        node_rot_jar.label = "Jar Counter-Rotation (CCW)"
+        node_rot_jar.location = (-200, -50)
+        node_rot_jar.target_object = jar_chamber
+        node_rot_jar.direction = "CCW"
+        node_rot_jar.rotation_axis = "Z"
+        node_rot_jar.base_rot_x = math.degrees(jar_chamber.rotation_euler.x)
+        node_rot_jar.base_rot_y = math.degrees(jar_chamber.rotation_euler.y)
+        node_rot_jar.base_rot_z = math.degrees(jar_chamber.rotation_euler.z)
+        node_rot_jar.has_captured_base = True
+
+        # Wire Connections:
+        # 1. RPM to Rotations & Transmission
+        tree.links.new(node_rpm.outputs["RPM"], node_rot_sun.inputs["RPM"])
+        tree.links.new(node_rpm.outputs["RPM"], node_gear.inputs["RPM In"])
+        tree.links.new(node_gear.outputs["RPM Out"], node_rot_jar.inputs["RPM"])
+
+        # 2. Objects to Rotations
+        tree.links.new(node_sun_obj.outputs["Object"], node_rot_sun.inputs["Object In"])
+        tree.links.new(node_jar_obj.outputs["Object"], node_rot_jar.inputs["Object In"])
+
+        # Timeline setup
+        context.scene.frame_start = 1
+        context.scene.frame_end = 150
+        context.scene.frame_set(1)
+
+        # Focus Node Editor
+        bpy.ops.science_blocks.open_node_editor()
+
+        self.report({"INFO"}, "Science Blocks: Planetary Mill template generated with complete 3D models and movement nodes.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_apply_material_preset(bpy.types.Operator):
+    """Apply physical constants for selected grinding media material."""
+    bl_idname = "science_blocks.apply_material_preset"
+    bl_label = "Apply Material Preset"
+    bl_description = "Apply standard scientific density, Young's modulus, Poisson's ratio, and friction"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+        presets = {
+            "STEEL": {"density": 7850.0, "modulus": 210.0, "poisson": 0.30, "restitution": 0.82, "friction": 0.20, "rolling": 0.05},
+            "ZIRCONIA": {"density": 6050.0, "modulus": 220.0, "poisson": 0.31, "restitution": 0.88, "friction": 0.15, "rolling": 0.03},
+            "TUNGSTEN": {"density": 14900.0, "modulus": 630.0, "poisson": 0.22, "restitution": 0.78, "friction": 0.22, "rolling": 0.06},
+            "AGATE": {"density": 2650.0, "modulus": 75.0, "poisson": 0.17, "restitution": 0.70, "friction": 0.25, "rolling": 0.08},
+            "SILICON_NITRIDE": {"density": 3200.0, "modulus": 310.0, "poisson": 0.24, "restitution": 0.85, "friction": 0.18, "rolling": 0.04},
+        }
+        p = presets.get(props.dem_material_preset)
+        if p:
+            props.dem_ball_density = p["density"]
+            props.dem_youngs_modulus_gpa = p["modulus"]
+            props.dem_poissons_ratio = p["poisson"]
+            props.dem_restitution = p["restitution"]
+            props.dem_static_friction = p["friction"]
+            props.dem_rolling_friction = p["rolling"]
+            self.report({"INFO"}, f"Applied physical preset: {props.dem_material_preset}")
+        return {"FINISHED"}
+
+
+def compute_effective_mill_geometry(sun_obj, jar_obj, props):
+    """Calculates actual engineering dimensions (R_sun, R_jar, H_jar) from models or manual inputs, invariant to 3D rotation."""
+    r_sun = float(getattr(props, "mill_sun_radius", 1.3))
+    r_jar = float(getattr(props, "mill_jar_radius", 0.42))
+    h_jar = float(getattr(props, "mill_jar_height", 1.0))
+
+    if getattr(props, "mill_dimension_mode", "AUTO") == "AUTO" and jar_obj:
+        try:
+            # 1. Jar dimensions from local bounding box (invariant to any 3D rotation)
+            if hasattr(jar_obj, "bound_box") and jar_obj.bound_box:
+                bb = jar_obj.bound_box
+                dx = (max(v[0] for v in bb) - min(v[0] for v in bb)) * abs(jar_obj.scale.x)
+                dy = (max(v[1] for v in bb) - min(v[1] for v in bb)) * abs(jar_obj.scale.y)
+                dz = (max(v[2] for v in bb) - min(v[2] for v in bb)) * abs(jar_obj.scale.z)
+                if dx > 0.001 and dy > 0.001:
+                    r_jar = float((dx + dy) / 4.0)
+                if dz > 0.001:
+                    h_jar = float(dz)
+            else:
+                dims = jar_obj.dimensions
+                if dims.x > 0.001 and dims.y > 0.001:
+                    r_jar = float((dims.x + dims.y) / 4.0)
+                if dims.z > 0.001:
+                    h_jar = float(dims.z)
+
+            # 2. Sun wheel orbital radius: distance from sun rotation axis to jar in sun's local space
+            if sun_obj and jar_obj:
+                jar_world_pos = jar_obj.matrix_world.translation
+                jar_local_pos = sun_obj.matrix_world.inverted() @ jar_world_pos
+                # In sun wheel local space, rotation axis is local Z, so orbital radius is in local XY!
+                dist_orbital = math.sqrt(jar_local_pos.x**2 + jar_local_pos.y**2)
+                if dist_orbital > 0.01:
+                    r_sun = float(dist_orbital)
+                elif jar_obj.location.x != 0 or jar_obj.location.y != 0:
+                    r_sun = float(math.sqrt(jar_obj.location.x**2 + jar_obj.location.y**2))
+
+            props.mill_sun_radius = r_sun
+            props.mill_jar_radius = r_jar
+            props.mill_jar_height = h_jar
+        except Exception:
+            pass
+
+    return r_sun, r_jar, h_jar
+
+
+def detect_mill_orientation(sun_obj, mode_setting="AUTO") -> str:
+    """Detects whether the mill operates in Vertical or Horizontal orientation based on sun wheel 3D tilt."""
+    if mode_setting != "AUTO":
+        return mode_setting
+
+    if not sun_obj:
+        return "VERTICAL"
+
+    try:
+        mat = sun_obj.matrix_world.to_3x3()
+        # Sun disc normal vector in world space
+        normal = mat @ mathutils.Vector((0, 0, 1))
+        normal.normalize()
+        # If normal aligns with world Z (|normal.z| > 0.7), it is a vertical axis mill
+        if abs(normal.z) > 0.7:
+            return "VERTICAL"
+        else:
+            return "HORIZONTAL"
+    except Exception:
+        return "VERTICAL"
+
+
+class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
+    """Execute Discrete Element Method (DEM) particle physics and bake trajectories."""
+    bl_idname = "science_blocks.run_dem_simulation"
+    bl_label = "Run DEM Simulation"
+    bl_description = "Solve centrifugal and Coriolis collisions for grinding balls and bake motion"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        # First ensure Python is initialized
+        if not props.pkg_numpy_installed:
+            bpy.ops.science_blocks.init_environment()
+            if not props.pkg_numpy_installed:
+                self.report({"ERROR"}, "NumPy is required to solve DEM physics.")
+                return {"CANCELLED"}
+
+        # Resolve objects from props or active node tree
+        jar_obj = props.jar_chamber_obj
+        sun_obj = props.sun_wheel_obj
+
+        if props.active_node_tree:
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksObjectNode":
+                    if node.object_role == "JAR" and node.target_object:
+                        jar_obj = node.target_object
+                        props.jar_chamber_obj = node.target_object
+                    elif node.object_role == "SUN_WHEEL" and node.target_object:
+                        sun_obj = node.target_object
+                        props.sun_wheel_obj = node.target_object
+
+        if not jar_obj:
+            jar_obj = bpy.data.objects.get("Jar_Chamber")
+            if jar_obj:
+                props.jar_chamber_obj = jar_obj
+
+        if not jar_obj:
+            self.report({"ERROR"}, "No Jar Chamber object selected or found. Select it in Step 2 or via 3D Object Input node.")
+            return {"CANCELLED"}
+
+        # Read RPM from node tree if available
+        sun_rpm = 200.0
+        jar_rpm = -300.0
+        if props.active_node_tree:
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksRPMValueNode":
+                    sun_rpm = node.rpm_constant
+                elif node.bl_idname == "ScienceBlocksGearRatioNode":
+                    ratio = node.gear_ratio if node.calc_mode == "RATIO" else (node.teeth_in / max(1, node.teeth_out))
+                    if node.invert_direction:
+                        ratio = -ratio
+                    jar_rpm = sun_rpm * ratio
+
+        ball_count = props.dem_ball_count
+        ball_radius_m = props.dem_ball_radius_mm / 1000.0
+        ball_density = props.dem_ball_density
+        frames = props.dem_sim_frames
+        fps = context.scene.render.fps / max(1, context.scene.render.fps_base)
+
+        # Dynamic CAD Dimensions & Mill Specifications
+        r_sun, r_jar, h_jar = compute_effective_mill_geometry(sun_obj, jar_obj, props)
+
+        # Detect effective mill orientation (Auto-detect from sun wheel normal vector if AUTO)
+        effective_orientation = detect_mill_orientation(sun_obj, props.mill_orientation)
+
+        # Solve Planetary DEM Physics with Hertz-Mindlin & Polydisperse PSD
+        self.report({"INFO"}, f"Solving DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
+        res = dem_solver.solve_planetary_dem(
+            sun_rpm=sun_rpm,
+            jar_rpm=jar_rpm,
+            r_sun=r_sun,
+            r_jar=r_jar,
+            h_jar=h_jar,
+            ball_count=ball_count,
+            ball_radius_m=ball_radius_m,
+            ball_density=ball_density,
+            youngs_modulus_gpa=props.dem_youngs_modulus_gpa,
+            poissons_ratio=props.dem_poissons_ratio,
+            restitution=props.dem_restitution,
+            static_friction=props.dem_static_friction,
+            rolling_friction=props.dem_rolling_friction,
+            frames=frames,
+            fps=fps,
+            substeps_per_frame=40,
+            contact_model=props.dem_contact_model,
+            charge_distribution=props.dem_charge_distribution,
+            integrator=props.dem_integrator,
+            gravity=props.mill_gravity_value,
+            mill_orientation=effective_orientation,
+            slurry_drag=(props.dem_environment == "WET_SLURRY"),
+            slurry_viscosity=props.dem_slurry_viscosity,
+            slurry_density=props.dem_slurry_density,
+        )
+
+        # Instantiate particles in Blender with PSD scaling & dynamic colormap
+        dem_solver.instantiate_dem_particles_in_blender(
+            context,
+            result=res,
+            jar_obj=jar_obj,
+            colormap_mode=props.dem_viewport_colormap,
+        )
+
+        # Update isolated side chamber particles if side view is enabled
+        if props.show_side_jar_view or props.side_jar_auto_show_on_select:
+            try:
+                create_or_update_side_jar_view(context)
+            except Exception:
+                pass
+
+        # Update telemetry & planetary analytical diagnostics
+        props.dem_total_impacts = res.total_impacts
+        props.dem_collision_freq_hz = res.collision_frequency_hz
+        props.dem_mean_impact_energy_j = res.mean_impact_energy_j
+        props.dem_max_impact_energy_j = res.max_impact_energy_j
+        props.dem_power_watts = res.estimated_power_watts
+        props.dem_is_simulated = True
+
+        props.analytics_froude_number = res.froude_number
+        props.analytics_critical_speed_ratio = res.critical_speed_ratio
+        props.analytics_milling_regime = res.milling_regime
+        props.analytics_filling_ratio_pct = res.filling_ratio_pct
+
+        # Set timeline and start playback so user sees results immediately
+        context.scene.frame_start = 1
+        context.scene.frame_end = frames
+        context.scene.frame_set(1)
+
+        # Professional post-bake jar focus & camera inspection framing
+        try:
+            bpy.ops.science_blocks.focus_jar_view(use_camera=True)
+        except Exception:
+            pass
+
+        try:
+            bpy.ops.screen.animation_play()
+        except Exception:
+            pass
+
+        self.report({"INFO"}, f"DEM Complete: {res.total_impacts} impacts, Mean Energy: {res.mean_impact_energy_j:.4f} J, Power: {res.estimated_power_watts:.1f} W")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_export_telemetry(bpy.types.Operator):
+    """Export the scientific DEM collision telemetry data to JSON."""
+    bl_idname = "science_blocks.export_telemetry"
+    bl_label = "Export Telemetry Report"
+    bl_description = "Export scientific impact energy, frequency, and milling power data to a JSON report"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props or not props.dem_is_simulated:
+            self.report({"WARNING"}, "No DEM simulation results to export. Run DEM simulation first.")
+            return {"CANCELLED"}
+
+        report_data = {
+            "simulation_type": "Planetary_Ball_Mill_DEM",
+            "milling_balls_count": props.dem_ball_count,
+            "ball_radius_mm": props.dem_ball_radius_mm,
+            "ball_density_kg_m3": props.dem_ball_density,
+            "restitution_coefficient": props.dem_restitution,
+            "simulated_frames": props.dem_sim_frames,
+            "telemetry_results": {
+                "total_impacts": props.dem_total_impacts,
+                "collision_frequency_hz": props.dem_collision_freq_hz,
+                "mean_impact_energy_joules": props.dem_mean_impact_energy_j,
+                "max_impact_energy_joules": props.dem_max_impact_energy_j,
+                "estimated_milling_power_watts": props.dem_power_watts,
+            },
+        }
+
+        # Save directly to the directory of the active .blend file
+        is_saved = is_blend_file_saved()
+        folder = get_blend_file_directory() if is_saved else get_effective_config_dir()
+        json_path = os.path.join(folder, "planetary_milling_telemetry_report.json")
+        csv_path = os.path.join(folder, "planetary_milling_telemetry_summary.csv")
+
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=4)
+
+            # Write clean CSV summary table
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write("Metric,Value,Unit\n")
+                f.write(f"Total Impacts,{props.dem_total_impacts},count\n")
+                f.write(f"Collision Frequency,{props.dem_collision_freq_hz:.2f},Hz\n")
+                f.write(f"Mean Impact Energy,{props.dem_mean_impact_energy_j:.6f},J\n")
+                f.write(f"Max Impact Energy,{props.dem_max_impact_energy_j:.6f},J\n")
+                f.write(f"Milling Power Draw,{props.dem_power_watts:.2f},W\n")
+
+            if is_saved:
+                self.report({"INFO"}, f"Science Blocks: Saved telemetry reports (JSON & CSV) to '{folder}' (same folder as .blend file).")
+            else:
+                self.report({"WARNING"}, f"Blender file is unsaved. Saved telemetry reports to fallback '{folder}'. Save your .blend file (Ctrl+S) to store alongside it.")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to export: {str(e)}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_generate_scientific_report(bpy.types.Operator):
+    """Generate high-resolution scientific figures (matplotlib) and comprehensive HTML report."""
+    bl_idname = "science_blocks.generate_scientific_report"
+    bl_label = "Generate Scientific Report & Figures"
+    bl_description = "Plot publication-quality figures and generate interactive scientific HTML report"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        from . import dem_solver
+        from . import report_generator
+
+        res = dem_solver.last_dem_result
+        if not res or not props.dem_is_simulated:
+            self.report({"WARNING"}, "No DEM simulation results found. Please run the DEM simulation first.")
+            return {"CANCELLED"}
+
+        folder = get_blend_file_directory() if is_blend_file_saved() else get_effective_config_dir()
+        blend_file = bpy.data.filepath if bpy.data.filepath else ""
+
+        try:
+            self.report({"INFO"}, "Science Blocks: Generating scientific figures and HTML report...")
+            report_info = report_generator.generate_full_scientific_report(
+                result=res,
+                blend_filepath=blend_file,
+                output_dir=folder,
+            )
+            html_path = report_info["html_report"]
+            props.report_html_path = html_path
+
+            import webbrowser
+            webbrowser.open(f"file://{os.path.abspath(html_path)}")
+
+            if is_blend_file_saved():
+                self.report({"INFO"}, f"Science Blocks: Scientific report & figures saved to '{folder}'.")
+            else:
+                self.report({"WARNING"}, f"Blender file is unsaved. Report saved to fallback '{folder}'. Save file (Ctrl+S) to store with project.")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to generate report: {str(e)}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_open_html_report(bpy.types.Operator):
+    """Open the generated scientific HTML report in the system default web browser."""
+    bl_idname = "science_blocks.open_html_report"
+    bl_label = "Open HTML Report"
+    bl_description = "Open the scientific HTML report in your default web browser"
+
+    def execute(self, context):
+        folder = get_blend_file_directory() if is_blend_file_saved() else get_effective_config_dir()
+        report_path = os.path.join(folder, "planetary_mill_scientific_report.html")
+
+        if not os.path.exists(report_path):
+            self.report({"WARNING"}, "Report has not been generated yet. Click 'Generate Scientific Report' first.")
+            return {"CANCELLED"}
+
+        import webbrowser
+        webbrowser.open(f"file://{os.path.abspath(report_path)}")
+        self.report({"INFO"}, f"Opened '{report_path}' in web browser.")
+# ===========================================================================
+# Isolated Side Chamber Inspection View & Constant Gravity Vector Indicator
+# ===========================================================================
+
+def get_or_create_gravity_arrow_mesh(axis: str = "-Z") -> bpy.types.Mesh:
+    """Generate or retrieve a 3D arrow mesh indicating gravitational force direction."""
+    mesh_name = f"DEM_Gravity_Arrow_Mesh_{axis}"
+    mesh = bpy.data.meshes.get(mesh_name)
+    if mesh:
+        return mesh
+
+    mesh = bpy.data.meshes.new(mesh_name)
+    bm = bmesh.new()
+
+    # Shaft: Cylinder along Z (length 0.40m, radius 0.025m)
+    shaft_matrix = mathutils.Matrix.Translation((0, 0, 0.05))
+    bmesh.ops.create_cone(
+        bm,
+        cap_ends=True,
+        segments=16,
+        radius1=0.025,
+        radius2=0.025,
+        depth=0.40,
+        matrix=shaft_matrix,
+    )
+
+    # Arrow Head: Cone pointing along -Z (radius 0.065m, depth 0.17m)
+    head_matrix = mathutils.Matrix.Translation((0, 0, -0.235))
+    rot_down = mathutils.Matrix.Rotation(math.pi, 4, "X")
+    bmesh.ops.create_cone(
+        bm,
+        cap_ends=True,
+        segments=16,
+        radius1=0.065,
+        radius2=0.0,
+        depth=0.17,
+        matrix=head_matrix @ rot_down,
+    )
+
+    # Axis Orientation
+    if axis == "-Y":
+        rot_axis = mathutils.Matrix.Rotation(math.pi / 2, 4, "X")
+        bmesh.ops.transform(bm, matrix=rot_axis, verts=bm.verts)
+    elif axis == "-X":
+        rot_axis = mathutils.Matrix.Rotation(-math.pi / 2, 4, "Y")
+        bmesh.ops.transform(bm, matrix=rot_axis, verts=bm.verts)
+
+    bm.to_mesh(mesh)
+    bm.free()
+    return mesh
+
+
+def get_or_create_arrow_material() -> bpy.types.Material:
+    """Creates a high-contrast glowing amber material for the constant gravity arrow."""
+    mat_name = "DEM_Gravity_Arrow_Material"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        n_out = nodes.new("ShaderNodeOutputMaterial")
+        n_out.location = (300, 0)
+        n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        n_bsdf.location = (0, 0)
+
+        n_bsdf.inputs["Base Color"].default_value = (1.0, 0.65, 0.05, 1.0)
+        if "Emission Color" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Color"].default_value = (1.0, 0.55, 0.05, 1.0)
+        if "Emission Strength" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Strength"].default_value = 0.8
+        if "Roughness" in n_bsdf.inputs:
+            n_bsdf.inputs["Roughness"].default_value = 0.2
+
+        links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+    return mat
+
+
+def get_or_create_chamber_glass_material(opacity: float = 0.25) -> bpy.types.Material:
+    """Creates a transparent acrylic/glass shader so internal milling balls are clearly visible."""
+    mat_name = "DEM_Side_Chamber_Glass_Material"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+        mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    n_out = nodes.new("ShaderNodeOutputMaterial")
+    n_out.location = (300, 0)
+    n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    n_bsdf.location = (0, 0)
+
+    n_bsdf.inputs["Base Color"].default_value = (0.35, 0.75, 0.95, opacity)
+    if "Alpha" in n_bsdf.inputs:
+        n_bsdf.inputs["Alpha"].default_value = opacity
+    if "Roughness" in n_bsdf.inputs:
+        n_bsdf.inputs["Roughness"].default_value = 0.1
+    if "Transmission Weight" in n_bsdf.inputs:
+        n_bsdf.inputs["Transmission Weight"].default_value = 0.92
+    elif "Transmission" in n_bsdf.inputs:
+        n_bsdf.inputs["Transmission"].default_value = 0.92
+
+    links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "BLEND"
+    if hasattr(mat, "shadow_method"):
+        mat.shadow_method = "NONE"
+
+    return mat
+
+
+def create_or_update_side_jar_view(context) -> bool:
+    """Displays an isolated side-by-side view of the jar with internal particles and fixed gravity arrow."""
+    props = getattr(context.scene, "science_blocks_props", None)
+    if not props:
+        return False
+
+    jar_obj = props.jar_chamber_obj
+    if not jar_obj:
+        jar_obj = bpy.data.objects.get("Jar_Chamber")
+        if jar_obj:
+            props.jar_chamber_obj = jar_obj
+
+    if not jar_obj:
+        return False
+
+    coll_name = "Science_Blocks_Side_Inspection"
+    coll = bpy.data.collections.get(coll_name)
+    if not coll:
+        coll = bpy.data.collections.new(coll_name)
+        context.scene.collection.children.link(coll)
+
+    # 1. Spawn or update isolated Jar_Chamber_SideView
+    side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+    if not side_jar:
+        side_jar = jar_obj.copy()
+        side_jar.name = "Jar_Chamber_SideView"
+        side_jar.data = jar_obj.data
+        coll.objects.link(side_jar)
+
+    # Ensure side jar is stationary in space (NO sun wheel parent)
+    side_jar.parent = None
+    side_jar.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+    offset_x = props.side_jar_offset_x
+    jar_z = jar_obj.matrix_world.translation.z if jar_obj.parent else (jar_obj.location.z or 0.65)
+    side_jar.location = (offset_x, 0.0, jar_z)
+    side_jar.rotation_mode = "XYZ"
+    if jar_obj.parent:
+        side_jar.rotation_euler.x = jar_obj.parent.rotation_euler.x
+        side_jar.rotation_euler.y = jar_obj.parent.rotation_euler.y
+    else:
+        side_jar.rotation_euler.x = 0.0
+        side_jar.rotation_euler.y = 0.0
+    side_jar.rotation_euler.z = jar_obj.rotation_euler.z
+
+    # Configure visual display mode
+    if props.side_jar_display_mode == "WIRE":
+        side_jar.display_type = "WIRE"
+        side_jar.show_wire = True
+    elif props.side_jar_display_mode == "SOLID":
+        side_jar.display_type = "TEXTURED"
+        side_jar.show_wire = False
+    else:  # TRANSPARENT
+        side_jar.display_type = "TEXTURED"
+        side_jar.show_wire = True
+        glass_mat = get_or_create_chamber_glass_material(props.side_jar_transparency)
+        if not side_jar.data.materials:
+            side_jar.data.materials.append(glass_mat)
+        else:
+            side_jar.data.materials[0] = glass_mat
+
+    # Side directional pointer (if original jar has one)
+    side_pointer = bpy.data.objects.get("Jar_Side_Direction_Pointer")
+    orig_pointer = bpy.data.objects.get("Jar_Direction_Pointer")
+    if orig_pointer and not side_pointer:
+        side_pointer = orig_pointer.copy()
+        side_pointer.name = "Jar_Side_Direction_Pointer"
+        side_pointer.parent = side_jar
+        side_pointer.matrix_parent_inverse = orig_pointer.matrix_parent_inverse
+        coll.objects.link(side_pointer)
+
+    # 2. Spawn or update Gravity Force Direction Arrow
+    arrow = bpy.data.objects.get("Gravity_Force_Arrow")
+    if props.side_jar_show_arrow:
+        arrow_mesh = get_or_create_gravity_arrow_mesh(props.side_jar_gravity_axis)
+        if not arrow:
+            arrow = bpy.data.objects.new("Gravity_Force_Arrow", arrow_mesh)
+            coll.objects.link(arrow)
+        else:
+            arrow.data = arrow_mesh
+
+        arrow_mat = get_or_create_arrow_material()
+        if not arrow.data.materials:
+            arrow.data.materials.append(arrow_mat)
+        else:
+            arrow.data.materials[0] = arrow_mat
+
+        # Position arrow floating next to the chamber
+        r_jar = 0.45
+        arrow.parent = None  # Crucial: NOT parented to rotating jar!
+        arrow.location = (side_jar.location.x - (r_jar + 0.35), side_jar.location.y, side_jar.location.z)
+        arrow.rotation_mode = "XYZ"
+        from . import nodes
+        fps = context.scene.render.fps / max(1, context.scene.render.fps_base)
+        frame_start = getattr(context.scene, "frame_start", 1)
+        t = max(0.0, (context.scene.frame_current - frame_start) / fps) * props.motion_time_scale
+        parent_rot_x = nodes.get_parent_wheel_rotation_angle(context.scene, t)
+        arrow.rotation_euler = (parent_rot_x, 0.0, 0.0)
+    elif arrow:
+        bpy.data.objects.remove(arrow, do_unlink=True)
+
+    # 3. Synchronize DEM Milling Particles in Side Chamber
+    coll_media = bpy.data.collections.get("Science_Blocks_Milling_Media")
+    for obj in list(coll.objects):
+        if obj.name.startswith("DEM_Media_Side_"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    if coll_media:
+        orig_balls = [
+            o for o in coll_media.objects
+            if o.name.startswith("DEM_Media_") and not o.name.startswith("DEM_Media_Side_") and o.name != "Template_DEM_Particle"
+        ]
+        for ball in orig_balls:
+            ball_side = ball.copy()
+            suffix = ball.name[len("DEM_Media_"):]
+            ball_side.name = f"DEM_Media_Side_{suffix}"
+            ball_side.parent = side_jar
+            ball_side.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+            ball_side.scale = ball.scale
+            if ball.animation_data and ball.animation_data.action:
+                ball_side.animation_data_create()
+                ball_side.animation_data.action = ball.animation_data.action
+            coll.objects.link(ball_side)
+
+    props.show_side_jar_view = True
+    return True
+
+
+def remove_side_jar_view():
+    """Remove all objects and collection for the side inspection view."""
+    coll_name = "Science_Blocks_Side_Inspection"
+    coll = bpy.data.collections.get(coll_name)
+    if coll:
+        for obj in list(coll.objects):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        bpy.data.collections.remove(coll)
+
+
+class SCIENCE_BLOCKS_OT_toggle_side_jar_view(bpy.types.Operator):
+    """Toggle isolated side chamber inspection station with gravity arrow."""
+    bl_idname = "science_blocks.toggle_side_jar_view"
+    bl_label = "Toggle Side Chamber View"
+    bl_description = "Show or hide an isolated side inspection copy of the jar with particles and gravity arrow"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        if props.show_side_jar_view and bpy.data.objects.get("Jar_Chamber_SideView"):
+            remove_side_jar_view()
+            props.show_side_jar_view = False
+            self.report({"INFO"}, "Science Blocks: Hidden isolated side chamber view.")
+        else:
+            success = create_or_update_side_jar_view(context)
+            if success:
+                self.report({"INFO"}, "Science Blocks: Displayed isolated side chamber view.")
+            else:
+                self.report({"WARNING"}, "No Jar Chamber found. Select or create the Jar first.")
+                return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_focus_jar_view(bpy.types.Operator):
+    """Frame and focus the 3D viewport or inspection camera directly on the Jar Chamber."""
+    bl_idname = "science_blocks.focus_jar_view"
+    bl_label = "Focus View on Jar"
+    bl_description = "Center and zoom viewport or active camera onto the Jar Chamber for detailed inspection"
+
+    use_camera: bpy.props.BoolProperty(name="Create/Switch to Inspection Camera", default=True)
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        target = None
+        if props and props.show_side_jar_view and bpy.data.objects.get("Jar_Chamber_SideView"):
+            target = bpy.data.objects.get("Jar_Chamber_SideView")
+        elif props and props.jar_chamber_obj:
+            target = props.jar_chamber_obj
+        else:
+            target = bpy.data.objects.get("Jar_Chamber")
+
+        if not target:
+            self.report({"WARNING"}, "No Jar Chamber found to focus on.")
+            return {"CANCELLED"}
+
+        # 1. Viewport Selection & Frame
+        for obj in context.scene.objects:
+            obj.select_set(False)
+        target.select_set(True)
+        context.view_layer.objects.active = target
+
+        # Try framing in 3D viewport
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                for region in area.regions:
+                    if region.type == "WINDOW":
+                        ctx = context.copy()
+                        ctx["area"] = area
+                        ctx["region"] = region
+                        try:
+                            bpy.ops.view3d.view_selected(ctx, use_all_regions=False)
+                        except Exception:
+                            pass
+                break
+
+        # 2. Setup or switch to Jar_Inspection_Camera
+        if self.use_camera:
+            cam_name = "Jar_Inspection_Camera"
+            cam = bpy.data.objects.get(cam_name)
+            if not cam:
+                cam_data = bpy.data.cameras.new(cam_name)
+                cam_data.lens = 50.0  # 50mm realistic standard focal length
+                cam = bpy.data.objects.new(cam_name, cam_data)
+                context.scene.collection.objects.link(cam)
+
+            # Position camera slightly elevated and offset from jar
+            t_loc = target.matrix_world.translation
+            cam.location = (t_loc.x, t_loc.y - 3.2, t_loc.z + 1.2)
+            cam.rotation_euler = (math.radians(72.0), 0.0, 0.0)
+
+            # Track constraint
+            track = None
+            for c in cam.constraints:
+                if c.type == "TRACK_TO":
+                    track = c
+                    break
+            if not track:
+                track = cam.constraints.new("TRACK_TO")
+                track.track_axis = "TRACK_NEGATIVE_Z"
+                track.up_axis = "UP_Y"
+            track.target = target
+
+            context.scene.camera = cam
+
+        self.report({"INFO"}, f"Science Blocks: Focused on {target.name}.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_toggle_chamber_cutaway(bpy.types.Operator):
+    """Toggle longitudinal cutaway section view to see internal grinding charge and fluid."""
+    bl_idname = "science_blocks.toggle_chamber_cutaway"
+    bl_label = "Toggle Chamber Cutaway"
+    bl_description = "Slice open the front half of the jar cylinder to inspect internal particle dynamics"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        jar = props.jar_chamber_obj or bpy.data.objects.get("Jar_Chamber")
+        side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+        targets = [o for o in [jar, side_jar] if o is not None]
+
+        if not targets:
+            self.report({"WARNING"}, "No Jar Chamber found to apply cutaway.")
+            return {"CANCELLED"}
+
+        cutter = bpy.data.objects.get("Jar_Cutaway_Cutter")
+
+        if props.show_chamber_cutaway and cutter:
+            # Turn OFF cutaway
+            for obj in targets:
+                mod = obj.modifiers.get("SB_Chamber_Cutaway")
+                if mod:
+                    obj.modifiers.remove(mod)
+            bpy.data.objects.remove(cutter, do_unlink=True)
+            props.show_chamber_cutaway = False
+            self.report({"INFO"}, "Science Blocks: Chamber cutaway disabled (Solid Casing).")
+        else:
+            # Turn ON cutaway: create cutter box
+            r_jar = props.mill_jar_radius or 0.45
+            h_jar = props.mill_jar_height or 1.1
+            size_box = (r_jar * 2.5, r_jar * 2.0, h_jar * 1.5)
+
+            bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, -r_jar, 0.0))
+            cutter = context.active_object
+            cutter.name = "Jar_Cutaway_Cutter"
+            cutter.scale = size_box
+            cutter.display_type = "WIRE"
+            cutter.hide_render = True
+
+            # Parent cutter to jar
+            if jar:
+                cutter.parent = jar
+                cutter.matrix_parent_inverse = jar.matrix_world.inverted()
+
+            # Add Boolean Difference modifier to jars
+            for obj in targets:
+                mod = obj.modifiers.get("SB_Chamber_Cutaway")
+                if not mod:
+                    mod = obj.modifiers.new(name="SB_Chamber_Cutaway", type="BOOLEAN")
+                mod.operation = "DIFFERENCE"
+                mod.object = cutter
+                # Support Blender 5.2+ ('FLOAT', 'EXACT', 'MANIFOLD') and legacy ('FAST', 'EXACT')
+                for s in ("FLOAT", "EXACT", "FAST"):
+                    try:
+                        mod.solver = s
+                        break
+                    except TypeError:
+                        pass
+
+            props.show_chamber_cutaway = True
+            self.report({"INFO"}, "Science Blocks: Chamber cutaway enabled (Internal Visibility).")
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_toggle_camera_tracking(bpy.types.Operator):
+    """Toggle camera tracking following the orbiting jar chamber."""
+    bl_idname = "science_blocks.toggle_camera_tracking"
+    bl_label = "Follow Jar Camera"
+    bl_description = "Lock the camera position to follow the jar throughout its orbital motion"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        jar = props.jar_chamber_obj or bpy.data.objects.get("Jar_Chamber")
+        cam = bpy.data.objects.get("Jar_Inspection_Camera")
+        if not cam or not jar:
+            bpy.ops.science_blocks.focus_jar_view(use_camera=True)
+            cam = bpy.data.objects.get("Jar_Inspection_Camera")
+
+        if not cam or not jar:
+            self.report({"WARNING"}, "Camera or Jar not found.")
+            return {"CANCELLED"}
+
+        copy_loc = None
+        for c in cam.constraints:
+            if c.type == "COPY_LOCATION":
+                copy_loc = c
+                break
+
+        if props.camera_follow_jar and copy_loc:
+            cam.constraints.remove(copy_loc)
+            props.camera_follow_jar = False
+            self.report({"INFO"}, "Science Blocks: Camera tracking disabled (Stationary Camera).")
+        else:
+            if not copy_loc:
+                copy_loc = cam.constraints.new("COPY_LOCATION")
+            copy_loc.target = jar
+            copy_loc.use_offset = True
+            props.camera_follow_jar = True
+            self.report({"INFO"}, "Science Blocks: Camera tracking enabled (Following Jar).")
+
+        return {"FINISHED"}
+
+
+def register():
+    ensure_user_site_in_path()
+    if on_blend_save_or_load not in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.append(on_blend_save_or_load)
+    if on_blend_save_or_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(on_blend_save_or_load)
+
+
+def unregister():
+    if on_blend_save_or_load in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.remove(on_blend_save_or_load)
+    if on_blend_save_or_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(on_blend_save_or_load)
