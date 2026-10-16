@@ -1,0 +1,53 @@
+{
+    "version": "1.0",
+    "blend_file_path": "",
+    "config_directory": "C:\\Users\\tpawi\\AppData\\Roaming\\Blender Foundation\\Blender\\5.2\\extensions\\vscode_development\\Science_Blocks",
+    "sun_wheel_object": "Sun_Wheel_Plate",
+    "jar_chamber_object": "Jar_Chamber",
+    "node_kinematics": {
+        "sun_rpm": 200.0,
+        "jar_rpm": -300.0,
+        "gear_ratio": 1.5,
+        "invert_direction": true
+    },
+    "dem_parameters": {
+        "ball_count": 20,
+        "ball_radius_mm": 10.0,
+        "ball_density": 14800.0,
+        "restitution": 0.8199999928474426,
+        "sim_frames": 45
+    },
+    "kinematics": {
+        "live_motion_preview": true,
+        "motion_time_scale": 1.0
+    },
+    "telemetry_results": {
+        "is_simulated": true,
+        "total_impacts": 6772,
+        "collision_frequency_hz": 3611.7333984375,
+        "mean_impact_energy_j": 0.5176692008972168,
+        "max_impact_energy_j": 26.49650764465332,
+        "power_watts": 1869.6829833984375
+    },
+    "mill_dimensions": {
+        "dimension_mode": "AUTO",
+        "sun_radius": 1.2999999523162842,
+        "jar_radius": 0.44999998807907104,
+        "jar_height": 1.100000023841858
+    },
+    "environment": {
+        "orientation": "AUTO",
+        "gravity": 9.8100004196167,
+        "medium": "WET_SLURRY",
+        "slurry_viscosity": 0.02500000037252903,
+        "slurry_density": 1150.0
+    },
+    "side_inspection": {
+        "active": true,
+        "auto_show_on_select": true,
+        "display_mode": "TRANSPARENT",
+        "transparency": 0.25,
+        "gravity_axis": "-Z",
+        "offset_x": 3.799999952316284
+    }
+}

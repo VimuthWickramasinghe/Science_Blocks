@@ -1,0 +1,28 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Blender autosaves and backup files
+*.blend1
+*.blend2
+*.blend@
+*.blend@@
+*.blend@@@
+
+# Test outputs and temporary directories
+test_output/
+Test_Blender_File/
+
+# Logs and local settings
+*.log
+settings.json
+local_settings.json
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# IDE configurations
+.vscode/
+.idea/
