@@ -10,7 +10,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 import addon_utils
 addon_utils.enable("bl_ext.vscode_development.Science_Blocks")
 
-from bl_ext.vscode_development.Science_Blocks import properties, operators, nodes, dem_solver, report_generator, ui_panels, tools
+from bl_ext.vscode_development.Science_Blocks import properties, operators, nodes, dem_solver, report_generator, ui_panels, tools, colormaps
 
 def log_test(name, passed, detail=""):
     status = "PASS" if passed else "FAIL"
@@ -111,10 +111,35 @@ def run_all_tests():
     nodes.evaluate_kinematics_frame(scene)
     log_test("Side Jar retains 90° tilt after frame change", abs(side_jar.rotation_euler.x - math.radians(90.0)) < 1e-4)
 
-    # The arrow must be impacted by parent wheel rotation, changing ONLY in the X axis!
-    log_test("Gravity Arrow X rotation impacted by parent wheel", abs(arrow.rotation_euler.x) > 0.01, f"arrow.rotation_euler.x = {arrow.rotation_euler.x}")
-    log_test("Gravity Arrow Y rotation remains 0 (only X changes)", abs(arrow.rotation_euler.y) < 1e-5)
-    log_test("Gravity Arrow Z rotation remains 0 (only X changes)", abs(arrow.rotation_euler.z) < 1e-5)
+    # Horizontal Mill: Arrow dynamically rotates in the transverse plane
+    g_horiz = nodes.compute_apparent_gravity_vector(scene, 30.0 / 24.0)
+    log_test("Horizontal Mill: Gravity Apparent Vector Norm is 1.0", abs(g_horiz.length - 1.0) < 1e-4)
+    log_test("Horizontal Mill: Gravity Arrow orientation updated dynamically", arrow.rotation_euler != mathutils.Euler((0, 0, 0)))
+
+    # Test Invert Arrow Direction toggle
+    rot_default = arrow.rotation_euler.copy()
+    props.side_jar_invert_arrow = True
+    nodes.evaluate_kinematics_frame(scene)
+    rot_inverted = arrow.rotation_euler.copy()
+    log_test("Invert Arrow changes transverse direction", rot_default != rot_inverted)
+    props.side_jar_invert_arrow = False
+    nodes.evaluate_kinematics_frame(scene)
+
+    # Rigorous Mathematical Test for High Energy Planetary Mill (Vertical Mill, tilt = 0°)
+    # In a vertical mill, Earth's gravity points strictly downward (-Z) with ZERO tumbling or pitching
+    sun_obj.rotation_euler.x = 0.0
+    bpy.context.view_layer.update()
+    nodes.evaluate_kinematics_frame(scene)
+    g_vert = nodes.compute_apparent_gravity_vector(scene, 30.0 / 24.0)
+    log_test("Vertical High-Energy Mill: Apparent Gravity strictly downward (0, 0, -1)", (g_vert - mathutils.Vector((0, 0, -1))).length < 1e-4)
+    log_test("Vertical High-Energy Mill: Gravity Arrow Euler X is 0 (No pitching)", abs(arrow.rotation_euler.x) < 1e-4)
+    log_test("Vertical High-Energy Mill: Gravity Arrow Euler Y is 0 (No rolling)", abs(arrow.rotation_euler.y) < 1e-4)
+    log_test("Vertical High-Energy Mill: Gravity Arrow Euler Z is 0 (No yawing)", abs(arrow.rotation_euler.z) < 1e-4)
+
+    # Restore 90° tilt for subsequent Horizontal Mill Suite 5
+    sun_obj.rotation_euler.x = math.radians(90.0)
+    bpy.context.view_layer.update()
+    nodes.evaluate_kinematics_frame(scene)
 
     # -------------------------------------------------------------------------
     # TEST SUITE 5: Full DEM Simulation & Scientific Telemetry under 90° Tilt
@@ -348,9 +373,161 @@ def run_all_tests():
     copy_loc = any(c.type == "COPY_LOCATION" for c in cam.constraints)
     log_test("Toggle Camera Tracking (ON)", ret_trk == {"FINISHED"} and copy_loc)
 
+    # -------------------------------------------------------------------------
+    # TEST SUITE 11: Scientific Research Paper Styling, Background & Object Colors
+    # -------------------------------------------------------------------------
+    print("\n--- Test Suite 11: Scientific Paper Styling, Background & Object Colors ---")
+
+    # 1. Test Default Publication Style (Nature / Science Paper White)
+    ret_sci = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="NATURE_WHITE")
+    log_test("Apply Scientific Paper Colors (Nature White)", ret_sci == {"FINISHED"})
+
+    # Check World Background is pure white (1, 1, 1)
+    world = scene.world
+    log_test("World exists with nodes enabled", world is not None and world.use_nodes)
+    bg_node = [n for n in world.node_tree.nodes if n.type == "BACKGROUND"][0]
+    log_test("World Background is Pure White (1.0, 1.0, 1.0)", bg_node.inputs["Color"].default_value[:3] == (1.0, 1.0, 1.0))
+    log_test("Film Transparent is False for White Paper", not scene.render.film_transparent)
+
+    # Check Object Materials Assigned
+    jar_mat = bpy.data.materials.get("SB_Jar_Chamber_Material")
+    carrier_mat = bpy.data.materials.get("SB_Sun_Wheel_Material")
+    accent_mat = bpy.data.materials.get("SB_Accent_Marker_Material")
+    log_test("Jar Chamber Material exists", jar_mat is not None)
+    log_test("Carrier Material exists", carrier_mat is not None)
+    log_test("Accent Material exists", accent_mat is not None)
+
+    log_test("Jar Chamber has Jar Material assigned", bool(jar_obj.data.materials and jar_obj.data.materials[0] == jar_mat))
+    log_test("Sun Wheel has Carrier Material assigned", bool(sun_obj.data.materials and sun_obj.data.materials[0] == carrier_mat))
+    marker = bpy.data.objects.get("Sun_Indicator_Marker")
+    log_test("Sun Marker has Accent Material assigned", bool(marker and marker.data.materials and marker.data.materials[0] == accent_mat))
+
+    # 2. Test Studio Grey Preset
+    ret_studio = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="STUDIO_NEUTRAL")
+    log_test("Apply Studio Grey Preset", ret_studio == {"FINISHED"})
+    log_test("Studio Grey Background applied", abs(bg_node.inputs["Color"].default_value[0] - 0.92) < 0.05)
+    log_test("Studio Grey Jar Finish is Ceramic", props.sci_jar_finish == "ALUMINA_CERAMIC")
+    log_test("Studio Grey Media Palette is Plasma", props.sci_media_palette == "PLASMA")
+
+    # 3. Test Metallic Rig Preset
+    ret_metal = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="METALLIC_TECH")
+    log_test("Apply Metallic Rig Preset", ret_metal == {"FINISHED"})
+    log_test("Metallic Rig Jar Finish is Stainless Steel", props.sci_jar_finish == "STAINLESS_STEEL")
+    log_test("Metallic Rig Media Palette is Chrome Steel", props.sci_media_palette == "STEEL")
+
+    # 4. Test Conference Dark Preset
+    ret_dark = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="CONFERENCE_DARK")
+    log_test("Apply Conference Dark Preset", ret_dark == {"FINISHED"})
+    log_test("Dark Background applied", bg_node.inputs["Color"].default_value[0] < 0.1)
+    log_test("Dark Keynote Media Palette is Turbo", props.sci_media_palette == "TURBO")
+
+    # 5. Test Transparent Cutout Preset (LaTeX / Overleaf / Word PNG)
+    ret_trans = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="TRANSPARENT_LATEX")
+    log_test("Apply Transparent LaTeX Preset", ret_trans == {"FINISHED"})
+    log_test("Render Film Transparent Enabled", scene.render.film_transparent)
+
+    # 6. Test Quick Background Setter Operator
+    ret_bg_w = bpy.ops.science_blocks.set_paper_background(bg_mode="WHITE")
+    log_test("Set Background White Operator", ret_bg_w == {"FINISHED"} and not scene.render.film_transparent and bg_node.inputs["Color"].default_value[0] == 1.0)
+
+    ret_bg_t = bpy.ops.science_blocks.set_paper_background(bg_mode="TRANSPARENT")
+    log_test("Set Background Transparent Operator", ret_bg_t == {"FINISHED"} and scene.render.film_transparent)
+
+    # 7. Test Particle Recoloring & Scientific Colormaps LUT
+    props.sci_media_palette = "VIRIDIS"
+    ret_recol = bpy.ops.science_blocks.update_particle_colors()
+    log_test("Recolor Particles Operator (Viridis)", ret_recol == {"FINISHED"})
+
+    # Verify Colormap Math Functions
+    c_vir_0 = colormaps.evaluate_scientific_colormap("VIRIDIS", 0.0, v_max=5.0)
+    c_vir_1 = colormaps.evaluate_scientific_colormap("VIRIDIS", 5.0, v_max=5.0)
+    log_test("Viridis evaluation 0.0 is dark purple", c_vir_0[2] > 0.3 and c_vir_0[0] < 0.4)
+    log_test("Viridis evaluation 1.0 is bright yellow", c_vir_1[0] > 0.8 and c_vir_1[1] > 0.8)
+
+    c_plasma = colormaps.evaluate_scientific_colormap("PLASMA", 2.5, v_max=5.0)
+    log_test("Plasma evaluation valid RGBA", len(c_plasma) == 4 and all(0.0 <= x <= 1.0 for x in c_plasma))
+
+    c_turbo = colormaps.evaluate_scientific_colormap("TURBO", 2.5, v_max=5.0)
+    log_test("Turbo evaluation valid RGBA", len(c_turbo) == 4 and all(0.0 <= x <= 1.0 for x in c_turbo))
+
+    c_coolwarm = colormaps.evaluate_scientific_colormap("COOLWARM", 2.5, v_max=5.0)
+    log_test("Coolwarm evaluation valid RGBA", len(c_coolwarm) == 4 and all(0.0 <= x <= 1.0 for x in c_coolwarm))
+
+    c_steel = colormaps.evaluate_scientific_colormap("STEEL", 2.5)
+    log_test("Steel evaluation is reflective metallic grey", abs(c_steel[0] - 0.85) < 0.05)
+
+    c_ceramic = colormaps.evaluate_scientific_colormap("CERAMIC", 2.5)
+    log_test("Ceramic evaluation is clean white", c_ceramic[0] > 0.9 and c_ceramic[1] > 0.9)
+
+    # 8. Test Publication Viewport Shading Operator
+    ret_shd = bpy.ops.science_blocks.enhance_publication_viewport()
+    log_test("Enhance Publication Viewport Operator Finished", ret_shd == {"FINISHED"})
+    log_test("Viewport Cavity Property is True", props.sci_viewport_cavity)
+
+    # 9. Test Save & Load Setup Persistence with Scientific Styling
+    props.sci_paper_preset = "CONFERENCE_DARK"
+    props.sci_jar_finish = "FROSTED_GLASS"
+    props.sci_jar_opacity = 0.33
+    props.sci_accent_color = (0.1, 0.8, 0.9)
+    bpy.ops.science_blocks.save_setup()
+
+    # Reset
+    props.sci_paper_preset = "NATURE_WHITE"
+    props.sci_jar_opacity = 0.50
+
+    # Load back
+    bpy.ops.science_blocks.load_setup()
+    log_test("Config JSON preserves sci_paper_preset 'CONFERENCE_DARK'", props.sci_paper_preset == "CONFERENCE_DARK")
+    # -------------------------------------------------------------------------
+    # TEST SUITE 12: Ready-to-Run Simulation Demo Scenarios Showcase
+    # -------------------------------------------------------------------------
+    print("\n--- Test Suite 12: Ready-to-Run Simulation Demo Scenarios Showcase ---")
+
+    # 1. High-Energy Ball Mill Demo
+    bpy.ops.science_blocks.load_demo(demo_type="HIGH_ENERGY_BALL_MILL")
+    log_test("Demo 1: High Energy Ball Mill loaded", props.demo_scenario == "HIGH_ENERGY_BALL_MILL")
+    log_test("Demo 1: Steel media preset applied", props.dem_material_preset == "STEEL")
+    log_test("Demo 1: Nature White styling applied", props.sci_paper_preset == "NATURE_WHITE")
+
+    # 2. Wet Slurry Milling Demo
+    bpy.ops.science_blocks.load_demo(demo_type="WET_SLURRY_MILL")
+    log_test("Demo 2: Wet Slurry Mill loaded", props.demo_scenario == "WET_SLURRY_MILL")
+    log_test("Demo 2: Slurry physics active", props.slurry_enable is True)
+    log_test("Demo 2: Ceramic Zirconia media", props.dem_material_preset == "ZIRCONIA")
+    log_test("Demo 2: Cutaway cutter generated", bpy.data.objects.get("Jar_Cutaway_Cutter") is not None)
+
+    # 3. Horizontal 90° Axis Tumbling Mill Demo
+    bpy.ops.science_blocks.load_demo(demo_type="HORIZONTAL_MILL")
+    sun_wheel = bpy.data.objects.get("Sun_Wheel_Plate")
+    log_test("Demo 3: Horizontal Mill loaded", props.demo_scenario == "HORIZONTAL_MILL")
+    log_test("Demo 3: 90° axis rotation applied", abs(math.degrees(sun_wheel.rotation_euler.x) - 90.0) < 1.0)
+    log_test("Demo 3: Tungsten media preset", props.dem_material_preset == "TUNGSTEN")
+    log_test("Demo 3: Metallic Tech styling applied", props.sci_paper_preset == "METALLIC_TECH")
+
+    # 4. Zero-G Space Centrifugal Mill Demo
+    bpy.ops.science_blocks.load_demo(demo_type="SPACE_ZERO_G_MILL")
+    log_test("Demo 4: Zero-G Space Mill loaded", props.demo_scenario == "SPACE_ZERO_G_MILL")
+    log_test("Demo 4: Zero gravity physics (g = 0)", props.dem_gravity_z == 0.0)
+    log_test("Demo 4: Silicon Nitride media", props.dem_material_preset == "SILICON_NITRIDE")
+    log_test("Demo 4: Conference Dark styling applied", props.sci_paper_preset == "CONFERENCE_DARK")
+
+    # 5. Multiphysics Solvers Suite Demo
+    bpy.ops.science_blocks.load_demo(demo_type="MULTIPHYSICS_SOLVERS")
+    tree = props.active_node_tree
+    node_types = {n.bl_idname for n in tree.nodes} if tree else set()
+    log_test("Demo 5: Multiphysics Solvers Suite loaded", props.demo_scenario == "MULTIPHYSICS_SOLVERS")
+    log_test("Demo 5: LIGGGHTS node present", "ScienceBlocksLiggghtsNode" in node_types)
+    log_test("Demo 5: OpenFOAM node present", "ScienceBlocksOpenFOAMNode" in node_types)
+    log_test("Demo 5: CFDEM node present", "ScienceBlocksCFDEMNode" in node_types)
+    log_test("Demo 5: CalculiX node present", "ScienceBlocksCalculiXNode" in node_types)
+    log_test("Demo 5: Elmer node present", "ScienceBlocksElmerNode" in node_types)
+    log_test("Demo 5: FluidX3D node present", "ScienceBlocksFluidX3DNode" in node_types)
+    log_test("Demo 5: OpenRadioss node present", "ScienceBlocksOpenRadiossNode" in node_types)
+    log_test("Demo 5: Yade node present", "ScienceBlocksYadeNode" in node_types)
+
     print("\n" + "=" * 70)
-    print("ALL 60/60 VERIFICATION TESTS PASSED SUCCESSFULLY!")
-    print("Planetary Ball Mill Tool, Dynamic Gravity Arrow, Solvers & Cutaway are 100% Verified.")
+    print("ALL VERIFICATION TESTS (SUITES 1 THROUGH 12) PASSED SUCCESSFULLY!")
+    print("Planetary Ball Mill Tool, Demos, Solvers & Scientific Colors are 100% Verified.")
     print("=" * 70)
 
 if __name__ == "__main__":

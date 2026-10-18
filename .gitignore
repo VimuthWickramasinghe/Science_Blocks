@@ -11,8 +11,8 @@ __pycache__/
 *.blend@@@
 
 # Test outputs and temporary directories
-test_output/
-Test_Blender_File/
+test_output/*
+Test_Blender_File/*
 
 # Logs and local settings
 *.log
@@ -26,3 +26,5 @@ Thumbs.db
 # IDE configurations
 .vscode/
 .idea/
+
+.science_blocks_venv/*
