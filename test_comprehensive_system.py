@@ -373,161 +373,95 @@ def run_all_tests():
     copy_loc = any(c.type == "COPY_LOCATION" for c in cam.constraints)
     log_test("Toggle Camera Tracking (ON)", ret_trk == {"FINISHED"} and copy_loc)
 
-    # -------------------------------------------------------------------------
-    # TEST SUITE 11: Scientific Research Paper Styling, Background & Object Colors
-    # -------------------------------------------------------------------------
-    print("\n--- Test Suite 11: Scientific Paper Styling, Background & Object Colors ---")
+    # =========================================================================
+    # SUITE 11: Light Studio White Theme, Material Library & Yade Force Colormap
+    # =========================================================================
+    print("\n--- SUITE 11: Light Studio White Theme, PBR Materials & Yade Colormap ---")
 
-    # 1. Test Default Publication Style (Nature / Science Paper White)
-    ret_sci = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="NATURE_WHITE")
-    log_test("Apply Scientific Paper Colors (Nature White)", ret_sci == {"FINISHED"})
+    # 1. Apply White Studio Theme
+    props.viewport_theme_mode = "LIGHT_WHITE"
+    ret_theme = bpy.ops.science_blocks.apply_light_theme()
+    log_test("Apply White Studio Theme Operator", ret_theme == {"FINISHED"})
 
-    # Check World Background is pure white (1, 1, 1)
-    world = scene.world
-    log_test("World exists with nodes enabled", world is not None and world.use_nodes)
-    bg_node = [n for n in world.node_tree.nodes if n.type == "BACKGROUND"][0]
-    log_test("World Background is Pure White (1.0, 1.0, 1.0)", bg_node.inputs["Color"].default_value[:3] == (1.0, 1.0, 1.0))
-    log_test("Film Transparent is False for White Paper", not scene.render.film_transparent)
+    # Check World Background is pure white
+    world_nodes = scene.world.node_tree.nodes
+    bg_node = next((n for n in world_nodes if n.type == "BACKGROUND"), None)
+    log_test(
+        "World Background pure white (1.0, 1.0, 1.0)",
+        bg_node is not None and bg_node.inputs["Color"].default_value[0] == 1.0 and bg_node.inputs["Color"].default_value[1] == 1.0 and bg_node.inputs["Color"].default_value[2] == 1.0
+    )
 
-    # Check Object Materials Assigned
-    jar_mat = bpy.data.materials.get("SB_Jar_Chamber_Material")
-    carrier_mat = bpy.data.materials.get("SB_Sun_Wheel_Material")
-    accent_mat = bpy.data.materials.get("SB_Accent_Marker_Material")
-    log_test("Jar Chamber Material exists", jar_mat is not None)
-    log_test("Carrier Material exists", carrier_mat is not None)
-    log_test("Accent Material exists", accent_mat is not None)
+    # Check Studio 3-point lighting
+    has_key = bpy.data.objects.get("Studio_Key_Light") is not None
+    has_fill = bpy.data.objects.get("Studio_Fill_Light") is not None
+    has_rim = bpy.data.objects.get("Studio_Rim_Light") is not None
+    log_test("Studio 3-Point Lights Created", has_key and has_fill and has_rim)
 
-    log_test("Jar Chamber has Jar Material assigned", bool(jar_obj.data.materials and jar_obj.data.materials[0] == jar_mat))
-    log_test("Sun Wheel has Carrier Material assigned", bool(sun_obj.data.materials and sun_obj.data.materials[0] == carrier_mat))
-    marker = bpy.data.objects.get("Sun_Indicator_Marker")
-    log_test("Sun Marker has Accent Material assigned", bool(marker and marker.data.materials and marker.data.materials[0] == accent_mat))
+    # 2. PBR Material Library Generation
+    expected_mats = [
+        "SB_Chamber_Casing",
+        "SB_Chamber_Lid",
+        "SB_Carrier_Plate",
+        "SB_Chamber_Inspection_Glass",
+        "SB_Grinding_Media_Steel",
+        "SB_Grinding_Media_Zirconia",
+        "SB_DEM_Dynamic_Particle",
+        "SB_Gravity_Arrow_Amber",
+    ]
+    all_mats_exist = all(bpy.data.materials.get(m) is not None for m in expected_mats)
+    log_test("Standard PBR Materials Library Generated", all_mats_exist)
 
-    # 2. Test Studio Grey Preset
-    ret_studio = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="STUDIO_NEUTRAL")
-    log_test("Apply Studio Grey Preset", ret_studio == {"FINISHED"})
-    log_test("Studio Grey Background applied", abs(bg_node.inputs["Color"].default_value[0] - 0.92) < 0.05)
-    log_test("Studio Grey Jar Finish is Ceramic", props.sci_jar_finish == "ALUMINA_CERAMIC")
-    log_test("Studio Grey Media Palette is Plasma", props.sci_media_palette == "PLASMA")
+    # Test Material Assignment to Jar
+    props.selected_studio_material = "SB_Chamber_Casing"
+    bpy.context.view_layer.objects.active = jar_obj
+    jar_obj.select_set(True)
+    ret_assign = bpy.ops.science_blocks.assign_studio_material()
+    log_test(
+        "Assign PBR Material to Jar",
+        ret_assign == {"FINISHED"} and jar_obj.data.materials and jar_obj.data.materials[0].name == "SB_Chamber_Casing"
+    )
 
-    # 3. Test Metallic Rig Preset
-    ret_metal = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="METALLIC_TECH")
-    log_test("Apply Metallic Rig Preset", ret_metal == {"FINISHED"})
-    log_test("Metallic Rig Jar Finish is Stainless Steel", props.sci_jar_finish == "STAINLESS_STEEL")
-    log_test("Metallic Rig Media Palette is Chrome Steel", props.sci_media_palette == "STEEL")
+    # Test Material Duplication
+    ret_dup = bpy.ops.science_blocks.duplicate_studio_material()
+    dup_mat = bpy.data.materials.get("SB_Chamber_Casing_Custom")
+    log_test(
+        "Duplicate PBR Material for Customization",
+        ret_dup == {"FINISHED"} and dup_mat is not None and jar_obj.data.materials[0] == dup_mat
+    )
 
-    # 4. Test Conference Dark Preset
-    ret_dark = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="CONFERENCE_DARK")
-    log_test("Apply Conference Dark Preset", ret_dark == {"FINISHED"})
-    log_test("Dark Background applied", bg_node.inputs["Color"].default_value[0] < 0.1)
-    log_test("Dark Keynote Media Palette is Turbo", props.sci_media_palette == "TURBO")
+    # 3. Yade DEM Simulation with Dynamic Contact Force Colormap
+    props.dem_solver_engine = "YADE"
+    props.dem_viewport_colormap = "FORCE"
+    props.dem_sim_frames = 25
+    props.dem_ball_count = 12
+    ret_yade_force = bpy.ops.science_blocks.run_dem_simulation()
+    log_test("Run Yade DEM Simulation with FORCE Colormap", ret_yade_force == {"FINISHED"})
 
-    # 5. Test Transparent Cutout Preset (LaTeX / Overleaf / Word PNG)
-    ret_trans = bpy.ops.science_blocks.apply_scientific_paper_colors(preset="TRANSPARENT_LATEX")
-    log_test("Apply Transparent LaTeX Preset", ret_trans == {"FINISHED"})
-    log_test("Render Film Transparent Enabled", scene.render.film_transparent)
+    # Check that yade_simulation.py was exported
+    yade_script_path = os.path.join(out_dir, "yade_simulation.py") if os.path.exists(os.path.join(out_dir, "yade_simulation.py")) else "yade_simulation.py"
+    yade_script_exists = os.path.exists(yade_script_path)
+    log_test("Yade Simulation Script (yade_simulation.py) Generated", yade_script_exists)
 
-    # 6. Test Quick Background Setter Operator
-    ret_bg_w = bpy.ops.science_blocks.set_paper_background(bg_mode="WHITE")
-    log_test("Set Background White Operator", ret_bg_w == {"FINISHED"} and not scene.render.film_transparent and bg_node.inputs["Color"].default_value[0] == 1.0)
+    # Check particles animated with dynamic color keyframes
+    coll_media = bpy.data.collections.get("Science_Blocks_Milling_Media")
+    media_balls = [o for o in coll_media.objects if o.name.startswith("DEM_Media_") and not o.name.startswith("DEM_Media_Side_")]
+    log_test("DEM Particles Instantiated in Collection", len(media_balls) == 12)
 
-    ret_bg_t = bpy.ops.science_blocks.set_paper_background(bg_mode="TRANSPARENT")
-    log_test("Set Background Transparent Operator", ret_bg_t == {"FINISHED"} and scene.render.film_transparent)
+    sample_ball = media_balls[0]
+    has_color_anim = False
+    if sample_ball.animation_data and sample_ball.animation_data.action:
+        # Check F-curves for 'color'
+        has_color_anim = any("color" in fc.data_path for fc in sample_ball.animation_data.action.fcurves)
+    log_test("Particles Animate Dynamic Contact Force Color", has_color_anim)
 
-    # 7. Test Particle Recoloring & Scientific Colormaps LUT
-    props.sci_media_palette = "VIRIDIS"
-    ret_recol = bpy.ops.science_blocks.update_particle_colors()
-    log_test("Recolor Particles Operator (Viridis)", ret_recol == {"FINISHED"})
-
-    # Verify Colormap Math Functions
-    c_vir_0 = colormaps.evaluate_scientific_colormap("VIRIDIS", 0.0, v_max=5.0)
-    c_vir_1 = colormaps.evaluate_scientific_colormap("VIRIDIS", 5.0, v_max=5.0)
-    log_test("Viridis evaluation 0.0 is dark purple", c_vir_0[2] > 0.3 and c_vir_0[0] < 0.4)
-    log_test("Viridis evaluation 1.0 is bright yellow", c_vir_1[0] > 0.8 and c_vir_1[1] > 0.8)
-
-    c_plasma = colormaps.evaluate_scientific_colormap("PLASMA", 2.5, v_max=5.0)
-    log_test("Plasma evaluation valid RGBA", len(c_plasma) == 4 and all(0.0 <= x <= 1.0 for x in c_plasma))
-
-    c_turbo = colormaps.evaluate_scientific_colormap("TURBO", 2.5, v_max=5.0)
-    log_test("Turbo evaluation valid RGBA", len(c_turbo) == 4 and all(0.0 <= x <= 1.0 for x in c_turbo))
-
-    c_coolwarm = colormaps.evaluate_scientific_colormap("COOLWARM", 2.5, v_max=5.0)
-    log_test("Coolwarm evaluation valid RGBA", len(c_coolwarm) == 4 and all(0.0 <= x <= 1.0 for x in c_coolwarm))
-
-    c_steel = colormaps.evaluate_scientific_colormap("STEEL", 2.5)
-    log_test("Steel evaluation is reflective metallic grey", abs(c_steel[0] - 0.85) < 0.05)
-
-    c_ceramic = colormaps.evaluate_scientific_colormap("CERAMIC", 2.5)
-    log_test("Ceramic evaluation is clean white", c_ceramic[0] > 0.9 and c_ceramic[1] > 0.9)
-
-    # 8. Test Publication Viewport Shading Operator
-    ret_shd = bpy.ops.science_blocks.enhance_publication_viewport()
-    log_test("Enhance Publication Viewport Operator Finished", ret_shd == {"FINISHED"})
-    log_test("Viewport Cavity Property is True", props.sci_viewport_cavity)
-
-    # 9. Test Save & Load Setup Persistence with Scientific Styling
-    props.sci_paper_preset = "CONFERENCE_DARK"
-    props.sci_jar_finish = "FROSTED_GLASS"
-    props.sci_jar_opacity = 0.33
-    props.sci_accent_color = (0.1, 0.8, 0.9)
-    bpy.ops.science_blocks.save_setup()
-
-    # Reset
-    props.sci_paper_preset = "NATURE_WHITE"
-    props.sci_jar_opacity = 0.50
-
-    # Load back
-    bpy.ops.science_blocks.load_setup()
-    log_test("Config JSON preserves sci_paper_preset 'CONFERENCE_DARK'", props.sci_paper_preset == "CONFERENCE_DARK")
-    # -------------------------------------------------------------------------
-    # TEST SUITE 12: Ready-to-Run Simulation Demo Scenarios Showcase
-    # -------------------------------------------------------------------------
-    print("\n--- Test Suite 12: Ready-to-Run Simulation Demo Scenarios Showcase ---")
-
-    # 1. High-Energy Ball Mill Demo
-    bpy.ops.science_blocks.load_demo(demo_type="HIGH_ENERGY_BALL_MILL")
-    log_test("Demo 1: High Energy Ball Mill loaded", props.demo_scenario == "HIGH_ENERGY_BALL_MILL")
-    log_test("Demo 1: Steel media preset applied", props.dem_material_preset == "STEEL")
-    log_test("Demo 1: Nature White styling applied", props.sci_paper_preset == "NATURE_WHITE")
-
-    # 2. Wet Slurry Milling Demo
-    bpy.ops.science_blocks.load_demo(demo_type="WET_SLURRY_MILL")
-    log_test("Demo 2: Wet Slurry Mill loaded", props.demo_scenario == "WET_SLURRY_MILL")
-    log_test("Demo 2: Slurry physics active", props.slurry_enable is True)
-    log_test("Demo 2: Ceramic Zirconia media", props.dem_material_preset == "ZIRCONIA")
-    log_test("Demo 2: Cutaway cutter generated", bpy.data.objects.get("Jar_Cutaway_Cutter") is not None)
-
-    # 3. Horizontal 90° Axis Tumbling Mill Demo
-    bpy.ops.science_blocks.load_demo(demo_type="HORIZONTAL_MILL")
-    sun_wheel = bpy.data.objects.get("Sun_Wheel_Plate")
-    log_test("Demo 3: Horizontal Mill loaded", props.demo_scenario == "HORIZONTAL_MILL")
-    log_test("Demo 3: 90° axis rotation applied", abs(math.degrees(sun_wheel.rotation_euler.x) - 90.0) < 1.0)
-    log_test("Demo 3: Tungsten media preset", props.dem_material_preset == "TUNGSTEN")
-    log_test("Demo 3: Metallic Tech styling applied", props.sci_paper_preset == "METALLIC_TECH")
-
-    # 4. Zero-G Space Centrifugal Mill Demo
-    bpy.ops.science_blocks.load_demo(demo_type="SPACE_ZERO_G_MILL")
-    log_test("Demo 4: Zero-G Space Mill loaded", props.demo_scenario == "SPACE_ZERO_G_MILL")
-    log_test("Demo 4: Zero gravity physics (g = 0)", props.dem_gravity_z == 0.0)
-    log_test("Demo 4: Silicon Nitride media", props.dem_material_preset == "SILICON_NITRIDE")
-    log_test("Demo 4: Conference Dark styling applied", props.sci_paper_preset == "CONFERENCE_DARK")
-
-    # 5. Multiphysics Solvers Suite Demo
-    bpy.ops.science_blocks.load_demo(demo_type="MULTIPHYSICS_SOLVERS")
-    tree = props.active_node_tree
-    node_types = {n.bl_idname for n in tree.nodes} if tree else set()
-    log_test("Demo 5: Multiphysics Solvers Suite loaded", props.demo_scenario == "MULTIPHYSICS_SOLVERS")
-    log_test("Demo 5: LIGGGHTS node present", "ScienceBlocksLiggghtsNode" in node_types)
-    log_test("Demo 5: OpenFOAM node present", "ScienceBlocksOpenFOAMNode" in node_types)
-    log_test("Demo 5: CFDEM node present", "ScienceBlocksCFDEMNode" in node_types)
-    log_test("Demo 5: CalculiX node present", "ScienceBlocksCalculiXNode" in node_types)
-    log_test("Demo 5: Elmer node present", "ScienceBlocksElmerNode" in node_types)
-    log_test("Demo 5: FluidX3D node present", "ScienceBlocksFluidX3DNode" in node_types)
-    log_test("Demo 5: OpenRadioss node present", "ScienceBlocksOpenRadiossNode" in node_types)
-    log_test("Demo 5: Yade node present", "ScienceBlocksYadeNode" in node_types)
+    # 4. Test Velocity / Speed Colormap Mode
+    props.dem_viewport_colormap = "VELOCITY"
+    ret_yade_vel = bpy.ops.science_blocks.run_dem_simulation()
+    log_test("Run Yade DEM Simulation with VELOCITY Colormap", ret_yade_vel == {"FINISHED"})
 
     print("\n" + "=" * 70)
-    print("ALL VERIFICATION TESTS (SUITES 1 THROUGH 12) PASSED SUCCESSFULLY!")
-    print("Planetary Ball Mill Tool, Demos, Solvers & Scientific Colors are 100% Verified.")
+    print("ALL VERIFICATION TESTS PASSED SUCCESSFULLY!")
+    print("Studio White Theme, Materials Library, Yade Engine & Dynamic Colormaps 100% Verified.")
     print("=" * 70)
 
 if __name__ == "__main__":

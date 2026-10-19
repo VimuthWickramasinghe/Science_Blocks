@@ -442,6 +442,32 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default=False,
     )
 
+    # Professional Studio Theme & Materials
+    viewport_theme_mode: EnumProperty(
+        name="Studio Theme",
+        items=[
+            ("LIGHT_WHITE", "Light Studio (White Background)", "High-contrast pure white studio environment for presentation"),
+            ("DARK_CAD", "Dark CAD Gray", "Classic dark gray CAD background"),
+        ],
+        default="LIGHT_WHITE",
+        description="Viewport background and lighting theme mode",
+    )
+    selected_studio_material: EnumProperty(
+        name="Material Library",
+        items=[
+            ("SB_Chamber_Casing", "Chamber Casing (Stainless Steel)", "High-strength brushed stainless steel / ceramic jar casing"),
+            ("SB_Chamber_Lid", "Chamber Clamp Lid", "Dark anodized aerospace alloy clamp lid"),
+            ("SB_Carrier_Plate", "Carrier Turntable", "Industrial machine tool carrier wheel"),
+            ("SB_Chamber_Inspection_Glass", "Inspection Glass (Transparent)", "Clear optical acrylic for interior particle visibility"),
+            ("SB_Grinding_Media_Steel", "Grinding Balls (Chrome Steel)", "Reflective polished chrome alloy grinding balls"),
+            ("SB_Grinding_Media_Zirconia", "Grinding Balls (Zirconia Ceramic)", "High-density white ceramic grinding media"),
+            ("SB_DEM_Dynamic_Particle", "Dynamic Particle Heatmap", "Colormapped particle shader responding to speed and force"),
+            ("SB_Gravity_Arrow_Amber", "Gravity Arrow (Vibrant Amber)", "Radiant high-contrast directional arrow"),
+        ],
+        default="SB_Chamber_Casing",
+        description="Select standard material to assign or duplicate",
+    )
+
     # 2b. Mill Geometry & CAD Model Dimensions
     mill_dimension_mode: EnumProperty(
         name="Dimension Mode",
@@ -604,18 +630,22 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default="VELOCITY_VERLET",
         description="Numerical integration method for orbital and contact equations",
     )
+    dem_solver_engine: EnumProperty(
+        name="DEM Engine",
+        items=[
+            ("YADE", "Yade DEM (Open-Source)", "Yade discrete element open-source framework formulation"),
+            ("LIGGGHTS", "LIGGGHTS-DEM", "LAMMPS-based granular physics engine"),
+            ("NATIVE", "Science Blocks Symplectic DEM", "High-performance native Velocity-Verlet engine"),
+        ],
+        default="YADE",
+        description="Discrete Element Method simulation engine backend",
+    )
     dem_viewport_colormap: EnumProperty(
         name="Viewport Colormap",
         items=[
-            ("VIRIDIS", "Viridis (Nature / Science Standard)", "Perceptually uniform, colorblind safe"),
-            ("PLASMA", "Plasma (High-Energy Heatmap)", "High-contrast energetic colormap"),
-            ("TURBO", "Turbo (Perceptual Rainbow)", "Smooth Google AI perceptual spectrum"),
-            ("COOLWARM", "Coolwarm (Diverging CFD / DEM)", "Diverging blue to red physics colormap"),
-            ("STEEL", "Chrome Steel (100Cr6)", "Polished metallic bearing balls"),
-            ("CERAMIC", "Zirconia White Ceramic", "Clean laboratory ceramic spheres"),
-            ("TUNGSTEN", "Tungsten Carbide", "Dense dark carbide spheres"),
-            ("VELOCITY", "Classic Rainbow (Velocity)", "Traditional velocity rainbow map"),
-            ("ENERGY", "Impact Shock Energy", "Highlight particles experiencing severe collision shocks"),
+            ("VELOCITY", "Speed / Velocity Magnitude", "Color particles dynamically from blue (stationary) to yellow to crimson red (high speed)"),
+            ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
+            ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock"),
             ("SOLID", "Solid Realistic Material", "Realistic metallic/ceramic material rendering"),
         ],
         default="VIRIDIS",
