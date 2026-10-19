@@ -6,7 +6,100 @@ from bpy.props import (
     EnumProperty,
     PointerProperty,
     IntProperty,
+    FloatVectorProperty,
 )
+
+
+def update_scientific_styling(self, context):
+    """Callback triggered whenever a scientific styling property is adjusted."""
+    try:
+        from . import operators
+        operators.apply_scientific_paper_style(context)
+    except Exception:
+        pass
+
+
+def update_scientific_preset(self, context):
+    """When the user changes the preset dropdown, populate matching color fields and apply style."""
+    preset = self.sci_paper_preset
+    if preset == "NATURE_WHITE":
+        self.sci_background_color = (1.0, 1.0, 1.0)
+        self.sci_transparent_background = False
+        self.sci_jar_finish = "FROSTED_GLASS"
+        self.sci_jar_color = (0.80, 0.92, 0.98)
+        self.sci_jar_opacity = 0.28
+        self.sci_sun_wheel_color = (0.12, 0.14, 0.18)
+        self.sci_sun_wheel_metallic = 0.70
+        self.sci_sun_wheel_roughness = 0.35
+        self.sci_accent_color = (0.08, 0.44, 0.88)
+        self.sci_media_palette = "VIRIDIS"
+        self.sci_viewport_cavity = True
+    elif preset == "STUDIO_NEUTRAL":
+        self.sci_background_color = (0.92, 0.93, 0.95)
+        self.sci_transparent_background = False
+        self.sci_jar_finish = "ALUMINA_CERAMIC"
+        self.sci_jar_color = (0.95, 0.95, 0.93)
+        self.sci_jar_opacity = 0.60
+        self.sci_sun_wheel_color = (0.75, 0.77, 0.80)
+        self.sci_sun_wheel_metallic = 0.85
+        self.sci_sun_wheel_roughness = 0.30
+        self.sci_accent_color = (0.06, 0.65, 0.35)
+        self.sci_media_palette = "PLASMA"
+        self.sci_viewport_cavity = True
+    elif preset == "METALLIC_TECH":
+        self.sci_background_color = (0.88, 0.89, 0.91)
+        self.sci_transparent_background = False
+        self.sci_jar_finish = "STAINLESS_STEEL"
+        self.sci_jar_color = (0.85, 0.86, 0.88)
+        self.sci_jar_opacity = 1.0
+        self.sci_sun_wheel_color = (0.20, 0.22, 0.25)
+        self.sci_sun_wheel_metallic = 0.90
+        self.sci_sun_wheel_roughness = 0.25
+        self.sci_accent_color = (1.0, 0.55, 0.05)
+        self.sci_media_palette = "STEEL"
+        self.sci_viewport_cavity = True
+    elif preset == "CONFERENCE_DARK":
+        self.sci_background_color = (0.03, 0.05, 0.09)
+        self.sci_transparent_background = False
+        self.sci_jar_finish = "FROSTED_GLASS"
+        self.sci_jar_color = (0.10, 0.75, 0.95)
+        self.sci_jar_opacity = 0.30
+        self.sci_sun_wheel_color = (0.08, 0.09, 0.12)
+        self.sci_sun_wheel_metallic = 0.80
+        self.sci_sun_wheel_roughness = 0.25
+        self.sci_accent_color = (0.0, 0.85, 0.95)
+        self.sci_media_palette = "TURBO"
+        self.sci_viewport_cavity = True
+    elif preset == "TRANSPARENT_LATEX":
+        self.sci_background_color = (1.0, 1.0, 1.0)
+        self.sci_transparent_background = True
+        self.sci_jar_finish = "FROSTED_GLASS"
+        self.sci_jar_color = (0.75, 0.90, 0.98)
+        self.sci_jar_opacity = 0.25
+        self.sci_sun_wheel_color = (0.15, 0.17, 0.22)
+        self.sci_sun_wheel_metallic = 0.75
+        self.sci_sun_wheel_roughness = 0.35
+        self.sci_accent_color = (0.08, 0.44, 0.88)
+        self.sci_media_palette = "VIRIDIS"
+        self.sci_viewport_cavity = True
+
+    update_scientific_styling(self, context)
+
+
+def update_gravity_arrow_orientation(self, context):
+    """Callback triggered whenever gravity arrow direction or orientation property is adjusted."""
+    try:
+        from . import nodes
+        scene = getattr(context, "scene", None) or bpy.context.scene
+        fps = scene.render.fps / max(1, scene.render.fps_base)
+        frame_start = getattr(scene, "frame_start", 1)
+        props = getattr(scene, "science_blocks_props", None)
+        time_scale = getattr(props, "motion_time_scale", 1.0) if props else 1.0
+        t = max(0.0, (scene.frame_current - frame_start) / fps) * time_scale
+        nodes.update_gravity_arrow_transform(scene, t)
+        nodes.evaluate_kinematics_frame(scene)
+    except Exception:
+        pass
 
 
 class ScienceBlocksProperties(bpy.types.PropertyGroup):
@@ -26,8 +119,204 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         description="Expand/Collapse DEM simulation and data",
         default=True,
     )
+    ui_scientific_styling: BoolProperty(
+        name="Scientific Paper Visuals & Colors",
+        description="Expand/Collapse publication-grade background and object colors",
+        default=True,
+    )
 
-    # 1. Scientific Python Environment Status
+    # Simulation Demos & Scenarios
+    demo_scenario: EnumProperty(
+        name="Simulation Demo",
+        description="Select a pre-configured scientific simulation demo",
+        items=[
+            ("HIGH_ENERGY_BALL_MILL", "🪐 High-Energy Planetary Mill", "Dry powder milling in optimal cataracting impact regime with steel balls"),
+            ("WET_SLURRY_MILL", "🌊 Wet Slurry Hydrodynamics", "Liquid milling with hydrodynamic drag, viscous damping, and ceramic balls"),
+            ("HORIZONTAL_MILL", "🔄 Horizontal Axis Tumbling Mill", "90° tilted rotation axis with transverse tumbling and rotating gravity vector"),
+            ("MULTIPHYSICS_SOLVERS", "🧪 Multiphysics Solvers Suite", "Pre-wired node network connecting CFD, DEM, FEM, and Thermal solvers"),
+            ("SPACE_ZERO_G_MILL", "🌌 Zero-G Space Centrifugal Mill", "Microgravity orbital manufacturing driven purely by centrifugal and Coriolis forces"),
+        ],
+        default="HIGH_ENERGY_BALL_MILL",
+    )
+
+    # Scientific Publication Styling & Paper Themes
+    sci_paper_preset: EnumProperty(
+        name="Publication Preset",
+        items=[
+            ("NATURE_WHITE", "Nature / Science (Paper White)", "Pure white background, frosted glass jar, titanium carrier, Viridis particles"),
+            ("STUDIO_NEUTRAL", "Physical Chemistry (Studio Grey)", "Soft studio grey background, ceramic jar, aluminum carrier, Plasma particles"),
+            ("METALLIC_TECH", "Industrial Powder Tech (Metals)", "Clean neutral background, 316L stainless steel jar, chrome steel balls"),
+            ("CONFERENCE_DARK", "Conference Keynote (Dark Navy)", "Deep dark slate background, luminescent glass, cyber accents, Turbo particles"),
+            ("TRANSPARENT_LATEX", "Transparent Cutout (LaTeX / PNG)", "Transparent film background for direct placement in LaTeX / Word papers"),
+            ("CUSTOM", "Custom Scientific Palette", "User-defined custom colors and materials"),
+        ],
+        default="NATURE_WHITE",
+        update=update_scientific_preset,
+    )
+    sci_background_color: FloatVectorProperty(
+        name="Background Color",
+        subtype="COLOR",
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        min=0.0,
+        max=1.0,
+        description="World background color for 3D viewport and figure renders",
+        update=update_scientific_styling,
+    )
+    sci_transparent_background: BoolProperty(
+        name="Transparent Background (LaTeX / PNG)",
+        description="Render with transparent film alpha background so figure integrates directly onto papers and slides",
+        default=False,
+        update=update_scientific_styling,
+    )
+    sci_jar_finish: EnumProperty(
+        name="Jar Finish",
+        items=[
+            ("FROSTED_GLASS", "Frosted Scientific Glass", "Semi-transparent acrylic/glass showing internal charge clearly"),
+            ("STAINLESS_STEEL", "316L Stainless Steel", "Polished laboratory metal casing"),
+            ("ALUMINA_CERAMIC", "Alumina Ceramic White", "Dense technical white ceramic"),
+            ("CUSTOM", "Custom Color & Tint", "Custom user-selected color and opacity"),
+        ],
+        default="FROSTED_GLASS",
+        update=update_scientific_styling,
+    )
+    sci_jar_color: FloatVectorProperty(
+        name="Jar Color / Tint",
+        subtype="COLOR",
+        size=3,
+        default=(0.80, 0.92, 0.98),
+        min=0.0,
+        max=1.0,
+        description="Tint color of the grinding jar chamber",
+        update=update_scientific_styling,
+    )
+    sci_jar_opacity: FloatProperty(
+        name="Jar Opacity",
+        description="Opacity of the chamber walls (lower allows clear viewing of internal charge)",
+        default=0.28,
+        min=0.05,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_sun_wheel_color: FloatVectorProperty(
+        name="Carrier Plate Color",
+        subtype="COLOR",
+        size=3,
+        default=(0.12, 0.14, 0.18),
+        min=0.0,
+        max=1.0,
+        description="Color of the Sun Wheel carrier disc",
+        update=update_scientific_styling,
+    )
+    sci_sun_wheel_metallic: FloatProperty(
+        name="Carrier Metallic",
+        description="Metallic reflectance of the carrier plate",
+        default=0.70,
+        min=0.0,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_sun_wheel_roughness: FloatProperty(
+        name="Carrier Roughness",
+        description="Surface roughness of the carrier plate",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_accent_color: FloatVectorProperty(
+        name="Indicator Accent Color",
+        subtype="COLOR",
+        size=3,
+        default=(0.08, 0.44, 0.88),
+        min=0.0,
+        max=1.0,
+        description="Color for rotation markers, directional pointers, and gravity arrows",
+        update=update_scientific_styling,
+    )
+    sci_media_palette: EnumProperty(
+        name="Media Palette",
+        items=[
+            ("VIRIDIS", "Viridis (Nature / Science Standard)", "Perceptually uniform, colorblind-safe standard for journal papers"),
+            ("PLASMA", "Plasma (High-Energy Heatmap)", "High-contrast energetic colormap (purple to yellow)"),
+            ("TURBO", "Turbo (Perceptual Rainbow)", "Smooth Google AI perceptual spectrum"),
+            ("COOLWARM", "Coolwarm (Diverging CFD/DEM)", "Diverging blue to red physics colormap"),
+            ("RAINBOW", "Classic Rainbow (Velocity)", "Traditional velocity rainbow map"),
+            ("ENERGY", "Impact Shock Energy", "Highlight high kinetic collision shocks"),
+            ("STEEL", "Chrome Steel (100Cr6)", "Polished metallic bearing balls"),
+            ("CERAMIC", "Zirconia White Ceramic", "Clean laboratory ceramic spheres"),
+            ("TUNGSTEN", "Tungsten Carbide", "Dense dark carbide spheres"),
+        ],
+        default="VIRIDIS",
+        update=update_scientific_styling,
+    )
+    sci_viewport_cavity: BoolProperty(
+        name="Publication Viewport Shading (Cavity + AO)",
+        description="Enable Viewport Cavity Ridge/Valley and Ambient Occlusion for publication-sharp 3D technical graphics",
+        default=True,
+        update=update_scientific_styling,
+    )
+
+    # 1. Scientific Python Environment Selection & Modes
+    python_environment_type: EnumProperty(
+        name="Target Runtime",
+        description="Select the Python execution runtime for Science Blocks",
+        items=(
+            ("BLENDER", "Blender Python", "Use Blender's bundled Python environment (Default)", "BLENDER", 0),
+            ("LOCAL", "Local Environment", "Connect to an external local Python virtualenv or process", "CONSOLE", 1),
+            ("COLAB", "Google Colab", "Connect to a remote Google Colab GPU server via FastAPI", "WORLD", 2),
+        ),
+        default="BLENDER",
+    )
+
+    # Local Python Environment Properties
+    local_python_path: StringProperty(
+        name="Python Binary / Virtualenv",
+        description="Path to local Python executable (e.g. /usr/bin/python3, ./venv/bin/python, or conda)",
+        subtype='FILE_PATH',
+        default="",
+    )
+    local_env_is_running: BoolProperty(
+        name="Local Env Running",
+        description="Whether a local Python worker or process is active",
+        default=False,
+    )
+    local_env_pid: IntProperty(
+        name="Process PID",
+        description="PID of running local Python background process",
+        default=0,
+    )
+    local_env_status: StringProperty(
+        name="Local Status",
+        description="Status of the external local Python environment",
+        default="Not Connected",
+    )
+    local_pkg_numpy: BoolProperty(name="NumPy (Local)", default=False)
+    local_pkg_scipy: BoolProperty(name="SciPy (Local)", default=False)
+    local_pkg_matplotlib: BoolProperty(name="Matplotlib (Local)", default=False)
+
+    # Google Colab FastAPI Cloud Properties
+    colab_endpoint_url: StringProperty(
+        name="Colab Endpoint URL",
+        description="Public HTTPS URL of Google Colab FastAPI server (e.g. from ngrok or localtunnel)",
+        default="https://your-colab-service.ngrok-free.app",
+    )
+    colab_is_connected: BoolProperty(
+        name="Colab Connected",
+        description="Whether the connection to Google Colab has been established",
+        default=False,
+    )
+    colab_status_msg: StringProperty(
+        name="Colab Status",
+        description="Current status of Google Colab remote connection",
+        default="Disconnected",
+    )
+    colab_server_info: StringProperty(
+        name="Colab Server Info",
+        description="Remote GPU / Server specifications from Colab",
+        default="",
+    )
+
     python_system_version: StringProperty(
         name="Python Version",
         description="Detected Blender Python version",
@@ -125,6 +414,13 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
             ("-X", "Lateral (-X)", "Gravity vector pointing along (-X)"),
         ],
         default="-Z",
+        update=update_gravity_arrow_orientation,
+    )
+    side_jar_invert_arrow: BoolProperty(
+        name="Invert Arrow Rotation",
+        description="Invert the rotation direction of the gravity force arrow in the inspection view",
+        default=False,
+        update=update_gravity_arrow_orientation,
     )
 
     # Professional Chamber Inspection & Framing (Focus Jar)
@@ -352,7 +648,7 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
             ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock"),
             ("SOLID", "Solid Realistic Material", "Realistic metallic/ceramic material rendering"),
         ],
-        default="VELOCITY",
+        default="VIRIDIS",
         description="Dynamic color-coding of milling media in 3D viewport",
     )
 

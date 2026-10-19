@@ -10,7 +10,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 import addon_utils
 addon_utils.enable("bl_ext.vscode_development.Science_Blocks")
 
-from bl_ext.vscode_development.Science_Blocks import properties, operators, nodes, dem_solver, report_generator, ui_panels, tools
+from bl_ext.vscode_development.Science_Blocks import properties, operators, nodes, dem_solver, report_generator, ui_panels, tools, colormaps
 
 def log_test(name, passed, detail=""):
     status = "PASS" if passed else "FAIL"
@@ -111,10 +111,35 @@ def run_all_tests():
     nodes.evaluate_kinematics_frame(scene)
     log_test("Side Jar retains 90° tilt after frame change", abs(side_jar.rotation_euler.x - math.radians(90.0)) < 1e-4)
 
-    # The arrow must be impacted by parent wheel rotation, changing ONLY in the X axis!
-    log_test("Gravity Arrow X rotation impacted by parent wheel", abs(arrow.rotation_euler.x) > 0.01, f"arrow.rotation_euler.x = {arrow.rotation_euler.x}")
-    log_test("Gravity Arrow Y rotation remains 0 (only X changes)", abs(arrow.rotation_euler.y) < 1e-5)
-    log_test("Gravity Arrow Z rotation remains 0 (only X changes)", abs(arrow.rotation_euler.z) < 1e-5)
+    # Horizontal Mill: Arrow dynamically rotates in the transverse plane
+    g_horiz = nodes.compute_apparent_gravity_vector(scene, 30.0 / 24.0)
+    log_test("Horizontal Mill: Gravity Apparent Vector Norm is 1.0", abs(g_horiz.length - 1.0) < 1e-4)
+    log_test("Horizontal Mill: Gravity Arrow orientation updated dynamically", arrow.rotation_euler != mathutils.Euler((0, 0, 0)))
+
+    # Test Invert Arrow Direction toggle
+    rot_default = arrow.rotation_euler.copy()
+    props.side_jar_invert_arrow = True
+    nodes.evaluate_kinematics_frame(scene)
+    rot_inverted = arrow.rotation_euler.copy()
+    log_test("Invert Arrow changes transverse direction", rot_default != rot_inverted)
+    props.side_jar_invert_arrow = False
+    nodes.evaluate_kinematics_frame(scene)
+
+    # Rigorous Mathematical Test for High Energy Planetary Mill (Vertical Mill, tilt = 0°)
+    # In a vertical mill, Earth's gravity points strictly downward (-Z) with ZERO tumbling or pitching
+    sun_obj.rotation_euler.x = 0.0
+    bpy.context.view_layer.update()
+    nodes.evaluate_kinematics_frame(scene)
+    g_vert = nodes.compute_apparent_gravity_vector(scene, 30.0 / 24.0)
+    log_test("Vertical High-Energy Mill: Apparent Gravity strictly downward (0, 0, -1)", (g_vert - mathutils.Vector((0, 0, -1))).length < 1e-4)
+    log_test("Vertical High-Energy Mill: Gravity Arrow Euler X is 0 (No pitching)", abs(arrow.rotation_euler.x) < 1e-4)
+    log_test("Vertical High-Energy Mill: Gravity Arrow Euler Y is 0 (No rolling)", abs(arrow.rotation_euler.y) < 1e-4)
+    log_test("Vertical High-Energy Mill: Gravity Arrow Euler Z is 0 (No yawing)", abs(arrow.rotation_euler.z) < 1e-4)
+
+    # Restore 90° tilt for subsequent Horizontal Mill Suite 5
+    sun_obj.rotation_euler.x = math.radians(90.0)
+    bpy.context.view_layer.update()
+    nodes.evaluate_kinematics_frame(scene)
 
     # -------------------------------------------------------------------------
     # TEST SUITE 5: Full DEM Simulation & Scientific Telemetry under 90° Tilt

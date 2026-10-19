@@ -1,5 +1,6 @@
 import bpy
 import math
+import mathutils
 from bpy.props import (
     StringProperty,
     FloatProperty,
@@ -261,7 +262,7 @@ class ScienceBlocksGearRatioNode(bpy.types.Node):
             col.prop(self, "teeth_in")
             col.prop(self, "teeth_out")
             ratio = self.teeth_in / max(1, self.teeth_out)
-            col.label(text=f"Effective Ratio: {ratio:.3f}", icon="SORTALPHA")
+            col.label(text=f"Effective Ratio: {ratio:.3f}", icon="DRIVER_TRANSFORM")
 
         col.prop(self, "invert_direction", toggle=True, icon="ARROW_LEFTRIGHT")
 
@@ -402,7 +403,7 @@ class ScienceBlocksRotationNode(bpy.types.Node):
         r_base.prop(self, "base_rot_y", text="Y")
         r_base.prop(self, "base_rot_z", text="Z")
 
-        op = c_p.operator("science_blocks.capture_base_rotation", text="Capture Rest Pose", icon="RESTRICT_ROT_OFF")
+        op = c_p.operator("science_blocks.capture_base_rotation", text="Capture Rest Pose", icon="ORIENTATION_GIMBAL")
         op.node_name = self.name
 
 
@@ -661,12 +662,27 @@ def get_input_rpm(node, socket_name: str, t: float) -> float:
         return from_node.evaluate(t)
     elif isinstance(from_node, ScienceBlocksGearRatioNode):
         in_val = get_input_rpm(from_node, "RPM In", t)
+        # If RPM In is linked to an unsigned source, but the node tree contains a driving Sun Wheel,
+        # inherit the Sun Wheel's driving direction so the transmission reverses correctly!
+        rpm_in_sock = from_node.inputs.get("RPM In")
+        if rpm_in_sock and rpm_in_sock.is_linked:
+            src = rpm_in_sock.links[0].from_node
+            if not isinstance(src, ScienceBlocksRotationNode) and from_node.id_data:
+                for other_node in from_node.id_data.nodes:
+                    if isinstance(other_node, ScienceBlocksRotationNode):
+                        tgt = other_node.get_target_object()
+                        if tgt and ("Sun" in tgt.name or "Wheel" in tgt.name or other_node.label.startswith("Sun")):
+                            dir_m = -1.0 if other_node.direction == "CW" else 1.0
+                            in_val = abs(in_val) * dir_m
+                            break
         return from_node.evaluate(in_val)
     elif isinstance(from_node, ScienceBlocksOffsetNode):
         in_val = get_input_rpm(from_node, "Value In", t)
         return from_node.evaluate(in_val)
     elif isinstance(from_node, ScienceBlocksRotationNode):
-        return get_input_rpm(from_node, "RPM", t)
+        base_rpm = get_input_rpm(from_node, "RPM", t)
+        dir_mult = -1.0 if from_node.direction == "CW" else 1.0
+        return abs(base_rpm) * dir_mult
 
     return getattr(sock, "default_value", 0.0)
 
@@ -694,13 +710,18 @@ def get_input_float(node, socket_name: str, t: float, default: float = 0.0) -> f
 
 
 def get_parent_wheel_rotation_angle(scene, t: float) -> float:
-    """Computes continuous rotation angle of the parent wheel (Sun Wheel) for the Gravity Arrow."""
+    """Computes continuous rotation angle of the parent wheel (Sun Wheel) for kinematics and gravity tracking."""
     props = getattr(scene, "science_blocks_props", None)
     if not props:
         return 0.0
 
-    jar_obj = props.jar_chamber_obj or bpy.data.objects.get("Jar_Chamber")
-    sun_obj = props.sun_wheel_obj or (jar_obj.parent if jar_obj else None) or bpy.data.objects.get("Sun_Wheel")
+    jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+    sun_obj = (
+        getattr(props, "sun_wheel_obj", None)
+        or (jar_obj.parent if jar_obj else None)
+        or bpy.data.objects.get("Sun_Wheel_Plate")
+        or bpy.data.objects.get("Sun_Wheel")
+    )
 
     for group in bpy.data.node_groups:
         if group.bl_idname != "ScienceBlocksNodeTree":
@@ -720,16 +741,132 @@ def get_parent_wheel_rotation_angle(scene, t: float) -> float:
     if hasattr(props, "kinematics_sun_rot_rad") and props.kinematics_sun_rot_rad != 0.0:
         return props.kinematics_sun_rot_rad
 
-    if sun_obj:
-        if abs(sun_obj.rotation_euler.z) > 1e-4:
-            return sun_obj.rotation_euler.z
-        if abs(sun_obj.rotation_euler.x) > 1e-4:
-            return sun_obj.rotation_euler.x
+    if sun_obj and abs(sun_obj.rotation_euler.z) > 1e-4:
+        return sun_obj.rotation_euler.z
 
     if hasattr(props, "kinematics_sun_angle") and props.kinematics_sun_angle != 0.0:
         return math.radians(props.kinematics_sun_angle)
 
     return 0.0
+
+
+def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
+    """Computes the exact apparent gravity vector in the side inspection chamber.
+
+    Mathematical Formulation:
+      1. World Gravity Vector g_world:
+         Default Earth gravity points downward along -Z: (0, 0, -1).
+         If props.side_jar_gravity_axis is "-Y" or "-X", g_world is aligned accordingly.
+         If microgravity is active (Zero-G space demo, or props.dem_gravity_z == 0), returns (0, 0, 0).
+
+      2. Carrier (Sun Wheel) Spin Axis u_spin:
+         Extracted from the Sun Wheel 3D world orientation:
+           u_spin = (sun_obj.matrix_world.to_3x3() @ Vector((0, 0, 1))).normalized()
+         If sun_obj is absent, defaults to vertical (0, 0, 1).
+
+      3. Rodrigues' Vector Decomposition:
+         Decompose g_world into parallel and perpendicular components relative to u_spin:
+           g_par = (g_world . u_spin) * u_spin
+           g_perp = g_world - g_par
+
+      4. Rotating Reference Frame Transformation:
+         As the carrier revolves at angular position theta(t), the transverse component
+         g_perp rotates in the cross-sectional plane orthogonal to u_spin:
+           theta_eff = parent_rot if props.side_jar_invert_arrow else -parent_rot
+           g_apparent = g_par + g_perp * cos(theta_eff) + (u_spin x g_perp) * sin(theta_eff)
+
+      5. Physical Invariants:
+         - Standard Vertical Mill (tilt = 0°):
+           u_spin = (0, 0, 1), so g_perp = (0, 0, 0).
+           Thus g_apparent = (0, 0, -1) strictly constant for all time.
+           Zero spurious tumbling or pitching around the X or Y axis.
+         - 90° Horizontal Mill (tilt = 90°):
+           g_par = 0, g_perp = (0, 0, -1).
+           g_apparent rotates continuously in the transverse plane with exact unit norm.
+         - Arbitrary Tilt Angle:
+           Preserves axial gravity component while rotating transverse component.
+    """
+    props = getattr(scene, "science_blocks_props", None)
+
+    # Check for microgravity / zero-G
+    if props:
+        if getattr(props, "demo_scenario", "") == "SPACE_ZERO_G_MILL":
+            return mathutils.Vector((0.0, 0.0, 0.0))
+        if abs(getattr(props, "dem_gravity_z", -9.81)) < 1e-5:
+            return mathutils.Vector((0.0, 0.0, 0.0))
+
+    # Base world gravity direction
+    axis = getattr(props, "side_jar_gravity_axis", "-Z") if props else "-Z"
+    if axis == "-Y":
+        g_world = mathutils.Vector((0.0, -1.0, 0.0))
+    elif axis == "-X":
+        g_world = mathutils.Vector((-1.0, 0.0, 0.0))
+    else:
+        g_world = mathutils.Vector((0.0, 0.0, -1.0))
+
+    # Carrier (Sun Wheel) Spin Axis in World Space
+    jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+    sun_obj = (
+        getattr(props, "sun_wheel_obj", None)
+        or (jar_obj.parent if jar_obj else None)
+        or bpy.data.objects.get("Sun_Wheel_Plate")
+        or bpy.data.objects.get("Sun_Wheel")
+    )
+
+    if sun_obj and hasattr(sun_obj, "matrix_world") and sun_obj.matrix_world:
+        rot_mat = sun_obj.matrix_world.to_3x3()
+        u_spin = (rot_mat @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
+    elif sun_obj and hasattr(sun_obj, "rotation_euler"):
+        rot_mat = sun_obj.rotation_euler.to_matrix()
+        u_spin = (rot_mat @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
+    else:
+        u_spin = mathutils.Vector((0.0, 0.0, 1.0))
+
+    # Rodrigues Decomposition
+    g_dot_u = g_world.dot(u_spin)
+    g_par = g_dot_u * u_spin
+    g_perp = g_world - g_par
+
+    # Standard vertical mill optimization: strictly parallel, no transverse component
+    if g_perp.length < 1e-6:
+        return g_par
+
+    # Transverse rotation in rotating carrier frame
+    parent_rot = get_parent_wheel_rotation_angle(scene, t)
+    invert = getattr(props, "side_jar_invert_arrow", False) if props else False
+    theta_eff = parent_rot if invert else -parent_rot
+
+    cross_term = u_spin.cross(g_perp)
+    g_apparent = g_par + g_perp * math.cos(theta_eff) + cross_term * math.sin(theta_eff)
+    return g_apparent
+
+
+def update_gravity_arrow_transform(scene, t: float = 0.0):
+    """Updates the 3D position, scale, and orientation of the Gravity Force Arrow."""
+    arrow = bpy.data.objects.get("Gravity_Force_Arrow")
+    if not arrow:
+        return
+
+    g_vec = compute_apparent_gravity_vector(scene, t)
+    g_len = g_vec.length
+
+    if g_len < 1e-6:
+        # Microgravity / Zero-G: hide arrow
+        arrow.scale = mathutils.Vector((0.0, 0.0, 0.0))
+        arrow.hide_viewport = True
+        arrow.hide_render = True
+        return
+
+    arrow.hide_viewport = False
+    arrow.hide_render = False
+    arrow.scale = mathutils.Vector((1.0, 1.0, 1.0))
+
+    v_base = mathutils.Vector((0.0, 0.0, -1.0))
+    g_dir = g_vec.normalized()
+    rot_diff = v_base.rotation_difference(g_dir)
+
+    arrow.rotation_mode = "XYZ"
+    arrow.rotation_euler = rot_diff.to_euler("XYZ")
 
 
 def evaluate_kinematics_frame(scene):
@@ -777,8 +914,26 @@ def evaluate_kinematics_frame(scene):
                     offset_deg += get_input_float(node, "Offset (°)", t)
 
                 rpm = get_input_rpm(node, "RPM", t)
-                direction_sign = -1.0 if node.direction == "CW" else 1.0
-                rad_per_sec = (rpm * 2.0 * math.pi / 60.0) * direction_sign
+                rpm_sock = node.inputs.get("RPM")
+                is_driven = (
+                    rpm_sock
+                    and rpm_sock.is_linked
+                    and isinstance(
+                        rpm_sock.links[0].from_node,
+                        (ScienceBlocksGearRatioNode, ScienceBlocksRotationNode),
+                    )
+                )
+
+                if is_driven:
+                    # Input RPM is signed by the transmission (positive = CCW, negative = CW)
+                    rad_per_sec = (rpm * 2.0 * math.pi / 60.0)
+                    computed_dir = "CCW" if rpm >= 0 else "CW"
+                    if node.direction != computed_dir:
+                        node.direction = computed_dir
+                else:
+                    direction_sign = -1.0 if node.direction == "CW" else 1.0
+                    rad_per_sec = (abs(rpm) * 2.0 * math.pi / 60.0) * direction_sign
+
                 angle = rad_per_sec * t
 
                 # 4. Set rotation on active axis from base + angle + offset
@@ -842,14 +997,8 @@ def evaluate_kinematics_frame(scene):
                     obj.location.y = cy + radius * math.cos(ang)
                     obj.location.z = cz + radius * math.sin(ang)
 
-    # 5. Synchronize Gravity Force Arrow in side inspection station (impacted by parent wheel rotation, X axis ONLY)
-    arrow = bpy.data.objects.get("Gravity_Force_Arrow")
-    if arrow:
-        arrow.rotation_mode = "XYZ"
-        parent_rot_x = get_parent_wheel_rotation_angle(scene, t)
-        arrow.rotation_euler.x = parent_rot_x
-        arrow.rotation_euler.y = 0.0
-        arrow.rotation_euler.z = 0.0
+    # 5. Synchronize Gravity Force Arrow in side inspection station
+    update_gravity_arrow_transform(scene, t)
 
 
 @bpy.app.handlers.persistent
@@ -857,16 +1006,10 @@ def on_frame_change_post(scene):
     evaluate_kinematics_frame(scene)
     props = getattr(scene, "science_blocks_props", None)
     if props and not props.live_motion_preview:
-        arrow = bpy.data.objects.get("Gravity_Force_Arrow")
-        if arrow:
-            fps = scene.render.fps / max(1, scene.render.fps_base)
-            frame_start = getattr(scene, "frame_start", 1)
-            t = max(0.0, (scene.frame_current - frame_start) / fps) * props.motion_time_scale
-            parent_rot_x = get_parent_wheel_rotation_angle(scene, t)
-            arrow.rotation_mode = "XYZ"
-            arrow.rotation_euler.x = parent_rot_x
-            arrow.rotation_euler.y = 0.0
-            arrow.rotation_euler.z = 0.0
+        fps = scene.render.fps / max(1, scene.render.fps_base)
+        frame_start = getattr(scene, "frame_start", 1)
+        t = max(0.0, (scene.frame_current - frame_start) / fps) * props.motion_time_scale
+        update_gravity_arrow_transform(scene, t)
 
 
 # ===========================================================================

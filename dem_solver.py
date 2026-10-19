@@ -27,6 +27,15 @@ try:
 except ImportError:
     bpy = None
 
+try:
+    from .colormaps import evaluate_scientific_colormap, recolor_dem_particles_in_scene
+except ImportError:
+    try:
+        from colormaps import evaluate_scientific_colormap, recolor_dem_particles_in_scene
+    except ImportError:
+        evaluate_scientific_colormap = None
+        recolor_dem_particles_in_scene = None
+
 
 class PlanetaryDEMResult:
     def __init__(self, frames: int, ball_count: int):
@@ -585,16 +594,16 @@ def instantiate_dem_particles_in_blender(
 
         links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
 
-    # Template spherical mesh (unit sphere of radius 1.0, scaled individually per PSD)
+    # Reference spherical mesh (unit sphere of radius 1.0, scaled individually per PSD)
     bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=1.0)
-    template_ball = context.active_object
-    template_ball.name = "Template_DEM_Particle"
-    template_ball.data.materials.append(mat)
+    ref_ball = context.active_object
+    ref_ball.name = "Reference_DEM_Particle"
+    ref_ball.data.materials.append(mat)
 
-    if template_ball.name not in coll.objects:
-        coll.objects.link(template_ball)
-    if template_ball.name in context.scene.collection.objects:
-        context.scene.collection.objects.unlink(template_ball)
+    if ref_ball.name not in coll.objects:
+        coll.objects.link(ref_ball)
+    if ref_ball.name in context.scene.collection.objects:
+        context.scene.collection.objects.unlink(ref_ball)
 
     # Auto-detect jar model bounding box center and scale compensation
     center_offset = (0.0, 0.0, 0.0)
@@ -618,7 +627,7 @@ def instantiate_dem_particles_in_blender(
     # Create individual particles parented to rotating jar
     ball_objects = []
     for i in range(num_balls):
-        ball_copy = template_ball.copy()
+        ball_copy = ref_ball.copy()
         ball_copy.name = f"DEM_Media_{i+1:03d}"
         ball_copy.parent = jar_obj
         # Exact PSD physical scaling compensating for parent scale
@@ -627,9 +636,9 @@ def instantiate_dem_particles_in_blender(
         coll.objects.link(ball_copy)
         ball_objects.append(ball_copy)
 
-    # Hide template object
-    template_ball.hide_viewport = True
-    template_ball.hide_render = True
+    # Hide reference prototype object
+    ref_ball.hide_viewport = True
+    ref_ball.hide_render = True
 
     # -------------------------------------------------------------------------
     # Bake Trajectories and Dynamic Heatmap Colors
@@ -654,7 +663,16 @@ def instantiate_dem_particles_in_blender(
             vel_vec = result.velocities[f, i, :]
             v_mag = float(np.linalg.norm(vel_vec))
 
-            if colormap_mode == "VELOCITY":
+            if evaluate_scientific_colormap is not None:
+                e_kin = 0.5 * result.ball_masses[i] * (v_mag**2) if i < len(result.ball_masses) else None
+                rgba = evaluate_scientific_colormap(
+                    colormap_mode,
+                    v_mag,
+                    v_max=5.5,
+                    e_kin=e_kin,
+                    mean_e=result.mean_impact_energy_j,
+                )
+            elif colormap_mode == "VELOCITY":
                 rgba = velocity_to_rainbow_rgb(v_mag, v_max=5.5)
             elif colormap_mode == "FORCE":
                 f_val = float(result.forces[f, i]) if hasattr(result, "forces") else 0.0

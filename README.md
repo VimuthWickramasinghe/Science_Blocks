@@ -45,6 +45,13 @@ A Blender 3D add-on dedicated to simulating, visualizing, and analyzing **Planet
 7. **Automated Project Folder Synchronization**:
    - All reports, figures, JSON configs, and CSV data logs are automatically saved directly into the **same folder as the active `.blend` file**.
 
+8. **Scientific Publication Visuals & Color Themes**:
+   - **One-Click Paper Presets**: Nature/Science Paper White, Physical Chemistry Studio Grey, Industrial Powder Tech (Metals), Conference Keynote (Dark Navy), and LaTeX Transparent Cutout.
+   - **Publication World Background**: Customizable background color with instant toggles for pure paper white (`#FFFFFF`), neutral studio grey, dark slate, or transparent alpha film for LaTeX/Word integration.
+   - **Scientific Object Materials**: Frosted acrylic/glass jar (enabling crystal-clear particle and slurry visibility), 316L stainless steel, alumina ceramic white, slate titanium carrier plate, and glowing directional indicator accents.
+   - **Perceptually Uniform Media Colormaps**: Viridis (journal standard), Plasma, Turbo, Coolwarm, plus realistic Chrome Steel, Zirconia White Ceramic, and Tungsten Carbide.
+   - **Publication Viewport Shading**: Technical Cavity (Ridge & Valley) + Ambient Occlusion (AO) for crisp, publication-sharp 3D graphics in viewport screenshots.
+
 ---
 
 ## 🚀 Quick Start Guide
@@ -55,12 +62,16 @@ A Blender 3D add-on dedicated to simulating, visualizing, and analyzing **Planet
    - Click **Verify Python Environment**.
    - If packages are missing, click **Install Required Packages (pip)**.
 4. In **Step 2 (Planetary Kinematics)**:
-   - Click **Load Planetary Mill Template** to generate 3D models and the node network.
-   - Click **View Planetary Node Editor** to customize drive speeds, gear ratios, or ball materials.
+   - Choose a curated demo from **Ready-to-Run Simulation Demos** (e.g. *High-Energy Mill*, *Wet Slurry Mill*, *Horizontal 90° Mill*, *Zero-G Space Mill*, or *Multiphysics Solvers Suite*) and click **Load Selected Simulation Demo**.
+   - Click **Open Science Blocks Node Editor** to customize drive speeds, gear ratios, or ball materials.
    - Use **Play Motion** to preview planetary counter-rotation.
    - **Isolated Chamber View (Side-by-Side)**: Selecting the jar or clicking **Display Side Chamber & Gravity Arrow** spawns a stationary side copy of the jar. The side jar spins on its own axis while an arrow displays the fixed gravitational force vector, allowing clear inspection of internal media motion without dizzying orbital revolution around the sun wheel.
-5. In **Step 3 (DEM Particle Physics & Telemetry)**:
+5. In **Scientific Paper Visuals & Colors**:
+   - Click **Assign Scientific Paper Colors** to apply publication-grade materials and clean paper white background.
+   - Switch presets (**Nature White**, **Studio Grey**, **Dark Keynote**, or **LaTeX Transparent**) or customize jar tint, carrier metal, and background color.
+6. In **Step 3 (DEM Particle Physics & Telemetry)**:
    - Configure ball count, radius (mm), density ($kg/m^3$), and simulation frames.
+   - Select your preferred scientific media palette (**Viridis**, **Plasma**, **Turbo**, **Chrome Steel**, etc.).
    - Click **Run DEM Simulation (Bake Physics)** to compute collisions and bake keyframes.
    - Click **Generate Scientific Report & Figures** to plot publication figures and launch the interactive HTML report.
 
