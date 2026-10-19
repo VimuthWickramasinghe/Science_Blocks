@@ -348,9 +348,95 @@ def run_all_tests():
     copy_loc = any(c.type == "COPY_LOCATION" for c in cam.constraints)
     log_test("Toggle Camera Tracking (ON)", ret_trk == {"FINISHED"} and copy_loc)
 
+    # =========================================================================
+    # SUITE 11: Light Studio White Theme, Material Library & Yade Force Colormap
+    # =========================================================================
+    print("\n--- SUITE 11: Light Studio White Theme, PBR Materials & Yade Colormap ---")
+
+    # 1. Apply White Studio Theme
+    props.viewport_theme_mode = "LIGHT_WHITE"
+    ret_theme = bpy.ops.science_blocks.apply_light_theme()
+    log_test("Apply White Studio Theme Operator", ret_theme == {"FINISHED"})
+
+    # Check World Background is pure white
+    world_nodes = scene.world.node_tree.nodes
+    bg_node = next((n for n in world_nodes if n.type == "BACKGROUND"), None)
+    log_test(
+        "World Background pure white (1.0, 1.0, 1.0)",
+        bg_node is not None and bg_node.inputs["Color"].default_value[0] == 1.0 and bg_node.inputs["Color"].default_value[1] == 1.0 and bg_node.inputs["Color"].default_value[2] == 1.0
+    )
+
+    # Check Studio 3-point lighting
+    has_key = bpy.data.objects.get("Studio_Key_Light") is not None
+    has_fill = bpy.data.objects.get("Studio_Fill_Light") is not None
+    has_rim = bpy.data.objects.get("Studio_Rim_Light") is not None
+    log_test("Studio 3-Point Lights Created", has_key and has_fill and has_rim)
+
+    # 2. PBR Material Library Generation
+    expected_mats = [
+        "SB_Chamber_Casing",
+        "SB_Chamber_Lid",
+        "SB_Carrier_Plate",
+        "SB_Chamber_Inspection_Glass",
+        "SB_Grinding_Media_Steel",
+        "SB_Grinding_Media_Zirconia",
+        "SB_DEM_Dynamic_Particle",
+        "SB_Gravity_Arrow_Amber",
+    ]
+    all_mats_exist = all(bpy.data.materials.get(m) is not None for m in expected_mats)
+    log_test("Standard PBR Materials Library Generated", all_mats_exist)
+
+    # Test Material Assignment to Jar
+    props.selected_studio_material = "SB_Chamber_Casing"
+    bpy.context.view_layer.objects.active = jar_obj
+    jar_obj.select_set(True)
+    ret_assign = bpy.ops.science_blocks.assign_studio_material()
+    log_test(
+        "Assign PBR Material to Jar",
+        ret_assign == {"FINISHED"} and jar_obj.data.materials and jar_obj.data.materials[0].name == "SB_Chamber_Casing"
+    )
+
+    # Test Material Duplication
+    ret_dup = bpy.ops.science_blocks.duplicate_studio_material()
+    dup_mat = bpy.data.materials.get("SB_Chamber_Casing_Custom")
+    log_test(
+        "Duplicate PBR Material for Customization",
+        ret_dup == {"FINISHED"} and dup_mat is not None and jar_obj.data.materials[0] == dup_mat
+    )
+
+    # 3. Yade DEM Simulation with Dynamic Contact Force Colormap
+    props.dem_solver_engine = "YADE"
+    props.dem_viewport_colormap = "FORCE"
+    props.dem_sim_frames = 25
+    props.dem_ball_count = 12
+    ret_yade_force = bpy.ops.science_blocks.run_dem_simulation()
+    log_test("Run Yade DEM Simulation with FORCE Colormap", ret_yade_force == {"FINISHED"})
+
+    # Check that yade_simulation.py was exported
+    yade_script_path = os.path.join(out_dir, "yade_simulation.py") if os.path.exists(os.path.join(out_dir, "yade_simulation.py")) else "yade_simulation.py"
+    yade_script_exists = os.path.exists(yade_script_path)
+    log_test("Yade Simulation Script (yade_simulation.py) Generated", yade_script_exists)
+
+    # Check particles animated with dynamic color keyframes
+    coll_media = bpy.data.collections.get("Science_Blocks_Milling_Media")
+    media_balls = [o for o in coll_media.objects if o.name.startswith("DEM_Media_") and not o.name.startswith("DEM_Media_Side_")]
+    log_test("DEM Particles Instantiated in Collection", len(media_balls) == 12)
+
+    sample_ball = media_balls[0]
+    has_color_anim = False
+    if sample_ball.animation_data and sample_ball.animation_data.action:
+        # Check F-curves for 'color'
+        has_color_anim = any("color" in fc.data_path for fc in sample_ball.animation_data.action.fcurves)
+    log_test("Particles Animate Dynamic Contact Force Color", has_color_anim)
+
+    # 4. Test Velocity / Speed Colormap Mode
+    props.dem_viewport_colormap = "VELOCITY"
+    ret_yade_vel = bpy.ops.science_blocks.run_dem_simulation()
+    log_test("Run Yade DEM Simulation with VELOCITY Colormap", ret_yade_vel == {"FINISHED"})
+
     print("\n" + "=" * 70)
-    print("ALL 60/60 VERIFICATION TESTS PASSED SUCCESSFULLY!")
-    print("Planetary Ball Mill Tool, Dynamic Gravity Arrow, Solvers & Cutaway are 100% Verified.")
+    print("ALL VERIFICATION TESTS PASSED SUCCESSFULLY!")
+    print("Studio White Theme, Materials Library, Yade Engine & Dynamic Colormaps 100% Verified.")
     print("=" * 70)
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ class PlanetaryDEMResult:
         self.ball_count = ball_count
         self.trajectories = np.zeros((frames, ball_count, 3), dtype=np.float32)
         self.velocities = np.zeros((frames, ball_count, 3), dtype=np.float32)
+        self.forces = np.zeros((frames, ball_count), dtype=np.float32)
         self.ball_radii = np.zeros(ball_count, dtype=np.float64)
         self.ball_masses = np.zeros(ball_count, dtype=np.float64)
 
@@ -135,6 +136,27 @@ def velocity_to_rainbow_rgb(v_mag: float, v_max: float = 6.0) -> tuple:
         # Yellow -> Bright Red
         f = (norm - 0.75) / 0.25
         return (0.95 + 0.05 * f, 0.95 * (1 - f), 0.05, 1.0)
+
+
+def force_to_colormap_rgb(force_n: float, f_max: float = 250.0) -> tuple:
+    """Maps dynamic contact force to a scientific colormap (Cyan/Green -> Yellow -> Fiery Red)."""
+    norm = min(1.0, max(0.0, force_n / max(1.0, f_max)))
+    if norm < 0.20:
+        # Minimal contact / free flight: Soft cyan/green
+        f = norm / 0.20
+        return (0.1, 0.70 + 0.25 * f, 0.85 * (1.0 - f * 0.4), 1.0)
+    elif norm < 0.50:
+        # Moderate shear: Green to Yellow
+        f = (norm - 0.20) / 0.30
+        return (0.1 + 0.85 * f, 0.95, 0.15 * (1.0 - f), 1.0)
+    elif norm < 0.80:
+        # Heavy contact: Yellow to Orange
+        f = (norm - 0.50) / 0.30
+        return (0.95 + 0.05 * f, 0.95 - 0.45 * f, 0.05, 1.0)
+    else:
+        # Extreme impact crushing force: Crimson Red
+        f = (norm - 0.80) / 0.20
+        return (1.0, 0.50 * (1.0 - f), 0.05, 1.0)
 
 
 def compute_planetary_accelerations(
@@ -278,6 +300,7 @@ def solve_planetary_dem(
         res.velocities[f, :, :] = vel.astype(np.float32)
 
         impacts_in_this_frame = 0
+        frame_forces = np.zeros(ball_count, dtype=np.float32)
 
         for _ in range(substeps_per_frame):
             # Compute current non-inertial accelerations
@@ -339,6 +362,7 @@ def solve_planetary_dem(
                             s_n = 2.0 * e_star * math.sqrt(r_star * max(1e-6, overlap_val))
                             gamma_n = -2.0 * math.sqrt(5.0 / 6.0) * beta * math.sqrt(s_n * m_i)
                             fn_mag = (4.0 / 3.0) * e_star * math.sqrt(r_star) * (overlap_val**1.5) + gamma_n * v_norm
+                            frame_forces[idx] = max(frame_forces[idx], float(abs(fn_mag)))
                             impulse_n = max(0.0, fn_mag) * dt
                             dv_n = min(impulse_n / m_i, (1.0 + restitution) * v_norm)
                             vel[idx, 0] -= dv_n * norm_x
@@ -349,6 +373,8 @@ def solve_planetary_dem(
                             vel[idx, 1] *= (1.0 - (static_friction + rolling_friction) * 0.15)
                         else:
                             # Standard viscoelastic reflection
+                            fn_wall = m_i * (1.0 + restitution) * v_norm / max(1e-6, dt)
+                            frame_forces[idx] = max(frame_forces[idx], float(fn_wall))
                             vel[idx, 0] -= (1.0 + restitution) * v_norm * norm_x
                             vel[idx, 1] -= (1.0 + restitution) * v_norm * norm_y
                             vel[idx, 0] *= (1.0 - static_friction * 0.2)
@@ -405,12 +431,17 @@ def solve_planetary_dem(
                                 s_n = 2.0 * e_star * math.sqrt(r_star * max(1e-6, overlap))
                                 gamma_n = -2.0 * math.sqrt(5.0 / 6.0) * beta * math.sqrt(s_n * m_eff)
                                 fn = (4.0 / 3.0) * e_star * math.sqrt(r_star) * (overlap**1.5) - gamma_n * v_rel_norm
+                                frame_forces[i] = max(frame_forces[i], float(abs(fn)))
+                                frame_forces[j] = max(frame_forces[j], float(abs(fn)))
                                 impulse = max(0.0, fn) * dt
                                 max_impulse = (1.0 + restitution) * abs(v_rel_norm) * m_eff
                                 impulse = min(impulse, max_impulse)
                                 vel[i] += normal * (impulse / masses[i])
                                 vel[j] -= normal * (impulse / masses[j])
                             else:
+                                fn_ball = m_eff * (1.0 + restitution) * abs(v_rel_norm) / max(1e-6, dt)
+                                frame_forces[i] = max(frame_forces[i], float(fn_ball))
+                                frame_forces[j] = max(frame_forces[j], float(fn_ball))
                                 impulse = -(1.0 + restitution) * v_rel_norm
                                 vel[i] += normal * (impulse * (m_eff / masses[i]))
                                 vel[j] -= normal * (impulse * (m_eff / masses[j]))
@@ -426,6 +457,7 @@ def solve_planetary_dem(
                 vel += 0.5 * (acc_kin + acc_kin_new) * dt
 
         # Frame summary recording
+        res.forces[f, :] = frame_forces
         t_frame = float(f + 1) * dt_frame
         res.frame_times.append(t_frame)
         res.frame_impact_counts.append(impacts_in_this_frame)
@@ -540,12 +572,16 @@ def instantiate_dem_particles_in_blender(
         n_info = nodes.new("ShaderNodeObjectInfo")
         n_info.location = (-200, 0)
 
-        # Wire Object Color to Base Color
+        # Wire Object Color to Base Color and Emission Color
         links.new(n_info.outputs["Color"], n_bsdf.inputs["Base Color"])
+        if "Emission Color" in n_bsdf.inputs:
+            links.new(n_info.outputs["Color"], n_bsdf.inputs["Emission Color"])
+        if "Emission Strength" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Strength"].default_value = 0.35
         if "Metallic" in n_bsdf.inputs:
-            n_bsdf.inputs["Metallic"].default_value = 0.75
+            n_bsdf.inputs["Metallic"].default_value = 0.50
         if "Roughness" in n_bsdf.inputs:
-            n_bsdf.inputs["Roughness"].default_value = 0.25
+            n_bsdf.inputs["Roughness"].default_value = 0.20
 
         links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
 
@@ -600,6 +636,7 @@ def instantiate_dem_particles_in_blender(
     # -------------------------------------------------------------------------
     orig_frame = context.scene.frame_current
     dt = 1.0 / max(1.0, result.fps)
+    max_f = float(np.max(result.forces)) if (hasattr(result, "forces") and result.forces.size and np.max(result.forces) > 0) else 100.0
 
     for f in range(frames):
         frame_num = f + 1
@@ -619,6 +656,9 @@ def instantiate_dem_particles_in_blender(
 
             if colormap_mode == "VELOCITY":
                 rgba = velocity_to_rainbow_rgb(v_mag, v_max=5.5)
+            elif colormap_mode == "FORCE":
+                f_val = float(result.forces[f, i]) if hasattr(result, "forces") else 0.0
+                rgba = force_to_colormap_rgb(f_val, f_max=max_f)
             elif colormap_mode == "ENERGY":
                 e_kin = 0.5 * result.ball_masses[i] * (v_mag**2)
                 norm_e = min(1.0, e_kin / max(1e-4, result.mean_impact_energy_j * 3.0))
@@ -630,3 +670,13 @@ def instantiate_dem_particles_in_blender(
             ball.keyframe_insert(data_path="color", frame=frame_num)
 
     context.scene.frame_set(orig_frame)
+
+    # Ensure 3D viewport shading is set to OBJECT color so dynamic colors show immediately in Solid mode
+    try:
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                for space in area.spaces:
+                    if space.type == "VIEW_3D":
+                        space.shading.color_type = "OBJECT"
+    except Exception:
+        pass

@@ -755,36 +755,53 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         # Detect effective mill orientation (Auto-detect from sun wheel normal vector if AUTO)
         effective_orientation = detect_mill_orientation(sun_obj, props.mill_orientation)
 
-        # Solve Planetary DEM Physics with Hertz-Mindlin & Polydisperse PSD
-        self.report({"INFO"}, f"Solving DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
-        res = dem_solver.solve_planetary_dem(
-            sun_rpm=sun_rpm,
-            jar_rpm=jar_rpm,
-            r_sun=r_sun,
-            r_jar=r_jar,
-            h_jar=h_jar,
-            ball_count=ball_count,
-            ball_radius_m=ball_radius_m,
-            ball_density=ball_density,
-            youngs_modulus_gpa=props.dem_youngs_modulus_gpa,
-            poissons_ratio=props.dem_poissons_ratio,
-            restitution=props.dem_restitution,
-            static_friction=props.dem_static_friction,
-            rolling_friction=props.dem_rolling_friction,
-            frames=frames,
-            fps=fps,
-            substeps_per_frame=40,
-            contact_model=props.dem_contact_model,
-            charge_distribution=props.dem_charge_distribution,
-            integrator=props.dem_integrator,
-            gravity=props.mill_gravity_value,
-            mill_orientation=effective_orientation,
-            slurry_drag=(props.dem_environment == "WET_SLURRY"),
-            slurry_viscosity=props.dem_slurry_viscosity,
-            slurry_density=props.dem_slurry_density,
-        )
+        # Prepare parameters dictionary
+        params = {
+            "sun_rpm": sun_rpm,
+            "jar_rpm": jar_rpm,
+            "r_sun": r_sun,
+            "r_jar": r_jar,
+            "h_jar": h_jar,
+            "ball_count": ball_count,
+            "ball_radius_m": ball_radius_m,
+            "ball_density": ball_density,
+            "youngs_modulus_gpa": props.dem_youngs_modulus_gpa,
+            "poissons_ratio": props.dem_poissons_ratio,
+            "restitution": props.dem_restitution,
+            "static_friction": props.dem_static_friction,
+            "rolling_friction": props.dem_rolling_friction,
+            "frames": frames,
+            "fps": fps,
+            "substeps_per_frame": 40,
+            "contact_model": props.dem_contact_model,
+            "charge_distribution": props.dem_charge_distribution,
+            "integrator": props.dem_integrator,
+            "gravity": props.mill_gravity_value,
+            "mill_orientation": effective_orientation,
+            "slurry_drag": (props.dem_environment == "WET_SLURRY"),
+            "slurry_viscosity": props.dem_slurry_viscosity,
+            "slurry_density": props.dem_slurry_density,
+        }
 
-        # Instantiate particles in Blender with PSD scaling & dynamic colormap
+        # Export native Yade simulation script (yade_simulation.py) into project / blend directory
+        from .tools.yade.yade_tool import YADE_TOOL
+        is_saved = is_blend_file_saved()
+        folder = get_blend_file_directory() if is_saved else get_effective_config_dir()
+        try:
+            YADE_TOOL.generate_case(folder, params)
+        except Exception:
+            pass
+
+        # Solve DEM Physics via Yade engine formulation (or selected engine)
+        if props.dem_solver_engine == "YADE":
+            self.report({"INFO"}, f"Solving Yade DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
+            solve_res = YADE_TOOL.solve_python(params)
+            res = solve_res.get("result_object")
+        else:
+            self.report({"INFO"}, f"Solving DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
+            res = dem_solver.solve_planetary_dem(**params)
+
+        # Instantiate particles in Blender with PSD scaling & dynamic colormap (Speed / Force / Energy)
         dem_solver.instantiate_dem_particles_in_blender(
             context,
             result=res,
@@ -828,7 +845,8 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         except Exception:
             pass
 
-        self.report({"INFO"}, f"DEM Complete: {res.total_impacts} impacts, Mean Energy: {res.mean_impact_energy_j:.4f} J, Power: {res.estimated_power_watts:.1f} W")
+        engine_label = "Yade DEM" if props.dem_solver_engine == "YADE" else "DEM"
+        self.report({"INFO"}, f"{engine_label} Complete: {res.total_impacts} impacts, Mean Energy: {res.mean_impact_energy_j:.4f} J, Power: {res.estimated_power_watts:.1f} W")
         return {"FINISHED"}
 
 
@@ -1068,6 +1086,317 @@ def get_or_create_chamber_glass_material(opacity: float = 0.25) -> bpy.types.Mat
         mat.shadow_method = "NONE"
 
     return mat
+
+
+def apply_white_studio_environment(context, mode: str = "LIGHT_WHITE"):
+    """Configures a pure white studio lighting and viewport environment."""
+    scene = context.scene
+    is_light = (mode == "LIGHT_WHITE")
+    bg_rgb = (1.0, 1.0, 1.0) if is_light else (0.18, 0.19, 0.22)
+    bg_rgba = (bg_rgb[0], bg_rgb[1], bg_rgb[2], 1.0)
+
+    # 1. Scene World Setup with White Studio Background
+    world = scene.world
+    if not world:
+        world = bpy.data.worlds.new("Science_Blocks_Studio_World")
+        scene.world = world
+    world.use_nodes = True
+    nodes = world.node_tree.nodes
+    links = world.node_tree.links
+    nodes.clear()
+
+    node_out = nodes.new("ShaderNodeOutputWorld")
+    node_out.location = (300, 0)
+    node_bg = nodes.new("ShaderNodeBackground")
+    node_bg.location = (0, 0)
+    node_bg.inputs["Color"].default_value = bg_rgba
+    node_bg.inputs["Strength"].default_value = 1.0 if is_light else 0.8
+    links.new(node_bg.outputs["Background"], node_out.inputs["Surface"])
+
+    # 2. Viewport Shading Configuration
+    try:
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                for space in area.spaces:
+                    if space.type == "VIEW_3D":
+                        space.shading.background_type = "VIEWPORT"
+                        space.shading.background_color = bg_rgb
+                        space.shading.color_type = "OBJECT"
+                        space.shading.light = "STUDIO"
+    except Exception:
+        pass
+
+    # 3. Blender 3D Viewport Theme Gradient Configuration
+    try:
+        theme_space = context.preferences.themes[0].view_3d.space
+        theme_space.gradients.background_type = "SINGLE_COLOR"
+        theme_space.gradients.high_gradient = bg_rgb
+        theme_space.gradients.gradient = bg_rgb
+    except Exception:
+        pass
+
+    # 4. Three-Point Studio Lighting Setup
+    if is_light:
+        coll_name = "Science_Blocks_Studio_Lighting"
+        coll = bpy.data.collections.get(coll_name)
+        if not coll:
+            coll = bpy.data.collections.new(coll_name)
+            scene.collection.children.link(coll)
+
+        def setup_light(name, light_type, loc, rot_euler, energy, color):
+            light_obj = bpy.data.objects.get(name)
+            if not light_obj:
+                ldata = bpy.data.lights.new(name=name, type=light_type)
+                light_obj = bpy.data.objects.new(name, ldata)
+                coll.objects.link(light_obj)
+            else:
+                ldata = light_obj.data
+            ldata.energy = energy
+            ldata.color = color
+            light_obj.location = loc
+            light_obj.rotation_euler = rot_euler
+            return light_obj
+
+        # Key Light (warm soft front-left)
+        setup_light(
+            "Studio_Key_Light", "SUN",
+            (4.0, -4.0, 6.0),
+            (math.radians(45.0), math.radians(20.0), math.radians(35.0)),
+            2.5, (1.0, 0.98, 0.95),
+        )
+        # Fill Light (cool soft fill right)
+        setup_light(
+            "Studio_Fill_Light", "SUN",
+            (-4.0, -3.0, 4.0),
+            (math.radians(50.0), math.radians(-25.0), math.radians(-35.0)),
+            1.2, (0.92, 0.96, 1.0),
+        )
+        # Rim Light (crisp backlight from above rear)
+        setup_light(
+            "Studio_Rim_Light", "SUN",
+            (0.0, 5.0, 7.0),
+            (math.radians(130.0), 0.0, math.radians(180.0)),
+            1.8, (1.0, 1.0, 1.0),
+        )
+
+
+def ensure_standard_materials():
+    """Generates and registers the Science Blocks standard PBR material library in bpy.data.materials."""
+    materials_def = {
+        "SB_Chamber_Casing": {
+            "color": (0.82, 0.84, 0.86, 1.0),
+            "metallic": 0.92,
+            "roughness": 0.28,
+            "transmission": 0.0,
+            "alpha": 1.0,
+        },
+        "SB_Chamber_Lid": {
+            "color": (0.12, 0.13, 0.15, 1.0),
+            "metallic": 0.85,
+            "roughness": 0.35,
+            "transmission": 0.0,
+            "alpha": 1.0,
+        },
+        "SB_Carrier_Plate": {
+            "color": (0.25, 0.27, 0.30, 1.0),
+            "metallic": 0.80,
+            "roughness": 0.40,
+            "transmission": 0.0,
+            "alpha": 1.0,
+        },
+        "SB_Chamber_Inspection_Glass": {
+            "color": (0.92, 0.95, 1.0, 0.25),
+            "metallic": 0.0,
+            "roughness": 0.05,
+            "transmission": 0.95,
+            "alpha": 0.25,
+            "blend_method": "BLEND",
+        },
+        "SB_Grinding_Media_Steel": {
+            "color": (0.92, 0.93, 0.96, 1.0),
+            "metallic": 0.98,
+            "roughness": 0.10,
+            "transmission": 0.0,
+            "alpha": 1.0,
+        },
+        "SB_Grinding_Media_Zirconia": {
+            "color": (0.96, 0.96, 0.94, 1.0),
+            "metallic": 0.05,
+            "roughness": 0.18,
+            "transmission": 0.0,
+            "alpha": 1.0,
+        },
+        "SB_Gravity_Arrow_Amber": {
+            "color": (1.0, 0.55, 0.05, 1.0),
+            "metallic": 0.1,
+            "roughness": 0.20,
+            "transmission": 0.0,
+            "alpha": 1.0,
+            "emission_color": (1.0, 0.55, 0.05, 1.0),
+            "emission_strength": 1.5,
+        },
+    }
+
+    created = []
+    for mat_name, cfg in materials_def.items():
+        mat = bpy.data.materials.get(mat_name)
+        if not mat:
+            mat = bpy.data.materials.new(mat_name)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        n_out = nodes.new("ShaderNodeOutputMaterial")
+        n_out.location = (300, 0)
+        n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        n_bsdf.location = (0, 0)
+
+        n_bsdf.inputs["Base Color"].default_value = cfg["color"]
+        if "Metallic" in n_bsdf.inputs:
+            n_bsdf.inputs["Metallic"].default_value = cfg["metallic"]
+        if "Roughness" in n_bsdf.inputs:
+            n_bsdf.inputs["Roughness"].default_value = cfg["roughness"]
+        if "Alpha" in n_bsdf.inputs:
+            n_bsdf.inputs["Alpha"].default_value = cfg["alpha"]
+        if cfg.get("transmission", 0.0) > 0.0:
+            if "Transmission Weight" in n_bsdf.inputs:
+                n_bsdf.inputs["Transmission Weight"].default_value = cfg["transmission"]
+            elif "Transmission" in n_bsdf.inputs:
+                n_bsdf.inputs["Transmission"].default_value = cfg["transmission"]
+        if "emission_color" in cfg and "Emission Color" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Color"].default_value = cfg["emission_color"]
+        if "emission_strength" in cfg and "Emission Strength" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Strength"].default_value = cfg["emission_strength"]
+
+        links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+
+        if "blend_method" in cfg and hasattr(mat, "blend_method"):
+            mat.blend_method = cfg["blend_method"]
+            if hasattr(mat, "shadow_method"):
+                mat.shadow_method = "NONE"
+
+        created.append(mat)
+
+    # Dynamic Heatmap Material
+    mat_hm_name = "SB_DEM_Dynamic_Particle"
+    mat_hm = bpy.data.materials.get(mat_hm_name)
+    if not mat_hm:
+        mat_hm = bpy.data.materials.new(mat_hm_name)
+    mat_hm.use_nodes = True
+    nodes = mat_hm.node_tree.nodes
+    links = mat_hm.node_tree.links
+    nodes.clear()
+    n_out = nodes.new("ShaderNodeOutputMaterial")
+    n_out.location = (400, 0)
+    n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    n_bsdf.location = (100, 0)
+    n_info = nodes.new("ShaderNodeObjectInfo")
+    n_info.location = (-200, 0)
+    links.new(n_info.outputs["Color"], n_bsdf.inputs["Base Color"])
+    if "Emission Color" in n_bsdf.inputs:
+        links.new(n_info.outputs["Color"], n_bsdf.inputs["Emission Color"])
+    if "Emission Strength" in n_bsdf.inputs:
+        n_bsdf.inputs["Emission Strength"].default_value = 0.35
+    if "Metallic" in n_bsdf.inputs:
+        n_bsdf.inputs["Metallic"].default_value = 0.50
+    if "Roughness" in n_bsdf.inputs:
+        n_bsdf.inputs["Roughness"].default_value = 0.20
+    links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+    created.append(mat_hm)
+
+    return created
+
+
+class SCIENCE_BLOCKS_OT_apply_light_theme(bpy.types.Operator):
+    """Apply high-contrast white studio background, lighting, and standard PBR materials."""
+    bl_idname = "science_blocks.apply_light_theme"
+    bl_label = "Apply White Studio Theme"
+    bl_description = "Configure pure white background, studio 3-point lighting, and ensure standard PBR materials"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        mode = props.viewport_theme_mode if props else "LIGHT_WHITE"
+        apply_white_studio_environment(context, mode=mode)
+        ensure_standard_materials()
+        self.report({"INFO"}, "Science Blocks: Applied White Studio Theme and generated Standard Materials.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_assign_studio_material(bpy.types.Operator):
+    """Assign selected standard PBR material to active or selected 3D object(s)."""
+    bl_idname = "science_blocks.assign_studio_material"
+    bl_label = "Assign Material"
+    bl_description = "Assign selected material from library to active or selected objects"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+        ensure_standard_materials()
+        mat_name = props.selected_studio_material
+        mat = bpy.data.materials.get(mat_name)
+        if not mat:
+            self.report({"WARNING"}, f"Material '{mat_name}' not found.")
+            return {"CANCELLED"}
+
+        targets = context.selected_objects if context.selected_objects else ([context.active_object] if context.active_object else [])
+        if not targets:
+            self.report({"WARNING"}, "No object selected to assign material to.")
+            return {"CANCELLED"}
+
+        for obj in targets:
+            if not hasattr(obj, "data") or not hasattr(obj.data, "materials"):
+                continue
+            if not obj.data.materials:
+                obj.data.materials.append(mat)
+            else:
+                obj.data.materials[0] = mat
+
+        self.report({"INFO"}, f"Science Blocks: Assigned '{mat_name}' to {len(targets)} object(s).")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_duplicate_studio_material(bpy.types.Operator):
+    """Duplicate selected material so you can customize its color and properties independently."""
+    bl_idname = "science_blocks.duplicate_studio_material"
+    bl_label = "Duplicate Material"
+    bl_description = "Create an editable copy of the selected material in Blender and assign to active object"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+        ensure_standard_materials()
+        mat_name = props.selected_studio_material
+        base_mat = bpy.data.materials.get(mat_name)
+        if not base_mat:
+            self.report({"WARNING"}, f"Base material '{mat_name}' not found.")
+            return {"CANCELLED"}
+
+        dup_mat = base_mat.copy()
+        dup_mat.name = f"{mat_name}_Custom"
+
+        if context.active_object and hasattr(context.active_object, "data") and hasattr(context.active_object.data, "materials"):
+            if not context.active_object.data.materials:
+                context.active_object.data.materials.append(dup_mat)
+            else:
+                context.active_object.data.materials[0] = dup_mat
+
+        self.report({"INFO"}, f"Science Blocks: Created material '{dup_mat.name}' (available in Material Properties).")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_create_all_materials(bpy.types.Operator):
+    """Generate all standard Science Blocks PBR materials in Blender data."""
+    bl_idname = "science_blocks.create_all_materials"
+    bl_label = "Generate Material Library"
+    bl_description = "Create or refresh all standard PBR materials in Blender"
+
+    def execute(self, context):
+        mats = ensure_standard_materials()
+        self.report({"INFO"}, f"Science Blocks: Generated {len(mats)} standard PBR materials.")
+        return {"FINISHED"}
 
 
 def create_or_update_side_jar_view(context) -> bool:

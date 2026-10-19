@@ -80,6 +80,23 @@ def draw_step_2_planetary_kinematics(layout, context, props):
 
     col.separator(factor=0.3)
 
+    # Studio Lighting & Material Library
+    b_theme = col.box()
+    b_theme.label(text="Studio Theme & Material Library:", icon="MATERIAL")
+    c_th = b_theme.column(align=True)
+    row_th = c_th.row(align=True)
+    row_th.prop(props, "viewport_theme_mode", text="")
+    row_th.operator("science_blocks.apply_light_theme", text="Apply Theme", icon="LIGHT_SUN")
+
+    c_th.separator(factor=0.2)
+    c_th.label(text="Standard PBR Materials:", icon="SHADING_RENDERED")
+    c_th.prop(props, "selected_studio_material", text="")
+    row_m_act = c_th.row(align=True)
+    row_m_act.operator("science_blocks.assign_studio_material", text="Assign to Selected", icon="RESTRICT_SELECT_OFF")
+    row_m_act.operator("science_blocks.duplicate_studio_material", text="Duplicate", icon="DUPLICATE")
+
+    col.separator(factor=0.3)
+
     # 3D Model Scene Assignments
     b_models = col.box()
     b_models.label(text="3D Simulation Models:", icon="OBJECT_DATA")
@@ -173,8 +190,9 @@ def draw_step_3_dem_simulation(layout, context, props):
 
     # 2. Simulation Environment Settings
     b_sim = col.box()
-    b_sim.label(text="Simulation Settings:", icon="PHYSICS")
+    b_sim.label(text="Simulation Settings & Engine:", icon="PHYSICS")
     c_s = b_sim.column(align=True)
+    c_s.prop(props, "dem_solver_engine", text="DEM Engine")
     row_s1 = c_s.row(align=True)
     row_s1.prop(props, "dem_sim_frames", text="Frames")
     row_s1.prop(props, "mill_gravity_value", text="Gravity (m/s²)")
