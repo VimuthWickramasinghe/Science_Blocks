@@ -15,26 +15,27 @@ def draw_step_1_python_env(layout, context, props):
 
     col.separator(factor=0.3)
 
-    env_type = props.python_environment_type
+    env_type = getattr(props, "python_environment_type", "BLENDER")
 
     # -------------------------------------------------------------------------
     # CASE A: BLENDER BUNDLED PYTHON
     # -------------------------------------------------------------------------
     if env_type == "BLENDER":
         b_info = col.box()
+        py_ver = getattr(props, "python_system_version", "")
         b_info.label(
-            text=props.python_system_version if props.python_system_version else "Blender Bundled Python",
+            text=py_ver if py_ver else "Blender Bundled Python",
             icon="BLENDER",
         )
         col_pkgs = b_info.column(align=True)
         row_p1 = col_pkgs.row(align=True)
         row_p1.label(
             text="NumPy (DEM Engine)",
-            icon="CHECKMARK" if props.pkg_numpy_installed else "CANCEL",
+            icon="CHECKMARK" if getattr(props, "pkg_numpy_installed", False) else "CANCEL",
         )
         row_p1.label(
             text="SciPy",
-            icon="CHECKMARK" if props.pkg_scipy_installed else "CANCEL",
+            icon="CHECKMARK" if getattr(props, "pkg_scipy_installed", False) else "CANCEL",
         )
 
         col.separator(factor=0.2)
@@ -46,8 +47,8 @@ def draw_step_1_python_env(layout, context, props):
         # Status readout
         status_box = col.box()
         row_st = status_box.row(align=True)
-        status_icon = "CHECKMARK" if props.env_initialized else "INFO"
-        row_st.label(text=props.env_status_message, icon=status_icon)
+        status_icon = "CHECKMARK" if getattr(props, "env_initialized", False) else "INFO"
+        row_st.label(text=getattr(props, "env_status_message", "Pending verification"), icon=status_icon)
 
     # -------------------------------------------------------------------------
     # CASE B: EXTERNAL LOCAL PYTHON ENVIRONMENT
@@ -63,15 +64,15 @@ def draw_step_1_python_env(layout, context, props):
         row_lp = col_lpkgs.row(align=True)
         row_lp.label(
             text="NumPy",
-            icon="CHECKMARK" if props.local_pkg_numpy else "CANCEL",
+            icon="CHECKMARK" if getattr(props, "local_pkg_numpy", False) else "CANCEL",
         )
         row_lp.label(
             text="SciPy",
-            icon="CHECKMARK" if props.local_pkg_scipy else "CANCEL",
+            icon="CHECKMARK" if getattr(props, "local_pkg_scipy", False) else "CANCEL",
         )
         row_lp.label(
             text="Matplotlib",
-            icon="CHECKMARK" if props.local_pkg_matplotlib else "CANCEL",
+            icon="CHECKMARK" if getattr(props, "local_pkg_matplotlib", False) else "CANCEL",
         )
 
         col.separator(factor=0.2)
@@ -79,11 +80,13 @@ def draw_step_1_python_env(layout, context, props):
         # Connection / Start / Stop Controls
         row_ctrl = col.row(align=True)
         row_ctrl.scale_y = 1.25
-        if not props.local_env_is_running:
+        is_local_running = getattr(props, "local_env_is_running", False)
+        if not is_local_running:
             row_ctrl.operator("science_blocks.start_local_env", icon="PLAY", text="Start / Connect")
             row_ctrl.operator("science_blocks.create_local_env", icon="FILE_NEW", text="Create New venv")
         else:
-            row_ctrl.label(text=f"● Active (PID: {props.local_env_pid})", icon="RECORD_ON")
+            pid = getattr(props, "local_env_pid", 0)
+            row_ctrl.label(text=f"● Active (PID: {pid})", icon="RECORD_ON")
             row_ctrl.operator("science_blocks.stop_local_env", icon="CANCEL", text="Stop / Disconnect")
 
         # Package Verify & Install
@@ -94,7 +97,8 @@ def draw_step_1_python_env(layout, context, props):
 
         # Local Status readout
         st_box = col.box()
-        st_box.label(text=f"Status: {props.local_env_status}", icon="INFO")
+        loc_status = getattr(props, "local_env_status", "Not Connected")
+        st_box.label(text=f"Status: {loc_status}", icon="INFO")
 
     # -------------------------------------------------------------------------
     # CASE C: GOOGLE COLAB REMOTE FASTAPI GPU BACKEND
@@ -109,17 +113,20 @@ def draw_step_1_python_env(layout, context, props):
 
         row_c_btn = col.row(align=True)
         row_c_btn.scale_y = 1.25
-        if not props.colab_is_connected:
+        is_colab_conn = getattr(props, "colab_is_connected", False)
+        if not is_colab_conn:
             row_c_btn.operator("science_blocks.colab_connect", text="Connect to Google Colab", icon="URL")
         else:
             row_c_btn.operator("science_blocks.colab_connect", text="Test Health / GPU", icon="FILE_TICK")
             row_c_btn.operator("science_blocks.colab_disconnect", text="Disconnect Colab", icon="CANCEL")
 
         st_c_box = col.box()
-        status_icon = "CHECKMARK" if props.colab_is_connected else "INFO"
-        st_c_box.label(text=f"Colab: {props.colab_status_msg}", icon=status_icon)
-        if props.colab_server_info:
-            st_c_box.label(text=f"Server: {props.colab_server_info}", icon="DRIVER")
+        status_icon = "CHECKMARK" if is_colab_conn else "INFO"
+        colab_msg = getattr(props, "colab_status_msg", "Disconnected")
+        st_c_box.label(text=f"Colab: {colab_msg}", icon=status_icon)
+        server_info = getattr(props, "colab_server_info", "")
+        if server_info:
+            st_c_box.label(text=f"Server: {server_info}", icon="DRIVER")
 
         col.separator(factor=0.3)
 
@@ -239,7 +246,7 @@ def draw_step_2_kinematics(layout, context, props):
 
     # Isolated Side Chamber Inspection View (Fixed Gravity Vector)
     b_side = col.box()
-    side_active = bool(props.show_side_jar_view and bpy.data.objects.get("Jar_Chamber_SideView"))
+    side_active = bool(getattr(props, "show_side_jar_view", False) and bpy.data.objects.get("Jar_Chamber_SideView"))
     row_side_hdr = b_side.row(align=True)
     row_side_hdr.label(text="Side Chamber View (Fixed Gravity):", icon="VIEW3D")
     row_side_hdr.operator(
@@ -258,7 +265,7 @@ def draw_step_2_kinematics(layout, context, props):
         row_side_btn.operator("science_blocks.toggle_side_jar_view", text="Show Side Chamber & Gravity Arrow", icon="VIEW3D")
 
     row_opt = c_s.row(align=True)
-    row_opt.prop(props, "side_jar_show_arrow", text="Gravity Vector Arrow", icon="CHECKBOX_HLT" if props.side_jar_show_arrow else "CHECKBOX_DEHLT")
+    row_opt.prop(props, "side_jar_show_arrow", text="Gravity Vector Arrow", icon="CHECKBOX_HLT" if getattr(props, "side_jar_show_arrow", True) else "CHECKBOX_DEHLT")
     row_opt.prop(props, "side_jar_invert_arrow", text="Invert Arrow", icon="ARROW_LEFTRIGHT")
     row_opt.prop(props, "side_jar_offset_x", text="Offset")
 
@@ -279,7 +286,7 @@ def draw_step_2_kinematics(layout, context, props):
 
     row_scrub = c_kin.row(align=True)
     row_scrub.prop(context.scene, "frame_current", text="Frame")
-    row_scrub.prop(props, "live_motion_preview", text="Live Preview", icon="CHECKBOX_HLT" if props.live_motion_preview else "CHECKBOX_DEHLT")
+    row_scrub.prop(props, "live_motion_preview", text="Live Preview", icon="CHECKBOX_HLT" if getattr(props, "live_motion_preview", True) else "CHECKBOX_DEHLT")
 
     col.separator(factor=0.3)
 
@@ -289,14 +296,16 @@ def draw_step_2_kinematics(layout, context, props):
     c_foc = b_focus.column(align=True)
     row_f1 = c_foc.row(align=True)
     row_f1.operator("science_blocks.focus_jar_view", text="Focus View on Jar", icon="VIEW_CAMERA")
+    show_cutaway = getattr(props, "show_chamber_cutaway", False)
     row_f1.operator(
         "science_blocks.toggle_chamber_cutaway",
-        text="Solid Chamber" if props.show_chamber_cutaway else "Chamber Cutaway (Inside View)",
+        text="Solid Chamber" if show_cutaway else "Chamber Cutaway (Inside View)",
         icon="MOD_BOOLEAN",
     )
+    is_tracking = getattr(props, "camera_follow_jar", False)
     c_foc.operator(
         "science_blocks.toggle_camera_tracking",
-        text="Stop Tracking Jar" if props.camera_follow_jar else "Track Jar With Camera",
+        text="Stop Tracking Jar" if is_tracking else "Track Jar With Camera",
         icon="CAMERA_DATA",
     )
 
@@ -345,12 +354,13 @@ def draw_step_3_simulation(layout, context, props):
     row_insp = col.row(align=True)
     row_insp.scale_y = 1.15
     row_insp.operator("science_blocks.focus_jar_view", text="Focus Jar", icon="VIEW_CAMERA")
+    show_cutaway = getattr(props, "show_chamber_cutaway", False)
     row_insp.operator(
         "science_blocks.toggle_chamber_cutaway",
-        text="Cutaway View" if not props.show_chamber_cutaway else "Solid Jar",
+        text="Cutaway View" if not show_cutaway else "Solid Jar",
         icon="MOD_BOOLEAN",
     )
-    side_active = bool(props.show_side_jar_view and bpy.data.objects.get("Jar_Chamber_SideView"))
+    side_active = bool(getattr(props, "show_side_jar_view", False) and bpy.data.objects.get("Jar_Chamber_SideView"))
     row_insp.operator(
         "science_blocks.toggle_side_jar_view",
         text="Side View" if not side_active else "Hide Side",
@@ -359,19 +369,23 @@ def draw_step_3_simulation(layout, context, props):
     row_insp.operator("science_blocks.apply_scientific_paper_colors", text="Colors", icon="SHADING_RENDERED")
 
     # 4. Results & Reporting
-    if props.dem_is_simulated:
+    if getattr(props, "dem_is_simulated", False):
         col.separator(factor=0.4)
         b_res = col.box()
         b_res.label(text="Simulation Telemetry & Results:", icon="VIEWZOOM")
         c_res = b_res.column(align=True)
 
+        total_impacts = getattr(props, "dem_total_impacts", 0)
+        coll_freq = getattr(props, "dem_collision_freq_hz", 0.0)
         row_im = c_res.row(align=True)
-        row_im.label(text=f"Impacts: {props.dem_total_impacts:,}", icon="DOT")
-        row_im.label(text=f"Freq: {props.dem_collision_freq_hz:.1f} Hz", icon="TIME")
+        row_im.label(text=f"Impacts: {total_impacts:,}", icon="DOT")
+        row_im.label(text=f"Freq: {coll_freq:.1f} Hz", icon="TIME")
 
+        mean_energy = getattr(props, "dem_mean_impact_energy_j", 0.0)
+        power_w = getattr(props, "dem_power_watts", 0.0)
         row_e = c_res.row(align=True)
-        row_e.label(text=f"Mean Energy: {props.dem_mean_impact_energy_j:.4f} J", icon="DRIVER")
-        row_e.label(text=f"Power: {props.dem_power_watts:.1f} W", icon="TOOL_SETTINGS")
+        row_e.label(text=f"Mean Energy: {mean_energy:.4f} J", icon="DRIVER")
+        row_e.label(text=f"Power: {power_w:.1f} W", icon="TOOL_SETTINGS")
 
         c_res.separator(factor=0.3)
         row_rep = c_res.row(align=True)
@@ -455,7 +469,7 @@ def draw_scientific_styling_panel(layout, context, props):
         props,
         "sci_transparent_background",
         text="Transparent Film (LaTeX / PNG)",
-        icon="CHECKBOX_HLT" if props.sci_transparent_background else "CHECKBOX_DEHLT",
+        icon="CHECKBOX_HLT" if getattr(props, "sci_transparent_background", False) else "CHECKBOX_DEHLT",
     )
 
     row_bg_quick = c_bg.row(align=True)
@@ -534,7 +548,7 @@ def draw_scientific_styling_panel(layout, context, props):
         props,
         "sci_viewport_cavity",
         text="Technical Cavity Ridge/Valley + AO",
-        icon="CHECKBOX_HLT" if props.sci_viewport_cavity else "CHECKBOX_DEHLT",
+        icon="CHECKBOX_HLT" if getattr(props, "sci_viewport_cavity", False) else "CHECKBOX_DEHLT",
     )
     row_vp = c_vp.row(align=True)
     row_vp.scale_y = 1.15

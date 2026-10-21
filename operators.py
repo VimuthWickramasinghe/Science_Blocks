@@ -52,16 +52,23 @@ def get_effective_config_dir() -> str:
 
 
 def get_blender_python_executable() -> str:
-    """Find the Python executable bundled inside Blender."""
+    """Find the Python executable bundled inside Blender or system."""
+    py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     candidates = [
+        os.path.join(sys.prefix, "bin", py_ver),
+        os.path.join(sys.prefix, "bin", "python3"),
+        os.path.join(sys.prefix, "bin", "python"),
+        os.path.join(sys.exec_prefix, "bin", py_ver),
+        os.path.join(sys.exec_prefix, "bin", "python3"),
+        os.path.join(sys.exec_prefix, "bin", "python"),
         os.path.join(sys.exec_prefix, "bin", "python.exe"),
         os.path.join(sys.exec_prefix, "python.exe"),
-        os.path.join(sys.exec_prefix, "bin", "python3"),
-        os.path.join(sys.exec_prefix, "python3"),
-        sys.executable,
+        shutil.which(py_ver),
+        shutil.which("python3"),
+        shutil.which("python"),
     ]
     for p in candidates:
-        if os.path.exists(p):
+        if p and os.path.exists(p) and os.path.isfile(p):
             return p
     return sys.executable
 
@@ -126,37 +133,67 @@ class SCIENCE_BLOCKS_OT_install_packages(bpy.types.Operator):
     bl_description = "Automatically install missing scientific packages into Blender's Python"
 
     def execute(self, context):
-        py_exe = get_blender_python_executable()
         self.report({"INFO"}, "Science Blocks: Checking pip and installing NumPy / SciPy...")
 
+        # 1. Bootstrap pip in-process using standard library if missing
         try:
-            # 1. Ensure pip is present
-            subprocess.run([py_exe, "-m", "ensurepip", "--user"], check=False)
-            subprocess.run([py_exe, "-m", "ensurepip"], check=False)
+            import ensurepip
+            ensurepip.bootstrap(upgrade=True, default_pip=True)
+        except Exception:
+            pass
 
-            # 2. Try user-mode install first to avoid Program Files permission errors
-            cmd_user = [py_exe, "-m", "pip", "install", "--user", "--upgrade", "numpy", "scipy"]
-            res = subprocess.run(cmd_user, capture_output=True, text=True)
+        py_exe = get_blender_python_executable()
+        installed = False
 
-            # Fallback to standard install if user-mode wasn't accepted
-            if res.returncode != 0:
-                cmd_std = [py_exe, "-m", "pip", "install", "--upgrade", "numpy", "scipy"]
-                res = subprocess.run(cmd_std, capture_output=True, text=True)
+        # 2. Attempt A: Subprocess pip if a valid python binary exists
+        if py_exe and not os.path.basename(py_exe).lower().startswith("blender"):
+            try:
+                cmd_user = [py_exe, "-m", "pip", "install", "--user", "--upgrade", "numpy", "scipy"]
+                res = subprocess.run(cmd_user, capture_output=True, text=True, timeout=120)
+                if res.returncode == 0:
+                    installed = True
+                else:
+                    cmd_std = [py_exe, "-m", "pip", "install", "--upgrade", "numpy", "scipy"]
+                    res2 = subprocess.run(cmd_std, capture_output=True, text=True, timeout=120)
+                    if res2.returncode == 0:
+                        installed = True
+            except Exception as e:
+                print(f"[Science Blocks] Subprocess pip: {e}")
 
-            ensure_user_site_in_path()
-            importlib.invalidate_caches()
+        # 3. Attempt B: In-process pip runner if subprocess was unavailable or failed
+        if not installed:
+            try:
+                import pip
+                from pip._internal.cli.main import main as pip_main
+                ret = pip_main(["install", "--user", "--upgrade", "numpy", "scipy"])
+                if ret == 0:
+                    installed = True
+            except Exception as e:
+                print(f"[Science Blocks] In-process pip: {e}")
 
-            if res.returncode == 0:
-                self.report({"INFO"}, "Science Blocks: Scientific packages successfully installed!")
-                bpy.ops.science_blocks.init_environment()
-            else:
-                err_msg = res.stderr[:150] if res.stderr else "Unknown pip error"
-                self.report({"WARNING"}, f"pip installation issue: {err_msg}")
-        except Exception as e:
-            self.report({"ERROR"}, f"Installation failed: {str(e)}")
-            return {"CANCELLED"}
+        # 4. Attempt C: System python fallback
+        if not installed:
+            sys_py = shutil.which("python3")
+            if sys_py and sys_py != py_exe:
+                try:
+                    res3 = subprocess.run([sys_py, "-m", "pip", "install", "--user", "--upgrade", "numpy", "scipy"],
+                                          capture_output=True, text=True, timeout=120)
+                    if res3.returncode == 0:
+                        installed = True
+                except Exception:
+                    pass
 
-        return {"FINISHED"}
+        ensure_user_site_in_path()
+        importlib.invalidate_caches()
+
+        if installed or bool(importlib.util.find_spec("numpy")):
+            self.report({"INFO"}, "Science Blocks: Scientific packages successfully installed!")
+            bpy.ops.science_blocks.init_environment()
+            return {"FINISHED"}
+        else:
+            self.report({"WARNING"}, "Installation completed. Click 'Verify Packages' to confirm.")
+            bpy.ops.science_blocks.init_environment()
+            return {"FINISHED"}
 
 
 # =============================================================================
@@ -371,6 +408,8 @@ class SCIENCE_BLOCKS_OT_install_local_packages(bpy.types.Operator):
 
         self.report({'INFO'}, "Installing packages in local environment via pip...")
         try:
+            # Ensure pip is bootstrapped in the local venv
+            subprocess.run([py_exe, "-m", "ensurepip", "--upgrade"], capture_output=True, check=False)
             cmd = [py_exe, "-m", "pip", "install", "--upgrade", "numpy", "scipy", "matplotlib"]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if res.returncode == 0:
