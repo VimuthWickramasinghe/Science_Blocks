@@ -566,12 +566,12 @@ class SCIENCE_BLOCKS_OT_save_setup(bpy.types.Operator):
                 "motion_time_scale": props.motion_time_scale,
             },
             "telemetry_results": {
-                "is_simulated": props.dem_is_simulated,
-                "total_impacts": props.dem_total_impacts,
-                "collision_frequency_hz": props.dem_collision_freq_hz,
-                "mean_impact_energy_j": props.dem_mean_impact_energy_j,
-                "max_impact_energy_j": props.dem_max_impact_energy_j,
-                "power_watts": props.dem_power_watts,
+                "is_simulated": getattr(props, "dem_is_simulated", False),
+                "total_impacts": getattr(props, "dem_total_impacts", 0),
+                "collision_frequency_hz": getattr(props, "dem_collision_freq_hz", 0.0),
+                "mean_impact_energy_j": getattr(props, "dem_mean_impact_energy_j", 0.0),
+                "max_impact_energy_j": getattr(props, "dem_max_impact_energy_j", 0.0),
+                "power_watts": getattr(props, "dem_power_watts", 0.0),
             },
             "mill_dimensions": {
                 "dimension_mode": props.mill_dimension_mode,
@@ -1529,7 +1529,7 @@ class SCIENCE_BLOCKS_OT_export_telemetry(bpy.types.Operator):
 
     def execute(self, context):
         props = getattr(context.scene, "science_blocks_props", None)
-        if not props or not props.dem_is_simulated:
+        if not props or not getattr(props, "dem_is_simulated", False):
             self.report({"WARNING"}, "No DEM simulation results to export. Run DEM simulation first.")
             return {"CANCELLED"}
 
@@ -1594,7 +1594,7 @@ class SCIENCE_BLOCKS_OT_generate_scientific_report(bpy.types.Operator):
         from . import report_generator
 
         res = dem_solver.last_dem_result
-        if not res or not props.dem_is_simulated:
+        if not res or not getattr(props, "dem_is_simulated", False):
             self.report({"WARNING"}, "No DEM simulation results found. Please run the DEM simulation first.")
             return {"CANCELLED"}
 
