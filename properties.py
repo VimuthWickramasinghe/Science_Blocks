@@ -785,6 +785,10 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
 
 def register():
     try:
+        bpy.utils.unregister_class(ScienceBlocksProperties)
+    except Exception:
+        pass
+    try:
         bpy.utils.register_class(ScienceBlocksProperties)
     except Exception:
         pass

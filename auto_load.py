@@ -27,7 +27,14 @@ def init():
 
 def register():
     for cls in ordered_classes:
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except Exception:
+            try:
+                bpy.utils.unregister_class(cls)
+                bpy.utils.register_class(cls)
+            except Exception:
+                pass
 
     for module in modules:
         if module.__name__ == __name__:
