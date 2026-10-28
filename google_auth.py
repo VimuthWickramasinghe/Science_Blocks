@@ -590,23 +590,6 @@ def draw_google_auth_card(layout, context):
         row_tok.operator("wm.google_logout", text="Disconnect", icon='CANCEL')
 
 
-class VIEW3D_PT_google_auth_panel(bpy.types.Panel):
-    """Standalone Panel for Account Security & Google Sign-In."""
-    bl_label = "Science Blocks Account"
-    bl_idname = "VIEW3D_PT_google_auth_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Science Blocks'
-    bl_order = 0
-
-    @classmethod
-    def poll(cls, context):
-        props = getattr(context.scene, "science_blocks_props", None)
-        return bool(props and props.python_environment_type == "COLAB")
-
-    def draw(self, context):
-        draw_google_auth_card(self.layout, context)
-
 
 # =============================================================================
 # REGISTRATION
@@ -618,7 +601,6 @@ classes = (
     SCIENCE_BLOCKS_OT_google_logout,
     SCIENCE_BLOCKS_OT_google_cancel_login,
     SCIENCE_BLOCKS_OT_google_copy_token,
-    VIEW3D_PT_google_auth_panel,
 )
 
 

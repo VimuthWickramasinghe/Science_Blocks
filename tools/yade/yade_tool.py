@@ -5,6 +5,7 @@ and provides an embedded discrete element engine in pure Python/NumPy.
 """
 
 import os
+import math
 from typing import Dict, Any
 from ..base_tool import BaseSimulationTool, register_tool
 

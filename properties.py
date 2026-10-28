@@ -296,10 +296,15 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
     local_pkg_matplotlib: BoolProperty(name="Matplotlib (Local)", default=False)
 
     # Google Colab FastAPI Cloud Properties
+    colab_show_instructions: BoolProperty(
+        name="Show Setup Instructions",
+        description="Toggle collapsible step-by-step instructions for Google Colab connection",
+        default=False,
+    )
     colab_endpoint_url: StringProperty(
         name="Colab Endpoint URL",
         description="Public HTTPS URL of Google Colab FastAPI server (e.g. from ngrok or localtunnel)",
-        default="https://your-colab-service.ngrok-free.app",
+        default="Enter your URL here",
     )
     colab_is_connected: BoolProperty(
         name="Colab Connected",
@@ -648,7 +653,7 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
             ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock"),
             ("SOLID", "Solid Realistic Material", "Realistic metallic/ceramic material rendering"),
         ],
-        default="VIRIDIS",
+        default="VELOCITY",
         description="Dynamic color-coding of milling media in 3D viewport",
     )
 

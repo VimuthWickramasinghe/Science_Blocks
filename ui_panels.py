@@ -61,20 +61,6 @@ def draw_step_1_python_env(layout, context, props):
         # Package indicators for local environment
         col_lpkgs = c_l.column(align=True)
         row_lp = col_lpkgs.row(align=True)
-        row_lp.label(
-            text="NumPy",
-            icon="CHECKMARK" if props.local_pkg_numpy else "CANCEL",
-        )
-        row_lp.label(
-            text="SciPy",
-            icon="CHECKMARK" if props.local_pkg_scipy else "CANCEL",
-        )
-        row_lp.label(
-            text="Matplotlib",
-            icon="CHECKMARK" if props.local_pkg_matplotlib else "CANCEL",
-        )
-
-        col.separator(factor=0.2)
 
         # Connection / Start / Stop Controls
         row_ctrl = col.row(align=True)
@@ -102,13 +88,41 @@ def draw_step_1_python_env(layout, context, props):
     elif env_type == "COLAB":
         b_colab = col.box()
         b_colab.label(text="Google Colab Remote GPU Backend:", icon="WORLD")
+
+        # Collapsible Instructions & Quick Setup Guide
+        box_guide = b_colab.box()
+        row_g = box_guide.row(align=True)
+        icon_tri = "TRIA_DOWN" if props.colab_show_instructions else "TRIA_RIGHT"
+        row_g.prop(
+            props,
+            "colab_show_instructions",
+            text="Connection Instructions & Setup Guide",
+            icon=icon_tri,
+            emboss=False,
+        )
+
+        if props.colab_show_instructions:
+            col_ins = box_guide.column(align=True)
+            col_ins.separator(factor=0.2)
+            col_ins.label(text="1. Open Google Colab & enable T4 GPU runtime.", icon="DOT")
+            col_ins.label(text="2. Click 'Copy Server Script' & paste into Colab cell.", icon="DOT")
+            col_ins.label(text="3. Run cell (Auto-tunnels via free Cloudflare, no signup).", icon="DOT")
+            col_ins.label(text="4. Copy the public HTTPS URL printed at bottom.", icon="DOT")
+            col_ins.label(text="5. Paste the URL into 'Colab URL' below.", icon="DOT")
+            col_ins.label(text="6. Click 'Connect to Google Colab'.", icon="DOT")
+            col_ins.separator(factor=0.3)
+
+            row_actions = col_ins.row(align=True)
+            row_actions.operator("science_blocks.colab_open_browser", text="Open Google Colab", icon="URL")
+            row_actions.operator("science_blocks.colab_copy_script", text="Copy Server Script", icon="COPYDOWN")
+            col_ins.separator(factor=0.2)
+
         c_c = b_colab.column(align=True)
+
         c_c.prop(props, "colab_endpoint_url", text="Colab URL")
-
-        col.separator(factor=0.2)
-
         row_c_btn = col.row(align=True)
         row_c_btn.scale_y = 1.25
+        
         if not props.colab_is_connected:
             row_c_btn.operator("science_blocks.colab_connect", text="Connect to Google Colab", icon="URL")
         else:
@@ -121,13 +135,10 @@ def draw_step_1_python_env(layout, context, props):
         if props.colab_server_info:
             st_c_box.label(text=f"Server: {props.colab_server_info}", icon="DRIVER")
 
-        col.separator(factor=0.3)
-
-        # Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
-        from . import google_auth
-        google_auth.draw_google_auth_card(col, context)
-
     col.separator(factor=0.4)
+    # Todo: Implement Google sign in code Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
+    # from . import google_auth
+    # google_auth.draw_google_auth_card(col, context)
 
     # Blender File Folder & Configuration Save/Load
     b_folder = col.box()
@@ -359,35 +370,35 @@ def draw_step_3_simulation(layout, context, props):
     row_insp.operator("science_blocks.apply_scientific_paper_colors", text="Colors", icon="SHADING_RENDERED")
 
     # 4. Results & Reporting
-    if props.dem_is_simulated:
-        col.separator(factor=0.4)
-        b_res = col.box()
-        b_res.label(text="Simulation Telemetry & Results:", icon="VIEWZOOM")
-        c_res = b_res.column(align=True)
+    # if props.dem_is_simulated:
+    #     col.separator(factor=0.4)
+    #     b_res = col.box()
+    #     b_res.label(text="Simulation Telemetry & Results:", icon="VIEWZOOM")
+    #     c_res = b_res.column(align=True)
 
-        row_im = c_res.row(align=True)
-        row_im.label(text=f"Impacts: {props.dem_total_impacts:,}", icon="DOT")
-        row_im.label(text=f"Freq: {props.dem_collision_freq_hz:.1f} Hz", icon="TIME")
+    #     row_im = c_res.row(align=True)
+    #     row_im.label(text=f"Impacts: {props.dem_total_impacts:,}", icon="DOT")
+    #     row_im.label(text=f"Freq: {props.dem_collision_freq_hz:.1f} Hz", icon="TIME")
 
-        row_e = c_res.row(align=True)
-        row_e.label(text=f"Mean Energy: {props.dem_mean_impact_energy_j:.4f} J", icon="DRIVER")
-        row_e.label(text=f"Power: {props.dem_power_watts:.1f} W", icon="TOOL_SETTINGS")
+    #     row_e = c_res.row(align=True)
+    #     row_e.label(text=f"Mean Energy: {props.dem_mean_impact_energy_j:.4f} J", icon="DRIVER")
+    #     row_e.label(text=f"Power: {props.dem_power_watts:.1f} W", icon="TOOL_SETTINGS")
 
-        c_res.separator(factor=0.3)
-        row_rep = c_res.row(align=True)
-        row_rep.scale_y = 1.3
-        row_rep.operator(
-            "science_blocks.generate_scientific_report",
-            text="Generate Scientific Report & Figures",
-            icon="TEXT",
-        )
+    #     c_res.separator(factor=0.3)
+    #     row_rep = c_res.row(align=True)
+    #     row_rep.scale_y = 1.3
+    #     row_rep.operator(
+    #         "science_blocks.generate_scientific_report",
+    #         text="Generate Scientific Report & Figures",
+    #         icon="TEXT",
+    #     )
 
-        row_links = c_res.row(align=True)
-        row_links.scale_y = 1.15
-        row_links.operator("science_blocks.open_html_report", text="View HTML Report", icon="URL")
-        row_links.operator("science_blocks.export_telemetry", text="Export CSV / JSON", icon="FILE_TICK")
+    #     row_links = c_res.row(align=True)
+    #     row_links.scale_y = 1.15
+    #     row_links.operator("science_blocks.open_html_report", text="View HTML Report", icon="URL")
+    #     row_links.operator("science_blocks.export_telemetry", text="Export CSV / JSON", icon="FILE_TICK")
 
-    col.separator(factor=0.4)
+    # col.separator(factor=0.4)
 
     # 5. Open-Source Multiphysics Tools (Node-Based)
     b_tools = col.box()
