@@ -349,19 +349,19 @@ class ScienceBlocksRotationNode(bpy.types.Node):
         default="CW",
     )
 
-    # Base Rest Pose (Degrees) - Prevents axis switching & rewind corruption
-    base_rot_x: FloatProperty(name="Base X (°)", default=0.0, description="Rest pose rotation on X axis in degrees")
-    base_rot_y: FloatProperty(name="Base Y (°)", default=0.0, description="Rest pose rotation on Y axis in degrees")
-    base_rot_z: FloatProperty(name="Base Z (°)", default=0.0, description="Rest pose rotation on Z axis in degrees")
-    has_captured_base: BoolProperty(default=False)
-    last_axis: StringProperty(name="Last Active Axis", default="")
+    # # Base Rest Pose (Degrees) - Prevents axis switching & rewind corruption
+    # base_rot_x: FloatProperty(name="Base X (°)", default=0.0, description="Rest pose rotation on X axis in degrees")
+    # base_rot_y: FloatProperty(name="Base Y (°)", default=0.0, description="Rest pose rotation on Y axis in degrees")
+    # base_rot_z: FloatProperty(name="Base Z (°)", default=0.0, description="Rest pose rotation on Z axis in degrees")
+    # has_captured_base: BoolProperty(default=False)
+    # last_axis: StringProperty(name="Last Active Axis", default="")
 
-    # Phase / Angle Offset (Degrees)
-    angle_offset: FloatProperty(
-        name="Offset (°)",
-        default=0.0,
-        description="Static angle or phase offset in degrees",
-    )
+    # # Phase / Angle Offset (Degrees)
+    # angle_offset: FloatProperty(
+    #     name="Offset (°)",
+    #     default=0.0,
+    #     description="Static angle or phase offset in degrees",
+    # )
 
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Object In")
@@ -540,7 +540,8 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
     bl_label = "Planetary DEM Solver Block"
     bl_icon = "PHYSICS"
 
-    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=500)
+    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=500, description="Total number of particles to simulate")
+    sim_frames: IntProperty(name="Frames", default=150, min=10, max=2000, description="Total simulation frames to compute and bake")
     substeps: IntProperty(name="Substeps/Frame", default=40, min=10, max=200)
     contact_model: EnumProperty(
         name="Contact Model",
@@ -583,8 +584,12 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
         col.prop(self, "charge_distribution", text="")
         row_cnt = col.row(align=True)
         row_cnt.prop(self, "ball_count", text="Balls")
-        row_cnt.prop(self, "substeps", text="Substeps")
-        col.label(text="Symplectic Velocity Verlet Solver", icon="INFO")
+        row_cnt.prop(self, "sim_frames", text="Frames")
+        col.prop(self, "substeps", text="Substeps")
+        col.separator(factor=0.3)
+        row_b = col.row(align=True)
+        row_b.scale_y = 1.3
+        row_b.operator("science_blocks.run_dem_simulation", text="Bake DEM Simulation", icon="PHYSICS")
 
 
 class ScienceBlocksSensorNode(bpy.types.Node):
@@ -641,6 +646,10 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         col = layout.column(align=True)
         col.prop(self, "display_mode", text="")
         col.prop(self, "colormap_mode", text="")
+        col.separator(factor=0.3)
+        row_b = col.row(align=True)
+        row_b.scale_y = 1.25
+        row_b.operator("science_blocks.run_dem_simulation", text="Bake Simulation", icon="RESTRICT_RENDER_OFF")
 
 
 # ===========================================================================

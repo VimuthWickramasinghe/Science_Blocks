@@ -1636,7 +1636,53 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         ball_count = props.dem_ball_count
         ball_radius_m = props.dem_ball_radius_mm / 1000.0
         ball_density = props.dem_ball_density
+        youngs_modulus_gpa = props.dem_youngs_modulus_gpa
+        poissons_ratio = props.dem_poissons_ratio
+        restitution = props.dem_restitution
+        static_friction = props.dem_static_friction
+        rolling_friction = props.dem_rolling_friction
+        contact_model = props.dem_contact_model
+        charge_distribution = props.dem_charge_distribution
+        integrator = props.dem_integrator
+        substeps_per_frame = 40
         frames = props.dem_sim_frames
+        colormap_mode = props.dem_viewport_colormap
+
+        # Read DEM solver & physics settings directly from Node Tree if nodes are present
+        if props.active_node_tree:
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksDEMSolverNode":
+                    ball_count = node.ball_count
+                    substeps_per_frame = node.substeps
+                    contact_model = node.contact_model
+                    charge_distribution = node.charge_distribution
+                    integrator = node.integrator
+                    if hasattr(node, "sim_frames") and node.sim_frames > 0:
+                        frames = node.sim_frames
+                        props.dem_sim_frames = frames
+                    props.dem_ball_count = ball_count
+                    props.dem_contact_model = contact_model
+                    props.dem_charge_distribution = charge_distribution
+                    props.dem_integrator = integrator
+                elif node.bl_idname == "ScienceBlocksPhysicsNode":
+                    ball_radius_m = node.ball_radius_mm / 1000.0
+                    ball_density = node.density
+                    youngs_modulus_gpa = node.youngs_modulus_gpa
+                    poissons_ratio = node.poissons_ratio
+                    restitution = node.restitution
+                    static_friction = node.friction
+                    rolling_friction = node.rolling_friction
+                    props.dem_ball_radius_mm = node.ball_radius_mm
+                    props.dem_ball_density = node.density
+                    props.dem_youngs_modulus_gpa = node.youngs_modulus_gpa
+                    props.dem_poissons_ratio = node.poissons_ratio
+                    props.dem_restitution = node.restitution
+                    props.dem_static_friction = node.friction
+                    props.dem_rolling_friction = node.rolling_friction
+                elif node.bl_idname == "ScienceBlocksOutputNode":
+                    colormap_mode = node.colormap_mode
+                    props.dem_viewport_colormap = colormap_mode
+
         fps = context.scene.render.fps / max(1, context.scene.render.fps_base)
 
         # Dynamic CAD Dimensions & Mill Specifications
@@ -1655,17 +1701,17 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             "ball_count": ball_count,
             "ball_radius_m": ball_radius_m,
             "ball_density": ball_density,
-            "youngs_modulus_gpa": props.dem_youngs_modulus_gpa,
-            "poissons_ratio": props.dem_poissons_ratio,
-            "restitution": props.dem_restitution,
-            "static_friction": props.dem_static_friction,
-            "rolling_friction": props.dem_rolling_friction,
+            "youngs_modulus_gpa": youngs_modulus_gpa,
+            "poissons_ratio": poissons_ratio,
+            "restitution": restitution,
+            "static_friction": static_friction,
+            "rolling_friction": rolling_friction,
             "frames": frames,
             "fps": fps,
-            "substeps_per_frame": 40,
-            "contact_model": props.dem_contact_model,
-            "charge_distribution": props.dem_charge_distribution,
-            "integrator": props.dem_integrator,
+            "substeps_per_frame": substeps_per_frame,
+            "contact_model": contact_model,
+            "charge_distribution": charge_distribution,
+            "integrator": integrator,
             "gravity": props.mill_gravity_value,
             "mill_orientation": effective_orientation,
             "slurry_drag": (props.dem_environment == "WET_SLURRY"),
