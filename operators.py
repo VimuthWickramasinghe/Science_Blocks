@@ -442,8 +442,10 @@ class SCIENCE_BLOCKS_OT_colab_connect(bpy.types.Operator):
             self.report({'ERROR'}, "Please enter a valid HTTP/HTTPS URL for Google Colab")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Pinging Google Colab server at {url}...")
-        headers = {}
+        headers = {
+            "Bypass-Tunnel-Reminder": "true",
+            "User-Agent": "ScienceBlocks-Blender/1.0",
+        }
         if auth and auth.id_token:
             headers["Authorization"] = f"Bearer {auth.id_token}"
 
@@ -509,6 +511,199 @@ class SCIENCE_BLOCKS_OT_colab_disconnect(bpy.types.Operator):
             props.colab_status_msg = "Disconnected"
             props.colab_server_info = ""
         self.report({'INFO'}, "Disconnected from Google Colab")
+        return {'FINISHED'}
+
+
+class SCIENCE_BLOCKS_OT_colab_open_browser(bpy.types.Operator):
+    """Open Google Colab in your default web browser."""
+    bl_idname = "science_blocks.colab_open_browser"
+    bl_label = "Open Google Colab"
+    bl_description = "Launch Google Colab in your system's default web browser"
+
+    def execute(self, context):
+        import webbrowser
+        webbrowser.open("https://colab.research.google.com/")
+        self.report({'INFO'}, "Opened Google Colab in web browser")
+        return {'FINISHED'}
+
+
+COLAB_SERVER_SCRIPT = r"""# =============================================================================
+# SCIENCE BLOCKS — Google Colab FastAPI Server (Zero Signup / Auto-Tunnel)
+# =============================================================================
+# 1. Free port 8000 if previously occupied
+!fuser -k 8000/tcp 2>/dev/null || true
+
+# 2. Install dependencies
+!pip install -q fastapi uvicorn pydantic numpy scipy pyngrok
+
+import os, sys, time, re, subprocess, threading, math
+import numpy as np
+from typing import Dict, Any, Optional
+from pydantic import BaseModel
+from fastapi import FastAPI, Header
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+# OPTIONAL: If you want to use ngrok, paste your authtoken below.
+# If left empty, it will use free localtunnel/Cloudflare with ZERO signup/account needed!
+NGROK_AUTHTOKEN = ""
+
+app = FastAPI(title="Science Blocks DEM Solver")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def get_gpu():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return f"{torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB VRAM)"
+    except Exception:
+        pass
+    return "Cloud CPU"
+
+class SimReq(BaseModel):
+    sun_rpm: float = 200.0
+    jar_rpm: float = -300.0
+    r_sun: float = 1.30
+    r_jar: float = 0.45
+    h_jar: float = 1.10
+    ball_count: int = 25
+    ball_radius_m: float = 0.012
+    ball_density: float = 7850.0
+    frames: int = 150
+    fps: float = 30.0
+    substeps_per_frame: int = 40
+    restitution: float = 0.82
+    gravity: float = 9.81
+    mill_orientation: str = "VERTICAL"
+
+@app.get("/health")
+def health(authorization: Optional[str] = Header(None)):
+    return {
+        "status": "online",
+        "gpu": get_gpu(),
+        "authorized": bool(authorization and authorization.startswith("Bearer ")),
+    }
+
+@app.post("/simulate")
+def simulate(req: SimReq):
+    np.random.seed(42)
+    dt = (1.0 / req.fps) / req.substeps_per_frame
+    w_sun = (req.sun_rpm * 2.0 * math.pi) / 60.0
+    w_jar = (req.jar_rpm * 2.0 * math.pi) / 60.0
+    radii = np.full(req.ball_count, req.ball_radius_m)
+    masses = (4.0 / 3.0) * math.pi * (radii**3) * req.ball_density
+    half_h = max(0.01, req.h_jar / 2.0 - req.ball_radius_m)
+    pos = np.column_stack((
+        np.random.uniform(-0.15, 0.15, req.ball_count),
+        np.random.uniform(-0.15, 0.15, req.ball_count),
+        np.random.uniform(-half_h * 0.5, half_h * 0.5, req.ball_count),
+    ))
+    vel = np.zeros_like(pos)
+    traj = np.zeros((req.frames, req.ball_count, 3), dtype=np.float32)
+    forces = np.zeros((req.frames, req.ball_count), dtype=np.float32)
+    total_impacts = 0
+    energies = []
+    t = 0.0
+    for f in range(req.frames):
+        traj[f, :, :] = pos.astype(np.float32)
+        f_frame = np.zeros(req.ball_count, dtype=np.float32)
+        for _ in range(req.substeps_per_frame):
+            ax = (w_sun**2) * req.r_sun * math.cos(w_jar * t) + (w_jar**2) * pos[:, 0] + 2.0 * (w_jar + w_sun) * vel[:, 1]
+            ay = -(w_sun**2) * req.r_sun * math.sin(w_jar * t) + (w_jar**2) * pos[:, 1] - 2.0 * (w_jar + w_sun) * vel[:, 0]
+            az = np.full(req.ball_count, -req.gravity if req.mill_orientation == "VERTICAL" else 0.0)
+            acc = np.column_stack((ax, ay, az))
+            pos += vel * dt + 0.5 * acc * (dt**2)
+            t += dt
+            r = np.sqrt(pos[:, 0]**2 + pos[:, 1]**2)
+            hit = r > (req.r_jar - req.ball_radius_m)
+            if np.any(hit):
+                for idx in np.where(hit)[0]:
+                    nx, ny = pos[idx, 0] / r[idx], pos[idx, 1] / r[idx]
+                    pos[idx, 0] -= nx * (r[idx] - (req.r_jar - radii[idx]))
+                    pos[idx, 1] -= ny * (r[idx] - (req.r_jar - radii[idx]))
+                    vn = vel[idx, 0] * nx + vel[idx, 1] * ny
+                    if vn > 0:
+                        total_impacts += 1
+                        fn = masses[idx] * (1.0 + req.restitution) * vn / dt
+                        f_frame[idx] = max(f_frame[idx], float(fn))
+                        vel[idx, 0] -= (1.0 + req.restitution) * vn * nx
+                        vel[idx, 1] -= (1.0 + req.restitution) * vn * ny
+                        energies.append(float(0.5 * masses[idx] * (vn**2)))
+            vel += acc * dt
+        forces[f, :] = f_frame
+    return {
+        "status": "success",
+        "total_impacts": total_impacts,
+        "mean_impact_energy_j": float(np.mean(energies)) if energies else 0.0,
+        "max_impact_energy_j": float(np.max(energies)) if energies else 0.0,
+        "trajectories": traj.tolist(),
+        "velocities": vel.tolist(),
+        "forces": forces.tolist(),
+    }
+
+# Start Uvicorn safely (Disabling signal handlers prevents Jupyter/Colab kernel crashes!)
+config = uvicorn.Config(app=app, host="0.0.0.0", port=8000, log_level="warning")
+server = uvicorn.Server(config)
+server.install_signal_handlers = lambda: None
+threading.Thread(target=server.run, daemon=True).start()
+time.sleep(2)
+
+public_url = None
+if NGROK_AUTHTOKEN.strip():
+    from pyngrok import ngrok
+    ngrok.set_auth_token(NGROK_AUTHTOKEN.strip())
+    tunnel = ngrok.connect(8000)
+    public_url = tunnel.public_url
+else:
+    # Use localtunnel (Fast, reliable, zero signup)
+    try:
+        proc = subprocess.Popen(["npx", "-y", "localtunnel", "--port", "8000"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in iter(proc.stdout.readline, ''):
+            if "your url is:" in line:
+                public_url = line.split("your url is:")[-1].strip()
+                break
+    except Exception:
+        pass
+    
+    # Fallback to Cloudflare Tunnel if localtunnel is unavailable
+    if not public_url:
+        try:
+            if not os.path.exists("cloudflared"):
+                subprocess.run(["wget", "-q", "-nc", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", "-O", "cloudflared"])
+                subprocess.run(["chmod", "+x", "cloudflared"])
+            proc = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://127.0.0.1:8000"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in iter(proc.stdout.readline, ''):
+                match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+                if match:
+                    public_url = match.group(0)
+                    break
+        except Exception:
+            pass
+
+print("\n" + "=" * 70)
+print(f"🚀 COLAB ENDPOINT URL: {public_url}")
+print("=" * 70)
+print("👉 Copy this URL and paste it into Blender:")
+print(f"   Science Blocks > Step 1 > Colab URL: {public_url}")
+"""
+
+class SCIENCE_BLOCKS_OT_colab_copy_script(bpy.types.Operator):
+    """Copy the ready-to-run Google Colab server script to system clipboard."""
+    bl_idname = "science_blocks.colab_copy_script"
+    bl_label = "Copy Colab Server Script"
+    bl_description = "Copy the complete FastAPI server script to clipboard for pasting into Google Colab"
+
+    def execute(self, context):
+        context.window_manager.clipboard = COLAB_SERVER_SCRIPT
+        self.report({'INFO'}, "Colab server script copied to clipboard! Paste it into a Colab cell and run.")
         return {'FINISHED'}
 
 
@@ -1459,8 +1654,36 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         except Exception:
             pass
 
-        # Solve DEM Physics via Yade engine formulation (or selected engine)
-        if props.dem_solver_engine == "YADE":
+        # Solve DEM Physics via Google Colab GPU / Yade engine formulation / local engine
+        if props.python_environment_type == "COLAB" and props.colab_is_connected and props.colab_endpoint_url:
+            self.report({"INFO"}, f"Solving DEM physics remotely on Google Colab GPU ({props.colab_endpoint_url})...")
+            auth = getattr(context.scene, "google_auth_data", None)
+            sim_url = props.colab_endpoint_url.strip().rstrip('/') + "/simulate"
+            req_headers = {
+                "Content-Type": "application/json",
+                "Bypass-Tunnel-Reminder": "true",
+                "User-Agent": "ScienceBlocks-Blender/1.0",
+            }
+            if auth and auth.id_token:
+                req_headers["Authorization"] = f"Bearer {auth.id_token}"
+
+            payload_data = json.dumps(params).encode("utf-8")
+            req = urllib.request.Request(sim_url, data=payload_data, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                remote_data = json.loads(resp.read().decode("utf-8"))
+
+            res = dem_solver.PlanetaryDEMResult(frames, ball_count)
+            res.trajectories = np.array(remote_data.get("trajectories"), dtype=np.float32)
+            res.velocities = np.array(remote_data.get("velocities"), dtype=np.float32)
+            res.forces = np.array(remote_data.get("forces"), dtype=np.float32)
+            res.total_impacts = remote_data.get("total_impacts", 0)
+            res.mean_impact_energy_j = remote_data.get("mean_impact_energy_j", 0.0)
+            res.max_impact_energy_j = remote_data.get("max_impact_energy_j", 0.0)
+            radii = dem_solver.generate_charge_radii(ball_count, ball_radius_m, props.dem_charge_distribution)
+            res.ball_radii = radii
+            res.ball_masses = (4.0 / 3.0) * math.pi * (radii**3) * ball_density
+            dem_solver.last_dem_result = res
+        elif props.dem_solver_engine == "YADE":
             self.report({"INFO"}, f"Solving Yade DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
             solve_res = YADE_TOOL.solve_python(params)
             res = solve_res.get("result_object")
@@ -1473,7 +1696,7 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             context,
             result=res,
             jar_obj=jar_obj,
-            colormap_mode=active_palette,
+            colormap_mode=props.dem_viewport_colormap,
         )
 
         # Update isolated side chamber particles if side view is enabled
@@ -2412,6 +2635,8 @@ class SCIENCE_BLOCKS_OT_toggle_camera_tracking(bpy.types.Operator):
             copy_loc.use_offset = True
             props.camera_follow_jar = True
             self.report({"INFO"}, "Science Blocks: Camera tracking enabled (Following Jar).")
+
+        return {"FINISHED"}
 
 # ===========================================================================
 # Scientific Research Paper Styling, Background & Object Colors

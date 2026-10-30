@@ -286,11 +286,11 @@ def recolor_dem_particles_in_scene(context, palette: str = "VIRIDIS", v_max: flo
             ball.color = rgba
             # Remove animation on color if any, or keyframe current frame
             if ball.animation_data and ball.animation_data.action:
-                fcurves = [
-                    fc for fc in ball.animation_data.action.fcurves if fc.data_path == "color"
-                ]
-                for fc in fcurves:
-                    ball.animation_data.action.fcurves.remove(fc)
+                act = ball.animation_data.action
+                if hasattr(act, "fcurves"):
+                    fcurves = [fc for fc in act.fcurves if fc.data_path == "color"]
+                    for fc in fcurves:
+                        act.fcurves.remove(fc)
             ball.keyframe_insert(data_path="color", frame=context.scene.frame_current)
 
     return len(target_balls)

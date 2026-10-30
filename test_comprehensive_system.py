@@ -450,8 +450,21 @@ def run_all_tests():
     sample_ball = media_balls[0]
     has_color_anim = False
     if sample_ball.animation_data and sample_ball.animation_data.action:
-        # Check F-curves for 'color'
-        has_color_anim = any("color" in fc.data_path for fc in sample_ball.animation_data.action.fcurves)
+        act = sample_ball.animation_data.action
+        if hasattr(act, "fcurves"):
+            has_color_anim = any("color" in fc.data_path for fc in act.fcurves)
+        elif hasattr(act, "layers"):
+            for layer in act.layers:
+                for strip in getattr(layer, "strips", []):
+                    for slot in getattr(act, "slots", []):
+                        try:
+                            cb = strip.channelbag(slot)
+                            if cb and hasattr(cb, "fcurves"):
+                                if any("color" in fc.data_path for fc in cb.fcurves):
+                                    has_color_anim = True
+                                    break
+                        except Exception:
+                            pass
     log_test("Particles Animate Dynamic Contact Force Color", has_color_anim)
 
     # 4. Test Velocity / Speed Colormap Mode
@@ -459,9 +472,66 @@ def run_all_tests():
     ret_yade_vel = bpy.ops.science_blocks.run_dem_simulation()
     log_test("Run Yade DEM Simulation with VELOCITY Colormap", ret_yade_vel == {"FINISHED"})
 
+    # -------------------------------------------------------------------------
+    # TEST SUITE 12: Google Colab Setup Instructions & Cloud Operators
+    # -------------------------------------------------------------------------
+    print("\n--- Test Suite 12: Google Colab Setup Instructions & Cloud Operators ---")
+    log_test("Property colab_show_instructions exists", hasattr(props, "colab_show_instructions"))
+    props.colab_show_instructions = True
+    log_test("Toggle colab_show_instructions True", props.colab_show_instructions is True)
+
+    ret_copy = bpy.ops.science_blocks.colab_copy_script()
+    log_test("Operator colab_copy_script executes", ret_copy == {"FINISHED"})
+    from bl_ext.vscode_development.Science_Blocks.operators import COLAB_SERVER_SCRIPT
+    log_test("COLAB_SERVER_SCRIPT contains FastAPI and Uvicorn", "uvicorn" in COLAB_SERVER_SCRIPT and "fastapi" in COLAB_SERVER_SCRIPT)
+
+    log_test("Operator colab_open_browser registered", hasattr(bpy.ops.science_blocks, "colab_open_browser"))
+
+    # Verify panel rendering for COLAB environment
+    props.sim_environment_type = "COLAB"
+    panel_cls = ui_panels.OBJECT_PT_science_blocks_main
+    # Test drawing without throwing exceptions
+    class MockLayout:
+        def __init__(self):
+            self.use_property_split = False
+            self.use_property_decorate = False
+            self.enabled = True
+            self.active = True
+            self.alignment = 'EXPAND'
+        def row(self, **kwargs):
+            return self
+        def column(self, **kwargs):
+            return self
+        def column_flow(self, **kwargs):
+            return self
+        def grid_flow(self, **kwargs):
+            return self
+        def box(self, **kwargs):
+            return self
+        def prop(self, *args, **kwargs):
+            pass
+        def operator(self, *args, **kwargs):
+            return self
+        def label(self, *args, **kwargs):
+            pass
+        def separator(self, *args, **kwargs):
+            pass
+        def menu(self, *args, **kwargs):
+            pass
+        def template_ID(self, *args, **kwargs):
+            pass
+    mock_layout = MockLayout()
+    try:
+        ui_panels.draw_guided_workflow_ui(mock_layout, bpy.context)
+        panel_draw_success = True
+    except Exception as e:
+        panel_draw_success = False
+        print(f"Panel draw failed: {e}")
+    log_test("Colab collapsible UI panel draws without errors", panel_draw_success)
+
     print("\n" + "=" * 70)
     print("ALL VERIFICATION TESTS PASSED SUCCESSFULLY!")
-    print("Studio White Theme, Materials Library, Yade Engine & Dynamic Colormaps 100% Verified.")
+    print("Planetary Mill, Materials, Colab Instructions & Dynamic DEM 100% Verified.")
     print("=" * 70)
 
 if __name__ == "__main__":

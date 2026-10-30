@@ -75,7 +75,7 @@ def iter_submodules(path, package_name):
 
 def iter_submodule_names(path, root=""):
     for _, module_name, is_package in pkgutil.iter_modules([str(path)]):
-        if module_name.startswith("test_"):
+        if module_name.startswith("test_") or module_name.endswith("_simulation") or module_name == "yade_simulation":
             continue
         if is_package:
             sub_path = path / module_name
