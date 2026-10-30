@@ -310,11 +310,12 @@ def finish_authentication_flow(auth_code: str, code_verifier: str, redirect_uri:
             bpy.app.timers.register(apply_success)
 
         except urllib.error.HTTPError as he:
+            err_code = he.code
             err_body = he.read().decode('utf-8', errors='ignore')
             def apply_err():
                 p = getattr(bpy.context.scene, "google_auth_data", None)
                 if p:
-                    p.status_msg = f"HTTP {he.code}: {err_body[:60]}"
+                    p.status_msg = f"HTTP {err_code}: {err_body[:60]}"
                     p.is_authenticated = False
                     p.is_waiting = False
                 tag_all_redraw()
@@ -322,10 +323,11 @@ def finish_authentication_flow(auth_code: str, code_verifier: str, redirect_uri:
             bpy.app.timers.register(apply_err)
 
         except Exception as ex:
+            err_msg = str(ex)[:60]
             def apply_ex():
                 p = getattr(bpy.context.scene, "google_auth_data", None)
                 if p:
-                    p.status_msg = f"Auth Failed: {str(ex)[:60]}"
+                    p.status_msg = f"Auth Failed: {err_msg}"
                     p.is_authenticated = False
                     p.is_waiting = False
                 tag_all_redraw()

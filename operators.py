@@ -469,23 +469,25 @@ class SCIENCE_BLOCKS_OT_colab_connect(bpy.types.Operator):
 
                 bpy.app.timers.register(apply_colab_success)
             except urllib.error.HTTPError as he:
+                status_code = he.code
                 def apply_colab_auth_err():
                     p = getattr(bpy.context.scene, "science_blocks_props", None)
                     if p:
-                        if he.code in (401, 403):
+                        if status_code in (401, 403):
                             p.colab_is_connected = False
-                            p.colab_status_msg = f"HTTP {he.code}: Authentication Required. Please Sign in with Google."
+                            p.colab_status_msg = f"HTTP {status_code}: Authentication Required. Please Sign in with Google."
                         else:
                             p.colab_is_connected = False
-                            p.colab_status_msg = f"HTTP {he.code}: Server error."
+                            p.colab_status_msg = f"HTTP {status_code}: Server error."
                     return None
                 bpy.app.timers.register(apply_colab_auth_err)
             except Exception as ex:
+                err_msg = str(ex)[:60]
                 def apply_colab_err():
                     p = getattr(bpy.context.scene, "science_blocks_props", None)
                     if p:
                         p.colab_is_connected = False
-                        p.colab_status_msg = f"Connection failed: {str(ex)[:60]}"
+                        p.colab_status_msg = f"Connection failed: {err_msg}"
                     return None
                 bpy.app.timers.register(apply_colab_err)
 
