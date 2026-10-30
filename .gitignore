@@ -28,3 +28,6 @@ Thumbs.db
 .idea/
 
 .science_blocks_venv/*
+
+Test_Blender_File_/*
+!Test_Blender_File_/Project.md

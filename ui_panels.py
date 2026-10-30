@@ -157,11 +157,8 @@ def draw_step_1_python_env(layout, context, props):
 
         col.separator(factor=0.3)
 
-        # Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
-        from . import google_auth
-        google_auth.draw_google_auth_card(col, context)
-
     col.separator(factor=0.4)
+
     # Todo: Implement Google sign in code Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
     # from . import google_auth
     # google_auth.draw_google_auth_card(col, context)
