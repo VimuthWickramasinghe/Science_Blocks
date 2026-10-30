@@ -1510,7 +1510,8 @@ def compute_effective_mill_geometry(sun_obj, jar_obj, props):
                     h_jar = float(dims.z)
 
             # 2. Sun wheel orbital radius: distance from sun rotation axis to jar in sun's local space
-            if sun_obj and jar_obj:
+            # If there is no Sun Wheel (e.g. standalone rotating Cube / drum), R_sun is strictly 0.0!
+            if sun_obj and jar_obj and sun_obj != jar_obj:
                 jar_world_pos = jar_obj.matrix_world.translation
                 jar_local_pos = sun_obj.matrix_world.inverted() @ jar_world_pos
                 # In sun wheel local space, rotation axis is local Z, so orbital radius is in local XY!
@@ -1519,6 +1520,10 @@ def compute_effective_mill_geometry(sun_obj, jar_obj, props):
                     r_sun = float(dist_orbital)
                 elif jar_obj.location.x != 0 or jar_obj.location.y != 0:
                     r_sun = float(math.sqrt(jar_obj.location.x**2 + jar_obj.location.y**2))
+                else:
+                    r_sun = 0.0
+            else:
+                r_sun = 0.0
 
             props.mill_sun_radius = r_sun
             props.mill_jar_radius = r_jar
@@ -1530,16 +1535,22 @@ def compute_effective_mill_geometry(sun_obj, jar_obj, props):
 
 
 def detect_mill_orientation(sun_obj, mode_setting="AUTO") -> str:
-    """Detects whether the mill operates in Vertical or Horizontal orientation based on sun wheel 3D tilt."""
+    """Detects whether the mill operates in Vertical or Horizontal orientation based on 3D model tilt."""
     if mode_setting != "AUTO":
         return mode_setting
 
-    if not sun_obj:
+    check_obj = sun_obj
+    if not check_obj:
+        props = getattr(bpy.context.scene, "science_blocks_props", None)
+        if props and props.jar_chamber_obj:
+            check_obj = props.jar_chamber_obj
+
+    if not check_obj:
         return "VERTICAL"
 
     try:
-        mat = sun_obj.matrix_world.to_3x3()
-        # Sun disc normal vector in world space
+        mat = check_obj.matrix_world.to_3x3()
+        # Normal / rotation axis in world space
         normal = mat @ mathutils.Vector((0, 0, 1))
         normal.normalize()
         # If normal aligns with world Z (|normal.z| > 0.7), it is a vertical axis mill
@@ -1593,17 +1604,34 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             return {"CANCELLED"}
 
         # Read RPM from node tree if available
-        sun_rpm = 200.0
-        jar_rpm = -300.0
+        sun_rpm = 0.0 if not sun_obj else 200.0
+        jar_rpm = 300.0
         if props.active_node_tree:
-            for node in props.active_node_tree.nodes:
-                if node.bl_idname == "ScienceBlocksRPMValueNode":
-                    sun_rpm = node.rpm_constant
-                elif node.bl_idname == "ScienceBlocksGearRatioNode":
-                    ratio = node.gear_ratio if node.calc_mode == "RATIO" else (node.teeth_in / max(1, node.teeth_out))
-                    if node.invert_direction:
-                        ratio = -ratio
-                    jar_rpm = sun_rpm * ratio
+            has_gear_node = any(n.bl_idname == "ScienceBlocksGearRatioNode" for n in props.active_node_tree.nodes)
+            if not has_gear_node or not sun_obj:
+                # Standalone Rotating Container Mode (e.g. single rotating Cube or drum):
+                sun_rpm = 0.0
+                jar_rpm_found = False
+                for node in props.active_node_tree.nodes:
+                    if node.bl_idname == "ScienceBlocksRotationNode":
+                        target = node.get_target_object()
+                        if target == jar_obj or not jar_obj or not jar_rpm_found:
+                            from .nodes import get_input_rpm
+                            val = get_input_rpm(node, "RPM", 0.0)
+                            direction_sign = -1.0 if node.direction == "CW" else 1.0
+                            jar_rpm = abs(val) * direction_sign
+                            jar_rpm_found = True
+                    elif node.bl_idname == "ScienceBlocksRPMValueNode" and not jar_rpm_found:
+                        jar_rpm = node.rpm_constant
+            else:
+                for node in props.active_node_tree.nodes:
+                    if node.bl_idname == "ScienceBlocksRPMValueNode":
+                        sun_rpm = node.rpm_constant
+                    elif node.bl_idname == "ScienceBlocksGearRatioNode":
+                        ratio = node.gear_ratio if node.calc_mode == "RATIO" else (node.teeth_in / max(1, node.teeth_out))
+                        if node.invert_direction:
+                            ratio = -ratio
+                        jar_rpm = sun_rpm * ratio
 
         ball_count = props.dem_ball_count
         ball_radius_m = props.dem_ball_radius_mm / 1000.0
