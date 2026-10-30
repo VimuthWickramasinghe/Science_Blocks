@@ -62,8 +62,6 @@ def draw_step_1_python_env(layout, context, props):
         # Package indicators for local environment
         col_lpkgs = c_l.column(align=True)
         row_lp = col_lpkgs.row(align=True)
-<<<<<<< HEAD
-=======
         row_lp.label(
             text="NumPy",
             icon="CHECKMARK" if getattr(props, "local_pkg_numpy", False) else "CANCEL",
@@ -78,7 +76,6 @@ def draw_step_1_python_env(layout, context, props):
         )
 
         col.separator(factor=0.2)
->>>>>>> 315858018b71642b7b63b998977307662e4787c9
 
         # Connection / Start / Stop Controls
         row_ctrl = col.row(align=True)
@@ -143,13 +140,8 @@ def draw_step_1_python_env(layout, context, props):
         c_c.prop(props, "colab_endpoint_url", text="Colab URL")
         row_c_btn = col.row(align=True)
         row_c_btn.scale_y = 1.25
-<<<<<<< HEAD
-        
-        if not props.colab_is_connected:
-=======
         is_colab_conn = getattr(props, "colab_is_connected", False)
         if not is_colab_conn:
->>>>>>> 315858018b71642b7b63b998977307662e4787c9
             row_c_btn.operator("science_blocks.colab_connect", text="Connect to Google Colab", icon="URL")
         else:
             row_c_btn.operator("science_blocks.colab_connect", text="Test Health / GPU", icon="FILE_TICK")
@@ -162,6 +154,12 @@ def draw_step_1_python_env(layout, context, props):
         server_info = getattr(props, "colab_server_info", "")
         if server_info:
             st_c_box.label(text=f"Server: {server_info}", icon="DRIVER")
+
+        col.separator(factor=0.3)
+
+        # Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
+        from . import google_auth
+        google_auth.draw_google_auth_card(col, context)
 
     col.separator(factor=0.4)
     # Todo: Implement Google sign in code Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
@@ -401,21 +399,7 @@ def draw_step_3_simulation(layout, context, props):
     row_insp.operator("science_blocks.apply_scientific_paper_colors", text="Colors", icon="SHADING_RENDERED")
 
     # 4. Results & Reporting
-<<<<<<< HEAD
-    # if props.dem_is_simulated:
-    #     col.separator(factor=0.4)
-    #     b_res = col.box()
-    #     b_res.label(text="Simulation Telemetry & Results:", icon="VIEWZOOM")
-    #     c_res = b_res.column(align=True)
 
-    #     row_im = c_res.row(align=True)
-    #     row_im.label(text=f"Impacts: {props.dem_total_impacts:,}", icon="DOT")
-    #     row_im.label(text=f"Freq: {props.dem_collision_freq_hz:.1f} Hz", icon="TIME")
-
-    #     row_e = c_res.row(align=True)
-    #     row_e.label(text=f"Mean Energy: {props.dem_mean_impact_energy_j:.4f} J", icon="DRIVER")
-    #     row_e.label(text=f"Power: {props.dem_power_watts:.1f} W", icon="TOOL_SETTINGS")
-=======
     if getattr(props, "dem_is_simulated", False):
         col.separator(factor=0.4)
         b_res = col.box()
@@ -433,7 +417,6 @@ def draw_step_3_simulation(layout, context, props):
         row_e = c_res.row(align=True)
         row_e.label(text=f"Mean Energy: {mean_energy:.4f} J", icon="DRIVER")
         row_e.label(text=f"Power: {power_w:.1f} W", icon="TOOL_SETTINGS")
->>>>>>> 315858018b71642b7b63b998977307662e4787c9
 
     #     c_res.separator(factor=0.3)
     #     row_rep = c_res.row(align=True)
@@ -450,6 +433,21 @@ def draw_step_3_simulation(layout, context, props):
     #     row_links.operator("science_blocks.export_telemetry", text="Export CSV / JSON", icon="FILE_TICK")
 
     # col.separator(factor=0.4)
+        c_res.separator(factor=0.3)
+        row_rep = c_res.row(align=True)
+        row_rep.scale_y = 1.3
+        row_rep.operator(
+            "science_blocks.generate_scientific_report",
+            text="Generate Scientific Report & Figures",
+            icon="TEXT",
+        )
+
+        row_links = c_res.row(align=True)
+        row_links.scale_y = 1.15
+        row_links.operator("science_blocks.open_html_report", text="View HTML Report", icon="URL")
+        row_links.operator("science_blocks.export_telemetry", text="Export CSV / JSON", icon="FILE_TICK")
+
+    col.separator(factor=0.4)
 
     # 5. Open-Source Multiphysics Tools (Node-Based)
     b_tools = col.box()
