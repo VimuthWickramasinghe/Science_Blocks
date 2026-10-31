@@ -19,8 +19,69 @@ def update_scientific_styling(self, context):
         pass
 
 
+def update_analytical_color_strip_transform(self, context):
+    """Callback triggered whenever strip position, rotation, or scale is adjusted."""
+    try:
+        from . import colormaps
+        colormaps.apply_strip_transform(context)
+    except Exception:
+        pass
+
+
+def update_analytical_color_strip_text_color(self, context):
+    """Callback triggered whenever strip text color (White / Black) is adjusted in UI."""
+    try:
+        from . import colormaps
+        colormaps.apply_strip_text_color(context, color_choice=getattr(self, "strip_text_color", "WHITE"))
+    except Exception:
+        pass
+
+
+def update_jar_finish_preset(self, context):
+    """Callback when jar finish preset is changed."""
+    finish = getattr(self, "sci_jar_finish", "FROSTED_GLASS")
+    if finish == "FROSTED_GLASS":
+        self.sci_jar_color = (0.80, 0.92, 0.98)
+        self.sci_jar_opacity = 0.28
+        self.sci_jar_metallic = 0.10
+        self.sci_jar_roughness = 0.12
+    elif finish == "STAINLESS_STEEL":
+        self.sci_jar_color = (0.84, 0.86, 0.88)
+        self.sci_jar_opacity = 1.0
+        self.sci_jar_metallic = 0.92
+        self.sci_jar_roughness = 0.18
+    elif finish == "ALUMINA_CERAMIC":
+        self.sci_jar_color = (0.95, 0.95, 0.93)
+        self.sci_jar_opacity = 1.0
+        self.sci_jar_metallic = 0.0
+        self.sci_jar_roughness = 0.22
+    update_scientific_styling(self, context)
+
+
+def update_sphere_finish_preset(self, context):
+    """Callback when sphere finish preset is changed."""
+    preset = getattr(self, "sci_sphere_preset", "STEEL")
+    if preset == "STEEL":
+        self.sci_sphere_color = (0.85, 0.88, 0.92)
+        self.sci_sphere_metallic = 0.95
+        self.sci_sphere_roughness = 0.12
+        self.sci_sphere_specular = 0.50
+    elif preset == "CERAMIC":
+        self.sci_sphere_color = (0.95, 0.95, 0.92)
+        self.sci_sphere_metallic = 0.0
+        self.sci_sphere_roughness = 0.18
+        self.sci_sphere_specular = 0.50
+    elif preset == "TUNGSTEN":
+        self.sci_sphere_color = (0.24, 0.26, 0.28)
+        self.sci_sphere_metallic = 0.88
+        self.sci_sphere_roughness = 0.25
+        self.sci_sphere_specular = 0.50
+    update_scientific_styling(self, context)
+
+
 def update_scientific_preset(self, context):
     """When the user changes the preset dropdown, populate matching color fields and apply style."""
+
     preset = self.sci_paper_preset
     if preset == "NATURE_WHITE":
         self.sci_background_color = (1.0, 1.0, 1.0)
@@ -28,6 +89,13 @@ def update_scientific_preset(self, context):
         self.sci_jar_finish = "FROSTED_GLASS"
         self.sci_jar_color = (0.80, 0.92, 0.98)
         self.sci_jar_opacity = 0.28
+        self.sci_jar_metallic = 0.10
+        self.sci_jar_roughness = 0.12
+        self.sci_sphere_preset = "STEEL"
+        self.sci_sphere_color = (0.85, 0.88, 0.92)
+        self.sci_sphere_metallic = 0.95
+        self.sci_sphere_roughness = 0.12
+        self.sci_sphere_specular = 0.50
         self.sci_sun_wheel_color = (0.12, 0.14, 0.18)
         self.sci_sun_wheel_metallic = 0.70
         self.sci_sun_wheel_roughness = 0.35
@@ -40,6 +108,13 @@ def update_scientific_preset(self, context):
         self.sci_jar_finish = "ALUMINA_CERAMIC"
         self.sci_jar_color = (0.95, 0.95, 0.93)
         self.sci_jar_opacity = 0.60
+        self.sci_jar_metallic = 0.0
+        self.sci_jar_roughness = 0.22
+        self.sci_sphere_preset = "CERAMIC"
+        self.sci_sphere_color = (0.95, 0.95, 0.92)
+        self.sci_sphere_metallic = 0.0
+        self.sci_sphere_roughness = 0.18
+        self.sci_sphere_specular = 0.50
         self.sci_sun_wheel_color = (0.75, 0.77, 0.80)
         self.sci_sun_wheel_metallic = 0.85
         self.sci_sun_wheel_roughness = 0.30
@@ -52,6 +127,13 @@ def update_scientific_preset(self, context):
         self.sci_jar_finish = "STAINLESS_STEEL"
         self.sci_jar_color = (0.85, 0.86, 0.88)
         self.sci_jar_opacity = 1.0
+        self.sci_jar_metallic = 0.92
+        self.sci_jar_roughness = 0.18
+        self.sci_sphere_preset = "STEEL"
+        self.sci_sphere_color = (0.90, 0.92, 0.95)
+        self.sci_sphere_metallic = 0.98
+        self.sci_sphere_roughness = 0.08
+        self.sci_sphere_specular = 0.60
         self.sci_sun_wheel_color = (0.20, 0.22, 0.25)
         self.sci_sun_wheel_metallic = 0.90
         self.sci_sun_wheel_roughness = 0.25
@@ -64,6 +146,13 @@ def update_scientific_preset(self, context):
         self.sci_jar_finish = "FROSTED_GLASS"
         self.sci_jar_color = (0.10, 0.75, 0.95)
         self.sci_jar_opacity = 0.30
+        self.sci_jar_metallic = 0.10
+        self.sci_jar_roughness = 0.15
+        self.sci_sphere_preset = "TUNGSTEN"
+        self.sci_sphere_color = (0.24, 0.26, 0.28)
+        self.sci_sphere_metallic = 0.88
+        self.sci_sphere_roughness = 0.25
+        self.sci_sphere_specular = 0.50
         self.sci_sun_wheel_color = (0.08, 0.09, 0.12)
         self.sci_sun_wheel_metallic = 0.80
         self.sci_sun_wheel_roughness = 0.25
@@ -76,6 +165,13 @@ def update_scientific_preset(self, context):
         self.sci_jar_finish = "FROSTED_GLASS"
         self.sci_jar_color = (0.75, 0.90, 0.98)
         self.sci_jar_opacity = 0.25
+        self.sci_jar_metallic = 0.10
+        self.sci_jar_roughness = 0.12
+        self.sci_sphere_preset = "STEEL"
+        self.sci_sphere_color = (0.85, 0.88, 0.92)
+        self.sci_sphere_metallic = 0.95
+        self.sci_sphere_roughness = 0.12
+        self.sci_sphere_specular = 0.50
         self.sci_sun_wheel_color = (0.15, 0.17, 0.22)
         self.sci_sun_wheel_metallic = 0.75
         self.sci_sun_wheel_roughness = 0.35
@@ -178,7 +274,7 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
             ("CUSTOM", "Custom Color & Tint", "Custom user-selected color and opacity"),
         ],
         default="FROSTED_GLASS",
-        update=update_scientific_styling,
+        update=update_jar_finish_preset,
     )
     sci_jar_color: FloatVectorProperty(
         name="Jar Color / Tint",
@@ -195,6 +291,70 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         description="Opacity of the chamber walls (lower allows clear viewing of internal charge)",
         default=0.28,
         min=0.05,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_jar_metallic: FloatProperty(
+        name="Jar Metallic",
+        description="Metallic reflectance of the chamber casing",
+        default=0.10,
+        min=0.0,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_jar_roughness: FloatProperty(
+        name="Jar Roughness",
+        description="Surface roughness / frosted finish of the jar chamber",
+        default=0.15,
+        min=0.0,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+
+    # Sphere / Grinding Media Material Styling
+    sci_sphere_preset: EnumProperty(
+        name="Sphere Finish",
+        items=[
+            ("STEEL", "316L Bearing Steel", "Polished laboratory bearing steel with high metallic reflectance"),
+            ("CERAMIC", "Alumina / Zirconia Ceramic", "White technical ceramic with zero metallic and low roughness"),
+            ("TUNGSTEN", "Tungsten Carbide", "Dense gunmetal tungsten carbide with dark high-density sheen"),
+            ("CUSTOM", "Custom Color & PBR", "User-defined sphere base color, metallic, roughness, and specular"),
+        ],
+        default="STEEL",
+        description="Material finish preset for grinding media spheres",
+        update=update_sphere_finish_preset,
+    )
+    sci_sphere_color: FloatVectorProperty(
+        name="Sphere Base Color",
+        subtype="COLOR",
+        size=3,
+        default=(0.85, 0.88, 0.92),
+        min=0.0,
+        max=1.0,
+        description="Base color / tint of the grinding media spheres",
+        update=update_scientific_styling,
+    )
+    sci_sphere_metallic: FloatProperty(
+        name="Sphere Metallic",
+        description="Metallic reflectance factor for media spheres (0 = dielectric/ceramic, 1 = chrome/steel)",
+        default=0.95,
+        min=0.0,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_sphere_roughness: FloatProperty(
+        name="Sphere Roughness",
+        description="Surface roughness for media spheres (lower is more polished/mirror-like)",
+        default=0.12,
+        min=0.0,
+        max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_sphere_specular: FloatProperty(
+        name="Sphere Specular",
+        description="Specular intensity / shine for media spheres",
+        default=0.50,
+        min=0.0,
         max=1.0,
         update=update_scientific_styling,
     )
@@ -682,7 +842,8 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         name="Viewport Colormap",
         items=[
             ("VELOCITY", "Speed / Velocity Magnitude", "Color particles dynamically from blue to yellow to crimson red with editable ColorRamp in Shader Editor"),
-            ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force with editable ColorRamp in Shader Editor"),
+            ("IMPACT_FORCE", "Dynamic Impact Force (Collisions)", "Visualize forces strictly during sphere-sphere and sphere-wall impacts (0 N during free fall)"),
+            ("FORCE", "Contact Force / Normal Load", "Color particles by instantaneous contact impact force with editable ColorRamp in Shader Editor"),
             ("ACCELERATION", "Acceleration (m/s², g-force)", "Color particles by instantaneous impact acceleration in m/s² and g-force with editable ColorRamp in Shader Editor"),
             ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock with editable ColorRamp in Shader Editor"),
             ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s) with editable ColorRamp in Shader Editor"),
@@ -698,6 +859,115 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default=True,
         description="Display in-viewport 3D analytical color gradient strip and telemetry data",
         update=_on_analytical_strip_toggle,
+    )
+
+    # 3D Analytical Color Strip Viewport Transforms (Move, Rotate, Scale, Save)
+    strip_location: FloatVectorProperty(
+        name="Strip Location",
+        size=3,
+        default=(0.35, 0.0, -0.15),
+        subtype="TRANSLATION",
+        unit="LENGTH",
+        description="Location offset of the 3D analytical color strip in viewport (X, Y, Z)",
+        update=update_analytical_color_strip_transform,
+    )
+    strip_rotation: FloatVectorProperty(
+        name="Strip Rotation",
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        subtype="EULER",
+        unit="ROTATION",
+        description="Euler rotation angles (degrees) for the 3D analytical color strip (X, Y, Z)",
+        update=update_analytical_color_strip_transform,
+    )
+    strip_scale: FloatVectorProperty(
+        name="Strip Scale XYZ",
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        description="Individual X, Y, Z axis scale factors for analytical color strip",
+        update=update_analytical_color_strip_transform,
+    )
+    strip_scale_uniform: FloatProperty(
+        name="Uniform Scale",
+        default=1.0,
+        min=0.01,
+        max=50.0,
+        description="Overall scale multiplier for color strip and text",
+        update=update_analytical_color_strip_transform,
+    )
+    strip_relative_to_jar: BoolProperty(
+        name="Relative to Jar Chamber",
+        default=True,
+        description="When enabled, location offset is applied relative to the active jar/chamber position",
+        update=update_analytical_color_strip_transform,
+    )
+    strip_text_color: EnumProperty(
+        name="Text Color",
+        items=[
+            ("WHITE", "White", "High-contrast white text for dark or standard 3D viewports", "LIGHT", 0),
+            ("BLACK", "Black", "High-contrast black text for bright white or publication paper viewports", "SHADING_SOLID", 1),
+        ],
+        default="WHITE",
+        description="Text label and numerical readout color for the 3D analytical strip (White or Black)",
+        update=update_analytical_color_strip_text_color,
+    )
+    ui_strip_transform_open: BoolProperty(
+        name="Color Strip Placement & Transform",
+        default=True,
+        description="Toggle collapsible 3D strip transform controls (Move, Rotate, Scale)",
+    )
+    ui_strip_export_open: BoolProperty(
+        name="Publication Figure Export (PNG)",
+        default=True,
+        description="Toggle collapsible publication figure export settings",
+    )
+
+    # Publication PNG Export Settings
+    strip_export_dir: StringProperty(
+        name="Export Directory",
+        subtype="DIR_PATH",
+        default="//figures",
+        description="Target directory for exported publication figures",
+    )
+    strip_export_filename: StringProperty(
+        name="File Name",
+        default="dem_analytical_color_strip.png",
+        description="File name for exported color strip graphic (.png)",
+    )
+    strip_export_dpi: IntProperty(
+        name="Resolution (DPI)",
+        default=300,
+        min=72,
+        max=1200,
+        description="Resolution DPI for journal publication (300 for standard paper, 600 for high-resolution print)",
+    )
+    strip_export_orientation: EnumProperty(
+        name="Orientation",
+        items=[
+            ("VERTICAL", "Vertical Colorbar", "Classic vertical colorbar (e.g. right side of visual)"),
+            ("HORIZONTAL", "Horizontal Colorbar", "Horizontal colorbar (e.g. bottom of visual)"),
+        ],
+        default="VERTICAL",
+        description="Colorbar bar orientation in the exported figure",
+    )
+    strip_export_bg: EnumProperty(
+        name="Background",
+        items=[
+            ("TRANSPARENT", "Transparent (Alpha)", "Transparent PNG background for seamless LaTeX/paper embedding"),
+            ("WHITE", "Clean White", "White background for paper manuscripts"),
+            ("DARK", "Dark Conference", "Dark background for presentation slides"),
+        ],
+        default="TRANSPARENT",
+        description="Background styling for exported figure",
+    )
+    strip_export_layout: EnumProperty(
+        name="Layout",
+        items=[
+            ("WITH_CARD", "Colorbar + Telemetry Card", "Export colorbar alongside comprehensive physical simulation values card"),
+            ("COLORBAR_ONLY", "Colorbar Only", "Minimal standalone colorbar with labels and SI units"),
+        ],
+        default="WITH_CARD",
+        description="Figure layout elements to export",
     )
 
     # Physical Material Constants
@@ -796,6 +1066,13 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         name="Use Source Tap",
         description="Feed particles into the jar through a non-overlapping planar source tap",
         default=True,
+    )
+    dem_inflow_rate_factor: FloatProperty(
+        name="Inflow Feed Speed",
+        description="Speed multiplier for how fast particles enter the chamber from the assigned plane (higher = fast pour, lower = slow gradual stream)",
+        default=1.0,
+        min=0.1,
+        max=10.0,
     )
     dem_is_simulated: BoolProperty(
         name="DEM Simulated",

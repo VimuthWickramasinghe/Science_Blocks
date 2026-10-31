@@ -181,20 +181,9 @@ def force_to_colormap_rgb(force_n: float, f_max: float = 250.0) -> tuple:
 
 
 def spin_to_colormap_rgb(omega_rad_s: float, w_max: float = 120.0) -> tuple:
-    """Maps angular velocity (spin rate in rad/s) to a colormap (Deep Blue -> Magenta -> Fiery Orange)."""
-    norm = min(1.0, max(0.0, float(omega_rad_s) / max(1.0, float(w_max))))
-    if norm < 0.25:
-        f = norm / 0.25
-        return (0.10 + 0.15 * f, 0.15 + 0.10 * f, 0.85, 1.0)
-    elif norm < 0.50:
-        f = (norm - 0.25) / 0.25
-        return (0.25 + 0.50 * f, 0.25 * (1.0 - f), 0.85 * (1.0 - f * 0.3), 1.0)
-    elif norm < 0.75:
-        f = (norm - 0.50) / 0.25
-        return (0.75 + 0.25 * f, 0.45 * f, 0.60 * (1.0 - f), 1.0)
-    else:
-        f = (norm - 0.75) / 0.25
-        return (1.0, 0.45 + 0.50 * f, 0.10 * f, 1.0)
+    """Maps angular velocity (spin rate in rad/s) to a scientific colormap (Blue -> Cyan -> Green -> Yellow -> Red)."""
+    norm = min(1.0, max(0.0, float(omega_rad_s) / max(1e-4, float(w_max))))
+    return evaluate_scientific_colormap("TURBO", norm, v_max=1.0)
 
 
 def evaluate_scientific_colormap(
@@ -330,21 +319,32 @@ def recolor_dem_particles_in_scene(context, palette: str = "VIRIDIS", v_max: flo
     if res is not None and hasattr(res, "velocities") and res.velocities is not None:
         frames, num_balls, _ = res.trajectories.shape
         orig_frame = context.scene.frame_current
-        max_f = float(np.max(res.forces)) if (hasattr(res, "forces") and res.forces is not None and res.forces.size and np.max(res.forces) > 0) else 100.0
-        max_w = float(np.max(np.linalg.norm(res.angular_velocities, axis=2))) if (hasattr(res, "angular_velocities") and res.angular_velocities is not None and res.angular_velocities.size and np.max(res.angular_velocities) > 0) else 100.0
+        f_arr = res.forces if (hasattr(res, "forces") and res.forces is not None and res.forces.size) else None
+        max_f = float(np.max(f_arr)) if (f_arr is not None and np.max(f_arr) > 1e-4) else 100.0
+
+        imp_f_arr = res.impact_forces if (hasattr(res, "impact_forces") and res.impact_forces is not None and res.impact_forces.size) else None
+        max_imp_f = float(np.max(imp_f_arr)) if (imp_f_arr is not None and np.max(imp_f_arr) > 1e-4) else 100.0
+
+        w_mags = np.linalg.norm(res.angular_velocities, axis=2) if (hasattr(res, "angular_velocities") and res.angular_velocities is not None and res.angular_velocities.size) else None
+        max_w = float(np.max(w_mags)) if (w_mags is not None and np.max(w_mags) > 1e-4) else 10.0
 
         for f in range(frames):
             frame_num = f + 1
             for i, ball in enumerate(target_balls):
                 if i >= num_balls:
                     break
-                if pal == "FORCE":
+                if pal in ("IMPACT_FORCE", "IMPACT"):
+                    f_val = float(res.impact_forces[f, i]) if hasattr(res, "impact_forces") else 0.0
+                    rgba = force_to_colormap_rgb(f_val, f_max=max_imp_f)
+                elif pal == "FORCE":
                     f_val = float(res.forces[f, i]) if hasattr(res, "forces") else 0.0
                     rgba = force_to_colormap_rgb(f_val, f_max=max_f)
                 elif pal == "SPIN":
                     w_vec = res.angular_velocities[f, i, :] if hasattr(res, "angular_velocities") else [0, 0, 0]
                     w_mag = float(np.linalg.norm(w_vec))
                     rgba = spin_to_colormap_rgb(w_mag, w_max=max_w)
+                elif pal == "SOLID":
+                    rgba = (0.85, 0.88, 0.92, 1.0)
                 else:
                     v_mag = float(np.linalg.norm(res.velocities[f, i, :])) if "np" in globals() else 2.5
                     e_kin = 0.5 * res.ball_masses[i] * (v_mag**2) if i < len(res.ball_masses) else None
@@ -384,6 +384,8 @@ def recolor_dem_particles_in_scene(context, palette: str = "VIRIDIS", v_max: flo
 
 DEM_SHADER_NAMES = {
     "VELOCITY": "DEM_Shader_Velocity",
+    "IMPACT_FORCE": "DEM_Shader_Impact",
+    "IMPACT": "DEM_Shader_Impact",
     "FORCE": "DEM_Shader_Force",
     "ACCELERATION": "DEM_Shader_Acceleration",
     "ENERGY": "DEM_Shader_Energy",
@@ -548,10 +550,11 @@ def build_or_update_variable_shader(
     n_info.location = (-650, 0)
 
     ramp_fac_in = n_ramp.inputs.get("Fac", _get_first_input(n_ramp))
-    info_color_out = n_info.outputs.get("Color")
+    info_color_out = n_info.outputs.get("Color") or n_info.outputs.get("color")
+    info_alpha_out = n_info.outputs.get("Alpha") or n_info.outputs.get("alpha")
 
-    if channel_index == 3 and "Alpha" in n_info.outputs and ramp_fac_in:
-        links.new(n_info.outputs["Alpha"], ramp_fac_in)
+    if channel_index == 3 and info_alpha_out and ramp_fac_in:
+        links.new(info_alpha_out, ramp_fac_in)
     else:
         sep = _create_separate_color_node(nodes)
         sep.location = (-380, 0)
@@ -568,8 +571,12 @@ def build_or_update_variable_shader(
 def build_solid_pbr_shader(
     mat_name: str = "DEM_Shader_Solid",
     preset: str = "STEEL",
+    custom_color=None,
+    metallic=None,
+    roughness=None,
+    specular=None,
 ) -> "bpy.types.Material":
-    """Creates a high-grade metallic PBR material for realistic media rendering."""
+    """Creates a high-grade metallic/ceramic/custom PBR material for realistic media rendering."""
     if bpy is None:
         return None
 
@@ -588,25 +595,48 @@ def build_solid_pbr_shader(
     n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
     n_bsdf.location = (0, 0)
 
-    p = preset.upper()
+    p = (preset or "STEEL").upper()
     if p == "CERAMIC":
-        n_bsdf.inputs["Base Color"].default_value = (0.95, 0.95, 0.92, 1.0)
-        if "Metallic" in n_bsdf.inputs:
-            n_bsdf.inputs["Metallic"].default_value = 0.0
-        if "Roughness" in n_bsdf.inputs:
-            n_bsdf.inputs["Roughness"].default_value = 0.18
+        base_color = (0.95, 0.95, 0.92, 1.0)
+        met = 0.0
+        rough = 0.18
+        spec = 0.50
     elif p == "TUNGSTEN":
-        n_bsdf.inputs["Base Color"].default_value = (0.24, 0.26, 0.28, 1.0)
-        if "Metallic" in n_bsdf.inputs:
-            n_bsdf.inputs["Metallic"].default_value = 0.88
-        if "Roughness" in n_bsdf.inputs:
-            n_bsdf.inputs["Roughness"].default_value = 0.25
+        base_color = (0.24, 0.26, 0.28, 1.0)
+        met = 0.88
+        rough = 0.25
+        spec = 0.50
+    elif p == "CUSTOM" or custom_color is not None:
+        c = custom_color or (0.85, 0.88, 0.92)
+        base_color = (c[0], c[1], c[2], 1.0)
+        met = 0.95 if metallic is None else metallic
+        rough = 0.12 if roughness is None else roughness
+        spec = 0.50 if specular is None else specular
     else:  # STEEL
-        n_bsdf.inputs["Base Color"].default_value = (0.85, 0.88, 0.92, 1.0)
-        if "Metallic" in n_bsdf.inputs:
-            n_bsdf.inputs["Metallic"].default_value = 0.95
-        if "Roughness" in n_bsdf.inputs:
-            n_bsdf.inputs["Roughness"].default_value = 0.12
+        base_color = (0.85, 0.88, 0.92, 1.0)
+        met = 0.95
+        rough = 0.12
+        spec = 0.50
+
+    if p == "CUSTOM":
+        if custom_color is not None:
+            base_color = (custom_color[0], custom_color[1], custom_color[2], 1.0)
+        if metallic is not None:
+            met = metallic
+        if roughness is not None:
+            rough = roughness
+        if specular is not None:
+            spec = specular
+
+    n_bsdf.inputs["Base Color"].default_value = base_color
+    if "Metallic" in n_bsdf.inputs:
+        n_bsdf.inputs["Metallic"].default_value = met
+    if "Roughness" in n_bsdf.inputs:
+        n_bsdf.inputs["Roughness"].default_value = rough
+    if "Specular IOR Level" in n_bsdf.inputs:
+        n_bsdf.inputs["Specular IOR Level"].default_value = spec
+    elif "Specular" in n_bsdf.inputs:
+        n_bsdf.inputs["Specular"].default_value = spec
 
     links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
     return mat
@@ -617,12 +647,25 @@ def ensure_dem_particle_shaders(context=None) -> dict:
     if bpy is None:
         return {}
 
+    props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+    solid_preset = getattr(props, "sci_sphere_preset", "STEEL") if props else "STEEL"
+    solid_color = getattr(props, "sci_sphere_color", (0.85, 0.88, 0.92)) if props else None
+    solid_met = getattr(props, "sci_sphere_metallic", 0.95) if props else None
+    solid_rough = getattr(props, "sci_sphere_roughness", 0.12) if props else None
+    solid_spec = getattr(props, "sci_sphere_specular", 0.50) if props else None
+
     shaders = {
         "VELOCITY": build_or_update_variable_shader(
             "DEM_Shader_Velocity",
             channel_index=0,
             default_palette="TURBO",
             label="Velocity (Speed)",
+        ),
+        "IMPACT_FORCE": build_or_update_variable_shader(
+            "DEM_Shader_Impact",
+            channel_index=1,
+            default_palette="TURBO",
+            label="Dynamic Impact Force",
         ),
         "FORCE": build_or_update_variable_shader(
             "DEM_Shader_Force",
@@ -645,10 +688,17 @@ def ensure_dem_particle_shaders(context=None) -> dict:
         "SPIN": build_or_update_variable_shader(
             "DEM_Shader_Spin",
             channel_index=3,
-            default_palette="COOLWARM",
+            default_palette="TURBO",
             label="Angular Velocity",
         ),
-        "SOLID": build_solid_pbr_shader("DEM_Shader_Solid", preset="STEEL"),
+        "SOLID": build_solid_pbr_shader(
+            "DEM_Shader_Solid",
+            preset=solid_preset,
+            custom_color=solid_color,
+            metallic=solid_met,
+            roughness=solid_rough,
+            specular=solid_spec,
+        ),
     }
 
     # Keep legacy names synchronized for backward compatibility with existing tests
@@ -694,16 +744,34 @@ def assign_dem_shader_to_particles(context, shader_mode: str = "VELOCITY") -> in
         if coll:
             for obj in coll.objects:
                 if obj.name.startswith("DEM_Media_") or "Reference_DEM_Particle" in obj.name:
+                    if hasattr(obj, "material_slots") and obj.material_slots:
+                        for slot in obj.material_slots:
+                            slot.material = mat
                     if obj.data and hasattr(obj.data, "materials"):
                         if obj.data.materials:
                             obj.data.materials[0] = mat
                         else:
                             obj.data.materials.append(mat)
-                        count += 1
+                    count += 1
 
     # Synchronize 3D analytical color ribbon strip
     try:
         create_or_update_analytical_color_strip(context, mode=mode)
+    except Exception:
+        pass
+
+    # Ensure 3D viewport shows shader materials and color ramps
+    try:
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D":
+                for space in area.spaces:
+                    if space.type == "VIEW_3D":
+                        if hasattr(space, "shading"):
+                            if hasattr(space.shading, "type"):
+                                space.shading.type = "MATERIAL"
+                            if hasattr(space.shading, "color_type"):
+                                space.shading.color_type = "MATERIAL"
+                area.tag_redraw()
     except Exception:
         pass
 
@@ -740,6 +808,18 @@ def extract_simulation_telemetry(result=None) -> dict:
         f_mean = float(np.mean(res.forces))
     else:
         f_max, f_mean = 150.0, 45.20
+
+    # 1b. Dynamic Impact Force (N) (Strictly collision events: Ball-Ball & Ball-Wall, 0 in free fall)
+    imp_f_min = 0.0
+    if res and hasattr(res, "impact_forces") and res.impact_forces is not None and res.impact_forces.size:
+        imp_f_max = float(np.max(res.impact_forces))
+        nz = res.impact_forces[res.impact_forces > 1e-4]
+        imp_f_mean = float(np.mean(nz)) if nz.size else 0.0
+    elif res and hasattr(res, "wall_impact_forces") and res.wall_impact_forces:
+        imp_f_max = float(np.max(res.wall_impact_forces))
+        imp_f_mean = float(np.mean(res.wall_impact_forces))
+    else:
+        imp_f_max, imp_f_mean = f_max, f_mean
 
     # 2. Velocity (m·s⁻¹ / ms⁻¹)
     v_min = 0.0
@@ -794,6 +874,9 @@ def extract_simulation_telemetry(result=None) -> dict:
         "force_min": f_min,
         "force_max": f_max,
         "force_mean": f_mean,
+        "impact_force_min": imp_f_min,
+        "impact_force_max": imp_f_max,
+        "impact_force_mean": imp_f_mean,
         "velocity_min": v_min,
         "velocity_max": v_max,
         "velocity_mean": v_mean,
@@ -815,6 +898,141 @@ def extract_simulation_telemetry(result=None) -> dict:
         "collision_frequency_hz": freq_hz,
         "estimated_power_watts": power_watts,
     }
+
+
+def apply_strip_transform(context=None):
+    """Applies location, rotation (deg -> rad), and scale from scene properties to all DEM_Analytical_Data_Strip objects."""
+    if bpy is None:
+        return
+    if context is None:
+        context = getattr(bpy, "context", None)
+    if not context or not hasattr(context, "scene"):
+        return
+
+    props = getattr(context.scene, "science_blocks_props", None)
+    if not props:
+        return
+
+    # Find all analytical color strip root objects in scene
+    strip_objs = []
+    all_objs = bpy.data.objects.values() if hasattr(bpy.data.objects, "values") else bpy.data.objects
+    for item in all_objs:
+        obj = item if hasattr(item, "name") else bpy.data.objects.get(item)
+        if obj and hasattr(obj, "name"):
+            if obj.name == "DEM_Analytical_Data_Strip" or obj.name.startswith("DEM_Analytical_Data_Strip"):
+                strip_objs.append(obj)
+
+    if not strip_objs:
+        return
+
+    # 1. Location (Optionally relative to Jar Chamber)
+    loc = getattr(props, "strip_location", (0.35, 0.0, -0.15))
+    loc_x, loc_y, loc_z = float(loc[0]), float(loc[1]), float(loc[2])
+
+    if getattr(props, "strip_relative_to_jar", True):
+        jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+        if jar_obj and hasattr(jar_obj, "location"):
+            loc_x += jar_obj.location.x
+            loc_y += jar_obj.location.y
+            loc_z += jar_obj.location.z
+
+    # 2. Rotation (Stored in degrees, applied as Euler radians)
+    rot_deg = getattr(props, "strip_rotation", (0.0, 0.0, 0.0))
+    rot_x_rad = math.radians(float(rot_deg[0]))
+    rot_y_rad = math.radians(float(rot_deg[1]))
+    rot_z_rad = math.radians(float(rot_deg[2]))
+
+    # 3. Scale (XYZ multiplied by uniform scale factor)
+    s_xyz = getattr(props, "strip_scale", (1.0, 1.0, 1.0))
+    s_uni = float(getattr(props, "strip_scale_uniform", 1.0))
+    scale_x = float(s_xyz[0]) * s_uni
+    scale_y = float(s_xyz[1]) * s_uni
+    scale_z = float(s_xyz[2]) * s_uni
+
+    for root_obj in strip_objs:
+        root_obj.location = (loc_x, loc_y, loc_z)
+        root_obj.rotation_mode = "XYZ"
+        root_obj.rotation_euler = (rot_x_rad, rot_y_rad, rot_z_rad)
+        root_obj.scale = (scale_x, scale_y, scale_z)
+
+
+def apply_strip_text_color(context=None, color_choice: str = None) -> "bpy.types.Material":
+    """Applies high-contrast White or Black color to the analytical color strip text material."""
+    if bpy is None:
+        return None
+    if context is None:
+        context = getattr(bpy, "context", None)
+
+    props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+    choice = (color_choice or getattr(props, "strip_text_color", "WHITE") or "WHITE").upper()
+    if choice not in ("WHITE", "BLACK"):
+        choice = "WHITE"
+
+    mat_txt_name = "DEM_Strip_Text_Material"
+    mat_txt = bpy.data.materials.get(mat_txt_name)
+    if not mat_txt:
+        mat_txt = bpy.data.materials.new(mat_txt_name)
+        mat_txt.use_nodes = True
+
+    nodes_t = mat_txt.node_tree.nodes
+    links_t = mat_txt.node_tree.links
+
+    out_t = None
+    bsdf_t = None
+    for n in nodes_t:
+        if n.type == "OUTPUT_MATERIAL":
+            out_t = n
+        elif n.type == "BSDF_PRINCIPLED":
+            bsdf_t = n
+
+    if not out_t:
+        out_t = nodes_t.new("ShaderNodeOutputMaterial")
+        out_t.location = (300, 0)
+    if not bsdf_t:
+        bsdf_t = nodes_t.new("ShaderNodeBsdfPrincipled")
+        bsdf_t.location = (0, 0)
+        links_t.new(bsdf_t.outputs["BSDF"], out_t.inputs["Surface"])
+
+    if choice == "BLACK":
+        # Pitch black with no emission for bright/paper viewports
+        bsdf_t.inputs["Base Color"].default_value = (0.02, 0.02, 0.02, 1.0)
+        if "Emission Color" in bsdf_t.inputs:
+            bsdf_t.inputs["Emission Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+        if "Emission Strength" in bsdf_t.inputs:
+            bsdf_t.inputs["Emission Strength"].default_value = 0.0
+        if "Roughness" in bsdf_t.inputs:
+            bsdf_t.inputs["Roughness"].default_value = 0.20
+    else:  # WHITE
+        # High contrast white with subtle self-illumination emission
+        bsdf_t.inputs["Base Color"].default_value = (0.95, 0.95, 0.95, 1.0)
+        if "Emission Color" in bsdf_t.inputs:
+            bsdf_t.inputs["Emission Color"].default_value = (0.95, 0.95, 0.95, 1.0)
+        if "Emission Strength" in bsdf_t.inputs:
+            bsdf_t.inputs["Emission Strength"].default_value = 0.40
+        if "Roughness" in bsdf_t.inputs:
+            bsdf_t.inputs["Roughness"].default_value = 0.50
+
+    # Ensure all text objects in DEM_Analytical_Data_Strip have mat_txt applied
+    root_obj = bpy.data.objects.get("DEM_Analytical_Data_Strip")
+    if root_obj and hasattr(root_obj, "children"):
+        for child in root_obj.children:
+            if child.type == "FONT" or "Label" in child.name or "Card" in child.name or "Tick" in child.name:
+                if hasattr(child.data, "materials"):
+                    if child.data.materials:
+                        child.data.materials[0] = mat_txt
+                    else:
+                        child.data.materials.append(mat_txt)
+
+    # Force viewport redraw
+    if context and hasattr(context, "screen") and context.screen:
+        try:
+            for area in context.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+        except Exception:
+            pass
+
+    return mat_txt
 
 
 def create_or_update_analytical_color_strip(
@@ -848,17 +1066,7 @@ def create_or_update_analytical_color_strip(
         root_obj.empty_display_size = 0.05
         coll.objects.link(root_obj)
     root_obj.rotation_mode = "XYZ"
-    root_obj.rotation_euler = (0.0, 0.0, 0.0)
-
-    # Position next to active chamber
-    props = getattr(context.scene, "science_blocks_props", None)
-    jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
-    if jar_obj:
-        root_obj.location = (
-            jar_obj.location.x + 0.35,
-            jar_obj.location.y,
-            jar_obj.location.z - 0.15,
-        )
+    apply_strip_transform(context)
 
     # 3. Ribbon Mesh Object
     ribbon_name = "DEM_Legend_Strip_Ribbon"
@@ -958,8 +1166,14 @@ def create_or_update_analytical_color_strip(
     # 5. Extract Analytical Units and Scientific Physical Telemetry
     tele = extract_simulation_telemetry(result)
 
-    if clean_mode == "FORCE":
-        title_text = "Impact Force [N]"
+    if clean_mode in ("IMPACT_FORCE", "IMPACT"):
+        title_text = "Dynamic Impact Force [N]"
+        unit = "N"
+        val_min = tele["impact_force_min"]
+        val_max = tele["impact_force_max"]
+        val_mean = tele["impact_force_mean"]
+    elif clean_mode == "FORCE":
+        title_text = "Contact Normal Force [N]"
         unit = "N"
         val_min = tele["force_min"]
         val_max = tele["force_max"]
@@ -1022,22 +1236,8 @@ def create_or_update_analytical_color_strip(
         "DEM_Strip_Card_Impacts": (f"Impacts: {tele['total_impacts']:,}  |  Freq: {tele['collision_frequency_hz']:.1f} Hz", (w_strip * 3.8, -0.002, h_strip * 0.10), 0.014),
     }
 
-    # Text Material (High contrast white)
-    mat_txt_name = "DEM_Strip_Text_Material"
-    mat_txt = bpy.data.materials.get(mat_txt_name)
-    if not mat_txt:
-        mat_txt = bpy.data.materials.new(mat_txt_name)
-        mat_txt.use_nodes = True
-        nodes_t = mat_txt.node_tree.nodes
-        nodes_t.clear()
-        out_t = nodes_t.new("ShaderNodeOutputMaterial")
-        bsdf_t = nodes_t.new("ShaderNodeBsdfPrincipled")
-        bsdf_t.inputs["Base Color"].default_value = (0.95, 0.95, 0.95, 1.0)
-        if "Emission Color" in bsdf_t.inputs:
-            bsdf_t.inputs["Emission Color"].default_value = (0.95, 0.95, 0.95, 1.0)
-        if "Emission Strength" in bsdf_t.inputs:
-            bsdf_t.inputs["Emission Strength"].default_value = 0.40
-        mat_txt.node_tree.links.new(bsdf_t.outputs["BSDF"], out_t.inputs["Surface"])
+    # Text Material (High contrast White or Black according to UI panel)
+    mat_txt = apply_strip_text_color(context)
 
     for lbl_name, (body, loc, size) in text_labels.items():
         txt_obj = bpy.data.objects.get(lbl_name)
@@ -1068,6 +1268,251 @@ def create_or_update_analytical_color_strip(
         child.hide_render = is_hidden
 
     return root_obj
+
+
+def export_color_strip_publication_png(
+    context=None,
+    filepath: str = None,
+    mode: str = None,
+    dpi: int = 300,
+    orientation: str = "VERTICAL",
+    bg: str = "TRANSPARENT",
+    layout_style: str = "WITH_CARD",
+) -> str:
+    """Exports a publication-grade scientific figure PNG of the active analytical color strip & telemetry.
+
+    Parameters:
+        context: Blender context (or None to use bpy.context)
+        filepath: Destination PNG file path (if None, derived from scene export properties)
+        mode: Analytical variable mode ("VELOCITY", "FORCE", "ACCELERATION", "ENERGY", "SPIN", "SOLID")
+        dpi: Output resolution DPI (e.g. 300 or 600)
+        orientation: "VERTICAL" or "HORIZONTAL"
+        bg: "TRANSPARENT", "WHITE", or "DARK"
+        layout_style: "WITH_CARD" (Colorbar + Physical telemetry card) or "COLORBAR_ONLY"
+
+    Returns:
+        str: Absolute filepath of exported PNG.
+    """
+    import os
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib_mplconfig")
+
+    if context is None and bpy is not None:
+        context = getattr(bpy, "context", None)
+
+    props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+
+    # Derive default parameters from properties if omitted
+    clean_mode = (mode or getattr(props, "dem_viewport_colormap", "VELOCITY") or "VELOCITY").upper()
+    export_dpi = int(dpi or getattr(props, "strip_export_dpi", 300) or 300)
+    orient_clean = (orientation or getattr(props, "strip_export_orientation", "VERTICAL") or "VERTICAL").upper()
+    bg_clean = (bg or getattr(props, "strip_export_bg", "TRANSPARENT") or "TRANSPARENT").upper()
+    layout_clean = (layout_style or getattr(props, "strip_export_layout", "WITH_CARD") or "WITH_CARD").upper()
+
+    # Destination filepath resolution
+    if not filepath:
+        export_dir = getattr(props, "strip_export_dir", "//figures") if props else "//figures"
+        export_filename = getattr(props, "strip_export_filename", "dem_analytical_color_strip.png") if props else "dem_analytical_color_strip.png"
+        if not export_filename.lower().endswith(".png"):
+            export_filename += ".png"
+
+        if export_dir.startswith("//"):
+            blend_path = bpy.data.filepath if (bpy and hasattr(bpy.data, "filepath") and bpy.data.is_saved) else ""
+            if blend_path:
+                base_dir = os.path.dirname(blend_path)
+                target_dir = os.path.join(base_dir, export_dir[2:])
+            else:
+                target_dir = os.path.abspath(os.path.join(".", export_dir[2:]))
+        else:
+            target_dir = os.path.abspath(export_dir)
+
+        os.makedirs(target_dir, exist_ok=True)
+        filepath = os.path.join(target_dir, export_filename)
+    else:
+        target_dir = os.path.dirname(os.path.abspath(filepath))
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+
+    # Simulation Telemetry Extraction
+    try:
+        from . import dem_solver
+    except ImportError:
+        try:
+            import dem_solver
+        except ImportError:
+            dem_solver = None
+    res = getattr(dem_solver, "last_dem_result", None) if dem_solver else None
+    tele = extract_simulation_telemetry(res)
+
+    if clean_mode == "FORCE":
+        title_text = "Contact Impact Force"
+        unit_str = "N"
+        val_min = tele["force_min"]
+        val_max = tele["force_max"]
+        val_mean = tele["force_mean"]
+    elif clean_mode == "ACCELERATION":
+        title_text = f"Impact Acceleration ({tele['accel_g_max']:.1f} g)"
+        unit_str = "m·s⁻²"
+        val_min = tele["accel_min"]
+        val_max = tele["accel_max"]
+        val_mean = tele["accel_mean"]
+    elif clean_mode == "ENERGY":
+        title_text = "Kinetic Shock Energy"
+        unit_str = "J"
+        val_min = tele["energy_min"]
+        val_max = tele["energy_max"]
+        val_mean = tele["energy_mean"]
+    elif clean_mode == "SPIN":
+        title_text = f"Rotational Velocity ({tele['rot_rpm_max']:.0f} RPM)"
+        unit_str = "rad·s⁻¹"
+        val_min = tele["rot_vel_min"]
+        val_max = tele["rot_vel_max"]
+        val_mean = tele["rot_vel_mean"]
+    elif clean_mode == "SOLID":
+        title_text = "PBR Grinding Media [Steel]"
+        unit_str = ""
+        val_min = 0.0
+        val_max = 1.0
+        val_mean = 1.0
+    else:  # VELOCITY
+        title_text = "Linear Velocity"
+        unit_str = "m·s⁻¹"
+        val_min = tele["velocity_min"]
+        val_max = tele["velocity_max"]
+        val_mean = tele["velocity_mean"]
+
+    # Extract exact ColorRamp stops from active shader
+    stops = None
+    active_mat = get_dem_shader_for_mode(clean_mode)
+    if active_mat and active_mat.use_nodes:
+        for n in active_mat.node_tree.nodes:
+            if n.type == "VALTORGB" and hasattr(n, "color_ramp") and n.color_ramp:
+                stops = [(e.position, (e.color[0], e.color[1], e.color[2], 1.0)) for e in n.color_ramp.elements]
+                break
+
+    if not stops:
+        pal_key = "TURBO" if clean_mode in ("VELOCITY", "SPIN") else ("COOLWARM" if clean_mode == "FORCE" else "VIRIDIS")
+        stops = get_palette_stops(pal_key)
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    colors = [(pos, (c[0], c[1], c[2], 1.0)) for pos, c in stops]
+    cmap = mcolors.LinearSegmentedColormap.from_list("science_blocks_cmap", colors, N=256)
+
+    # Styling colors based on background
+    if bg_clean == "DARK":
+        text_color = "#f8fafc"
+        outline_color = "#64748b"
+        card_fc = "#1e293b"
+        card_ec = "#475569"
+        fig_fc = "#0f172a"
+        is_transparent = False
+    elif bg_clean == "WHITE":
+        text_color = "#111827"
+        outline_color = "#374151"
+        card_fc = "#f8fafc"
+        card_ec = "#cbd5e1"
+        fig_fc = "#ffffff"
+        is_transparent = False
+    else:  # TRANSPARENT
+        user_txt_choice = getattr(props, "strip_text_color", "WHITE") if props else "WHITE"
+        if user_txt_choice == "WHITE":
+            text_color = "#f8fafc"
+            outline_color = "#94a3b8"
+            card_fc = "#1e293b"
+            card_ec = "#475569"
+        else:
+            text_color = "#111827"
+            outline_color = "#374151"
+            card_fc = "#f8fafc"
+            card_ec = "#cbd5e1"
+        fig_fc = None
+        is_transparent = True
+
+    norm = mcolors.Normalize(vmin=float(val_min), vmax=max(float(val_min) + 1e-4, float(val_max)))
+    norm_mappable = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+
+    if orient_clean == "VERTICAL":
+        if layout_clean == "WITH_CARD":
+            fig = plt.figure(figsize=(7.2, 4.4), dpi=export_dpi)
+            gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 4.0], wspace=0.45)
+            ax_cb = fig.add_subplot(gs[0])
+            ax_card = fig.add_subplot(gs[1])
+            cb = fig.colorbar(norm_mappable, cax=ax_cb, orientation="vertical")
+            cb.set_label(f"{title_text} [{unit_str}]" if unit_str else title_text, fontsize=11, fontweight="bold", color=text_color, labelpad=10)
+            cb.ax.tick_params(labelsize=10, colors=text_color, width=1.1)
+            cb.outline.set_edgecolor(outline_color)
+            cb.outline.set_linewidth(1.0)
+
+            ax_card.axis("off")
+            tele_text = (
+                "DEM Simulation Physical Telemetry\n"
+                "──────────────────────────────────────────────\n"
+                f"• Linear Velocity:    {tele['velocity_max']:.2f} m·s⁻¹  (mean {tele['velocity_mean']:.2f} m·s⁻¹)\n"
+                f"• Contact Impact Force: {tele['force_max']:.1f} N  (mean {tele['force_mean']:.1f} N)\n"
+                f"• Impact Acceleration:  {tele['accel_max']:.0f} m·s⁻²  ({tele['accel_g_max']:.1f} g)\n"
+                f"• Rotational Velocity:  {tele['rot_vel_max']:.1f} rad·s⁻¹  ({tele['rot_rpm_max']:.0f} RPM)\n"
+                f"• Kinetic Shock Energy: {tele['energy_max']:.4f} J  (mean {tele['energy_mean']:.4f} J)\n"
+                f"• Collision Impacts:    {tele['total_impacts']:,}  ({tele['collision_frequency_hz']:.1f} Hz)\n"
+                "──────────────────────────────────────────────\n"
+                "Science Blocks • Planetary Ball Mill DEM Engine"
+            )
+            ax_card.text(
+                0.05, 0.50, tele_text, transform=ax_card.transAxes, fontsize=10.0,
+                verticalalignment='center', color=text_color, fontfamily="sans-serif",
+                linespacing=1.6,
+                bbox=dict(boxstyle='round,pad=0.8', facecolor=card_fc, edgecolor=card_ec, alpha=0.95)
+            )
+        else:
+            fig = plt.figure(figsize=(2.2, 4.4), dpi=export_dpi)
+            ax_cb = fig.add_axes([0.35, 0.10, 0.30, 0.80])
+            cb = fig.colorbar(norm_mappable, cax=ax_cb, orientation="vertical")
+            cb.set_label(f"{title_text} [{unit_str}]" if unit_str else title_text, fontsize=10.5, fontweight="bold", color=text_color, labelpad=8)
+            cb.ax.tick_params(labelsize=9.5, colors=text_color, width=1.0)
+            cb.outline.set_edgecolor(outline_color)
+    else:  # HORIZONTAL
+        if layout_clean == "WITH_CARD":
+            fig = plt.figure(figsize=(7.2, 3.8), dpi=export_dpi)
+            gs = fig.add_gridspec(2, 1, height_ratios=[1.0, 2.2], hspace=0.55)
+            ax_cb = fig.add_subplot(gs[0])
+            ax_card = fig.add_subplot(gs[1])
+            cb = fig.colorbar(norm_mappable, cax=ax_cb, orientation="horizontal")
+            cb.set_label(f"{title_text} [{unit_str}]" if unit_str else title_text, fontsize=10.5, fontweight="bold", color=text_color, labelpad=8)
+            cb.ax.tick_params(labelsize=9.5, colors=text_color, width=1.0)
+            cb.outline.set_edgecolor(outline_color)
+
+            ax_card.axis("off")
+            tele_text = (
+                f"Force: {tele['force_max']:.1f} N  |  Velocity: {tele['velocity_max']:.2f} m·s⁻¹  |  Accel: {tele['accel_max']:.0f} m·s⁻² ({tele['accel_g_max']:.1f} g)\n"
+                f"Spin: {tele['rot_vel_max']:.1f} rad·s⁻¹ ({tele['rot_rpm_max']:.0f} RPM)  |  Kinetic E: {tele['energy_max']:.4f} J  |  Impacts: {tele['total_impacts']:,} ({tele['collision_frequency_hz']:.1f} Hz)\n"
+                "────────────────────────────────────────────────────────────────────────\n"
+                "Science Blocks • Planetary Ball Mill DEM Engine"
+            )
+            ax_card.text(
+                0.05, 0.50, tele_text, transform=ax_card.transAxes, fontsize=9.5,
+                verticalalignment='center', color=text_color, fontfamily="sans-serif",
+                linespacing=1.5,
+                bbox=dict(boxstyle='round,pad=0.6', facecolor=card_fc, edgecolor=card_ec, alpha=0.95)
+            )
+        else:
+            fig = plt.figure(figsize=(5.5, 1.2), dpi=export_dpi)
+            ax_cb = fig.add_axes([0.1, 0.45, 0.8, 0.35])
+            cb = fig.colorbar(norm_mappable, cax=ax_cb, orientation="horizontal")
+            cb.set_label(f"{title_text} [{unit_str}]" if unit_str else title_text, fontsize=10.0, fontweight="bold", color=text_color, labelpad=8)
+            cb.ax.tick_params(labelsize=9.0, colors=text_color, width=1.0)
+            cb.outline.set_edgecolor(outline_color)
+
+    if is_transparent:
+        fig.patch.set_alpha(0.0)
+        fig.savefig(filepath, dpi=export_dpi, bbox_inches="tight", transparent=True)
+    else:
+        fig.patch.set_facecolor(fig_fc)
+        fig.savefig(filepath, dpi=export_dpi, bbox_inches="tight", facecolor=fig_fc)
+
+    plt.close(fig)
+    return filepath
 
 
 def draw_analytical_data_strip_ui(layout, context, active_mode: str = "VELOCITY"):
@@ -1101,8 +1546,15 @@ def draw_analytical_data_strip_ui(layout, context, active_mode: str = "VELOCITY"
     # Telemetry and physical bounds computation
     tele = extract_simulation_telemetry(res)
 
-    if clean_mode == "FORCE":
-        title = "Contact Force"
+    if clean_mode in ("IMPACT_FORCE", "IMPACT"):
+        title = "Dynamic Impact Force (Collisions)"
+        unit = "N"
+        strip_ascii = "🟦 🟩 🟨 🟧 🟥"
+        v_min = tele["impact_force_min"]
+        v_max = tele["impact_force_max"]
+        v_mean = tele["impact_force_mean"]
+    elif clean_mode == "FORCE":
+        title = "Contact Normal Force"
         unit = "N"
         strip_ascii = "🟦 🟩 🟨 🟥 ⬜"
         v_min = tele["force_min"]
@@ -1125,7 +1577,7 @@ def draw_analytical_data_strip_ui(layout, context, active_mode: str = "VELOCITY"
     elif clean_mode == "SPIN":
         title = "Angular Velocity / Spin"
         unit = "rad·s⁻¹"
-        strip_ascii = "🟦 🟦 🟧 🟥 🟥"
+        strip_ascii = "🟦 🟩 🟨 🟧 🟥"
         v_min = tele["rot_vel_min"]
         v_max = tele["rot_vel_max"]
         v_mean = tele["rot_vel_mean"]
@@ -1213,7 +1665,79 @@ def draw_analytical_data_strip_ui(layout, context, active_mode: str = "VELOCITY"
         p_short = p_name.replace("_FLAME", "").capitalize()
         op_p = r_pal.operator("science_blocks.apply_shader_palette_preset", text=p_short)
         op_p.palette = p_name
-    for p_name in ("TURBO", "VIRIDIS", "PLASMA", "HEAT_FLAME", "COOLWARM"):
-        p_short = p_name.replace("_FLAME", "").capitalize()
-        op_p = r_pal.operator("science_blocks.apply_shader_palette_preset", text=p_short)
-        op_p.palette = p_name
+
+    # 7. 3D Viewport Transform & Placement Controls (Move, Rotate, Scale, Save)
+    b_tr = box.box()
+    r_tr_hdr = b_tr.row(align=True)
+    is_tr_open = getattr(props, "ui_strip_transform_open", True) if props else True
+    r_tr_hdr.prop(
+        props,
+        "ui_strip_transform_open",
+        text="3D Viewport Placement & Transform",
+        icon="TRIA_DOWN" if is_tr_open else "TRIA_RIGHT",
+        emboss=False,
+    )
+    r_tr_hdr.label(text="", icon="ORIENTATION_GIMBAL")
+
+    if is_tr_open and props:
+        c_tr = b_tr.column(align=True)
+
+        # Location X, Y, Z
+        row_loc = c_tr.row(align=True)
+        row_loc.prop(props, "strip_location", text="Offset")
+
+        # Rotation Euler X, Y, Z (deg)
+        row_rot = c_tr.row(align=True)
+        row_rot.prop(props, "strip_rotation", text="Rotation")
+
+        # Scale XYZ + Uniform Scale
+        row_sc = c_tr.row(align=True)
+        row_sc.prop(props, "strip_scale", text="Scale XYZ")
+
+        row_uni = c_tr.row(align=True)
+        row_uni.prop(props, "strip_scale_uniform", text="Uniform Scale", slider=True)
+        row_uni.prop(props, "strip_relative_to_jar", text="Relative to Jar")
+
+        # Text Color (White or Black)
+        row_tc = c_tr.row(align=True)
+        row_tc.label(text="Text Color:", icon="FONT_DATA")
+        row_tc.prop(props, "strip_text_color", expand=True)
+
+        c_tr.separator(factor=0.3)
+        row_tr_act = c_tr.row(align=True)
+        row_tr_act.scale_y = 1.15
+        row_tr_act.operator("science_blocks.reset_color_strip_transform", text="Reset", icon="LOOP_FORWARDS")
+        row_tr_act.operator("science_blocks.sync_strip_transform_from_viewport", text="Sync from Viewport", icon="EYEDROPPER")
+        row_tr_act.operator("science_blocks.align_strip_to_camera", text="Align to Camera", icon="CAMERA_DATA")
+
+    # 8. Publication Figure PNG Export
+    b_exp = box.box()
+    r_exp_hdr = b_exp.row(align=True)
+    is_exp_open = getattr(props, "ui_strip_export_open", True) if props else True
+    r_exp_hdr.prop(
+        props,
+        "ui_strip_export_open",
+        text="Publication Figure Export (PNG)",
+        icon="TRIA_DOWN" if is_exp_open else "TRIA_RIGHT",
+        emboss=False,
+    )
+    r_exp_hdr.label(text="", icon="IMAGE_DATA")
+
+    if is_exp_open and props:
+        c_exp = b_exp.column(align=True)
+        c_exp.prop(props, "strip_export_dir", text="Directory")
+        c_exp.prop(props, "strip_export_filename", text="Filename")
+
+        row_cfg1 = c_exp.row(align=True)
+        row_cfg1.prop(props, "strip_export_dpi", text="DPI")
+        row_cfg1.prop(props, "strip_export_orientation", text="")
+
+        row_cfg2 = c_exp.row(align=True)
+        row_cfg2.prop(props, "strip_export_bg", text="")
+        row_cfg2.prop(props, "strip_export_layout", text="")
+
+        c_exp.separator(factor=0.3)
+        row_exp_act = c_exp.row(align=True)
+        row_exp_act.scale_y = 1.25
+        row_exp_act.operator("science_blocks.export_color_strip_png", text="Export Color Strip PNG", icon="IMAGE_DATA")
+        row_exp_act.operator("science_blocks.open_figures_folder", text="Open Folder", icon="FILE_FOLDER")

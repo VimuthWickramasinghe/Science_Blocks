@@ -201,10 +201,11 @@ def draw_step_2_kinematics(layout, context, props):
     """Step 2: 3D Models, Chamber Setup, and Motion Preview."""
     col = layout.column(align=True)
 
-    # Primary Action: Open Node Editor
+    # Primary Action: Open Node Editor & Sensible Zoom
     row_top = col.row(align=True)
     row_top.scale_y = 1.25
     row_top.operator("science_blocks.open_node_editor", text="Open Science Blocks Node Editor", icon="NODETREE")
+    row_top.operator("science_blocks.zoom_node_editor", text="Zoom In", icon="VIEWZOOM")
 
     col.separator(factor=0.3)
 
@@ -242,15 +243,19 @@ def draw_step_2_kinematics(layout, context, props):
     if getattr(props, "dem_container_stl_path", ""):
         row_stl.label(text="STL Ready", icon="CHECKMARK")
 
-    # Particle Source Tap / Inlet Control
+    # Fluid-Style Inflow Surface / Particle Tap Control
     box_tap = col.box()
     r_tap = box_tap.row(align=True)
-    r_tap.prop(props, "dem_use_source_plane", text="Use Source Tap Inlet", icon="SNAP_GRID")
+    r_tap.prop(props, "dem_use_source_plane", text="Inflow Plane (Fluid Emitter)", icon="SNAP_GRID")
     if getattr(props, "dem_use_source_plane", True):
         c_tap = box_tap.column(align=True)
         r_sel = c_tap.row(align=True)
-        r_sel.prop(props, "dem_source_plane_obj", text="Tap Object")
+        r_sel.prop(props, "dem_source_plane_obj", text="Inflow Plane")
         r_sel.operator("science_blocks.create_particle_source_plane", text="", icon="ADD")
+
+        r_flow = c_tap.row(align=True)
+        r_flow.prop(props, "dem_settle_delay_s", text="Settle Time (s)")
+        r_flow.prop(props, "dem_inflow_rate_factor", text="Inflow Speed")
 
     col.separator(factor=0.3)
 
@@ -316,9 +321,9 @@ def draw_scientific_styling_panel(layout, context, props):
 
     col.separator(factor=0.3)
 
-    # 3. Background Color & Alpha Transparency
+    # 3. Component 1: Publication World Background (Decoupled from Scene Lighting)
     b_bg = col.box()
-    b_bg.label(text="Publication World Background:", icon="WORLD")
+    b_bg.label(text="1. Background Styling (Decoupled Lighting):", icon="WORLD")
     c_bg = b_bg.column(align=True)
     c_bg.prop(props, "sci_background_color", text="Color")
     c_bg.prop(
@@ -344,17 +349,35 @@ def draw_scientific_styling_panel(layout, context, props):
 
     col.separator(factor=0.3)
 
-    # 4. Object Materials & Colors
+    # 4. Component 2: Chamber & Carrier Disc Styling
     b_obj = col.box()
-    b_obj.label(text="Object Materials & Colors:", icon="MATERIAL")
+    b_obj.label(text="2. Chamber & Carrier Styling:", icon="MESH_CYLINDER")
     c_obj = b_obj.column(align=True)
 
-    # Jar Chamber
-    c_obj.label(text="Grinding Jar Chamber:", icon="MESH_CYLINDER")
+    # Jar Chamber Finishes & Colors
+    c_obj.label(text="Grinding Jar Chamber Wall:", icon="SHADING_RENDERED")
     c_obj.prop(props, "sci_jar_finish", text="Finish")
+
+    row_jf_quick = c_obj.row(align=True)
+    row_jf_quick.scale_y = 1.05
+    op_fg = row_jf_quick.operator("science_blocks.set_chamber_finish", text="Frosted Glass", icon="NODE_MATERIAL")
+    op_fg.finish = "FROSTED_GLASS"
+    op_ss = row_jf_quick.operator("science_blocks.set_chamber_finish", text="316L Steel", icon="TOOL_SETTINGS")
+    op_ss.finish = "STAINLESS_STEEL"
+
+    row_jf_q2 = c_obj.row(align=True)
+    row_jf_q2.scale_y = 1.05
+    op_ac = row_jf_q2.operator("science_blocks.set_chamber_finish", text="Ceramic White", icon="IMAGE_PLANE")
+    op_ac.finish = "ALUMINA_CERAMIC"
+    op_cu = row_jf_q2.operator("science_blocks.set_chamber_finish", text="Custom Casing", icon="COLOR")
+    op_cu.finish = "CUSTOM"
+
+    c_obj.separator(factor=0.2)
+    c_obj.prop(props, "sci_jar_color", text="Chamber Tint")
     row_jc = c_obj.row(align=True)
-    row_jc.prop(props, "sci_jar_color", text="Tint")
     row_jc.prop(props, "sci_jar_opacity", text="Opacity")
+    row_jc.prop(props, "sci_jar_metallic", text="Metallic")
+    c_obj.prop(props, "sci_jar_roughness", text="Roughness")
 
     c_obj.separator(factor=0.25)
     # Sun Wheel Carrier Plate
@@ -366,7 +389,7 @@ def draw_scientific_styling_panel(layout, context, props):
 
     c_obj.separator(factor=0.25)
     # Indicators & Gravity Arrow Accent
-    c_obj.label(text="Indicators & Gravity Vector:", icon="FORCE_FORCE")
+    c_obj.label(text="Pointers & Gravity Arrow:", icon="FORCE_FORCE")
     c_obj.prop(props, "sci_accent_color", text="Accent")
 
     c_obj.separator(factor=0.2)
@@ -374,34 +397,67 @@ def draw_scientific_styling_panel(layout, context, props):
     row_app_obj.scale_y = 1.2
     row_app_obj.operator(
         "science_blocks.apply_scientific_paper_colors",
-        text="Apply Object Colors & Shaders",
+        text="Apply Chamber & Rig Styling",
         icon="CHECKMARK",
     )
 
     col.separator(factor=0.3)
 
-    # 5. DEM Grinding Media / Particles Palette
-    b_part = col.box()
-    b_part.label(text="DEM Particles Palette:", icon="PARTICLES")
-    c_part = b_part.column(align=True)
-    c_part.prop(props, "sci_media_palette", text="Palette")
+    # 5. Component 3: Spheres / Grinding Media Styling
+    b_sphere = col.box()
+    b_sphere.label(text="3. Spheres (Grinding Media) Styling:", icon="SPHERE")
+    c_sph = b_sphere.column(align=True)
 
-    row_rec = c_part.row(align=True)
-    row_rec.scale_y = 1.2
-    row_rec.operator(
+    c_sph.label(text="Media Finish Preset:", icon="MATERIAL")
+    c_sph.prop(props, "sci_sphere_preset", text="Preset")
+
+    row_sf_quick = c_sph.row(align=True)
+    row_sf_quick.scale_y = 1.05
+    op_st = row_sf_quick.operator("science_blocks.set_sphere_finish", text="316L Steel", icon="TOOL_SETTINGS")
+    op_st.preset = "STEEL"
+    op_ce = row_sf_quick.operator("science_blocks.set_sphere_finish", text="Ceramic", icon="IMAGE_PLANE")
+    op_ce.preset = "CERAMIC"
+
+    row_sf_q2 = c_sph.row(align=True)
+    row_sf_q2.scale_y = 1.05
+    op_tg = row_sf_q2.operator("science_blocks.set_sphere_finish", text="Tungsten", icon="SHADING_SOLID")
+    op_tg.preset = "TUNGSTEN"
+    op_cs = row_sf_q2.operator("science_blocks.set_sphere_finish", text="Custom PBR", icon="COLOR")
+    op_cs.preset = "CUSTOM"
+
+    c_sph.separator(factor=0.2)
+    c_sph.prop(props, "sci_sphere_color", text="Base Color")
+    row_sph_pbr = c_sph.row(align=True)
+    row_sph_pbr.prop(props, "sci_sphere_metallic", text="Metallic")
+    row_sph_pbr.prop(props, "sci_sphere_roughness", text="Roughness")
+    c_sph.prop(props, "sci_sphere_specular", text="Specular Shine")
+
+    c_sph.separator(factor=0.25)
+    c_sph.label(text="Colormap Visualization Variable:", icon="RESTRICT_COLOR_OFF")
+    c_sph.prop(props, "dem_viewport_colormap", text="Variable")
+    c_sph.prop(props, "sci_media_palette", text="Heat Palette")
+
+    row_sph_btns = c_sph.row(align=True)
+    row_sph_btns.scale_y = 1.2
+    row_sph_btns.operator(
+        "science_blocks.apply_scientific_paper_colors",
+        text="Apply Sphere Materials",
+        icon="CHECKMARK",
+    )
+    row_sph_btns.operator(
         "science_blocks.update_particle_colors",
-        text="Recolor Particles in Scene",
+        text="Recolor Particles",
         icon="COLOR",
     )
 
-    c_part.separator(factor=0.3)
+    c_sph.separator(factor=0.3)
     try:
         from .colormaps import draw_analytical_data_strip_ui
-        draw_analytical_data_strip_ui(c_part, context)
+        draw_analytical_data_strip_ui(c_sph, context)
     except Exception:
         try:
             from colormaps import draw_analytical_data_strip_ui
-            draw_analytical_data_strip_ui(c_part, context)
+            draw_analytical_data_strip_ui(c_sph, context)
         except Exception:
             pass
 
@@ -500,4 +556,36 @@ class OBJECT_PT_science_blocks_main(bpy.types.Panel):
 
     def draw(self, context):
         draw_guided_workflow_ui(self.layout, context)
+
+
+# Node Editor 'N' Sidebar Panel for Science Blocks
+class NODE_PT_science_blocks_editor_tools(bpy.types.Panel):
+    """Sidebar tools panel inside the Science Blocks Node Editor."""
+    bl_label = "Science Blocks"
+    bl_idname = "NODE_PT_science_blocks_editor_tools"
+    bl_space_type = "NODE_EDITOR"
+    bl_region_type = "UI"
+    bl_category = "Science Blocks"
+
+    @classmethod
+    def poll(cls, context):
+        space = getattr(context, "space_data", None)
+        if space and getattr(space, "type", None) == "NODE_EDITOR":
+            tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+            return (
+                getattr(space, "tree_type", None) == "ScienceBlocksNodeTree"
+                or (tree and getattr(tree, "bl_idname", None) == "ScienceBlocksNodeTree")
+            )
+        return False
+
+    def draw(self, context):
+        layout = self.layout
+        props = getattr(context.scene, "science_blocks_props", None)
+
+        box_v = layout.box()
+        box_v.label(text="Node View & Framing:", icon="VIEWZOOM")
+        col_v = box_v.column(align=True)
+        col_v.scale_y = 1.2
+        col_v.operator("science_blocks.zoom_node_editor", text="Zoom In (Sensible Scale)", icon="VIEWZOOM")
+        col_v.operator("science_blocks.open_node_editor", text="Reset / Re-frame View", icon="FILE_REFRESH")
 

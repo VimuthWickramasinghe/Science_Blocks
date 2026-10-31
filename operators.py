@@ -1066,11 +1066,144 @@ class SCIENCE_BLOCKS_OT_capture_base_rotation(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def zoom_node_editor_sensible(context, node_area=None, zoom_in_steps: int = 3):
+    """Frames all nodes in the node editor and zooms in by a sensible amount so nodes are easily legible."""
+    if bpy is None or context is None:
+        return
+
+    # Find the Node Editor area if not supplied
+    if node_area is None:
+        screen = getattr(context, "screen", None) or getattr(getattr(bpy, "context", None), "screen", None)
+        if screen and hasattr(screen, "areas"):
+            for area in screen.areas:
+                if area.type == "NODE_EDITOR":
+                    node_area = area
+                    break
+
+    if not node_area or not hasattr(node_area, "regions"):
+        return
+
+    # Ensure tree_type and active tree are assigned
+    props = getattr(context.scene, "science_blocks_props", None) if hasattr(context, "scene") else None
+    if hasattr(node_area, "spaces") and node_area.spaces:
+        space = node_area.spaces.active
+        if space and hasattr(space, "tree_type"):
+            space.tree_type = "ScienceBlocksNodeTree"
+            if props and getattr(props, "active_node_tree", None):
+                space.node_tree = props.active_node_tree
+
+    # Find WINDOW region (the node canvas)
+    window_region = None
+    for r in node_area.regions:
+        if r.type == "WINDOW":
+            window_region = r
+            break
+
+    if not window_region:
+        return
+
+    def _execute_view_ops():
+        # 1. Frame all nodes to center them on screen
+        if hasattr(bpy.ops, "node") and hasattr(bpy.ops.node, "view_all"):
+            try:
+                bpy.ops.node.view_all()
+            except Exception:
+                pass
+
+        # 2. Zoom in for a sensible, comfortably readable scale
+        if hasattr(bpy.ops, "view2d") and hasattr(bpy.ops.view2d, "zoom_in"):
+            for _ in range(max(1, int(zoom_in_steps))):
+                try:
+                    bpy.ops.view2d.zoom_in(zoomfacx=1.35, zoomfacy=1.35)
+                except Exception:
+                    try:
+                        bpy.ops.view2d.zoom_in()
+                    except Exception:
+                        pass
+        elif hasattr(bpy.ops, "view2d") and hasattr(bpy.ops.view2d, "zoom"):
+            try:
+                bpy.ops.view2d.zoom(deltax=15, deltay=15)
+            except Exception:
+                pass
+
+    # Execute with context override
+    try:
+        if hasattr(context, "temp_override"):
+            with context.temp_override(area=node_area, region=window_region):
+                _execute_view_ops()
+        else:
+            override = {
+                "window": getattr(context, "window", None),
+                "screen": getattr(context, "screen", None),
+                "area": node_area,
+                "region": window_region,
+                "space_data": getattr(node_area.spaces, "active", None),
+            }
+            if hasattr(bpy.ops, "node") and hasattr(bpy.ops.node, "view_all"):
+                try:
+                    bpy.ops.node.view_all(override)
+                except Exception:
+                    pass
+            if hasattr(bpy.ops, "view2d") and hasattr(bpy.ops.view2d, "zoom_in"):
+                for _ in range(max(1, int(zoom_in_steps))):
+                    try:
+                        bpy.ops.view2d.zoom_in(override, zoomfacx=1.35, zoomfacy=1.35)
+                    except Exception:
+                        try:
+                            bpy.ops.view2d.zoom_in(override)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    try:
+        node_area.tag_redraw()
+    except Exception:
+        pass
+
+
+def schedule_node_editor_zoom(context, node_area=None, zoom_in_steps: int = 3):
+    """Executes zoom immediately and registers a brief timer to ensure newly initialized regions are framed."""
+    zoom_node_editor_sensible(context, node_area=node_area, zoom_in_steps=zoom_in_steps)
+    try:
+        if hasattr(bpy.app, "timers") and hasattr(bpy.app.timers, "register"):
+            def _delayed_zoom():
+                try:
+                    zoom_node_editor_sensible(bpy.context, node_area=node_area, zoom_in_steps=zoom_in_steps)
+                except Exception:
+                    pass
+                return None  # Unregister timer
+            bpy.app.timers.register(_delayed_zoom, first_interval=0.03)
+    except Exception:
+        pass
+
+
+class SCIENCE_BLOCKS_OT_zoom_node_editor(bpy.types.Operator):
+    """Frame nodes and zoom in for a sensible, comfortably readable scale in Science Blocks Node Editor."""
+    bl_idname = "science_blocks.zoom_node_editor"
+    bl_label = "Zoom In Nodes (Sensible Size)"
+    bl_description = "Frame and zoom in the Science Blocks node editor so node labels, sockets, and sliders are comfortably legible"
+
+    zoom_steps: bpy.props.IntProperty(
+        name="Zoom In Steps",
+        description="Number of zoom-in increments applied after framing",
+        default=3,
+        min=1,
+        max=8,
+    )
+
+    def execute(self, context):
+        steps = int(getattr(self, "zoom_steps", 3) or 3)
+        schedule_node_editor_zoom(context, zoom_in_steps=steps)
+        self.report({"INFO"}, "Science Blocks: Focused and zoomed in Node Editor to a sensible scale.")
+        return {"FINISHED"}
+
+
 class SCIENCE_BLOCKS_OT_open_node_editor(bpy.types.Operator):
-    """Switch an area or focus the Science Blocks Node Editor."""
+    """Switch an area or focus the Science Blocks Node Editor and zoom in to a sensible scale."""
     bl_idname = "science_blocks.open_node_editor"
     bl_label = "View Planetary Node Editor"
-    bl_description = "Open or focus the Science Blocks Node Editor"
+    bl_description = "Open or focus the Science Blocks Node Editor and zoom in to a sensible scale"
 
     def execute(self, context):
         node_area = None
@@ -1084,9 +1217,10 @@ class SCIENCE_BLOCKS_OT_open_node_editor(bpy.types.Operator):
         if node_area:
             space = node_area.spaces.active
             space.tree_type = "ScienceBlocksNodeTree"
-            if props and props.active_node_tree:
+            if props and getattr(props, "active_node_tree", None):
                 space.node_tree = props.active_node_tree
-            self.report({"INFO"}, "Science Blocks: Focused Node Editor.")
+            schedule_node_editor_zoom(context, node_area=node_area, zoom_in_steps=3)
+            self.report({"INFO"}, "Science Blocks: Focused Node Editor and zoomed in to a sensible size.")
             return {"FINISHED"}
 
         for area in context.screen.areas:
@@ -1094,9 +1228,10 @@ class SCIENCE_BLOCKS_OT_open_node_editor(bpy.types.Operator):
                 area.type = "NODE_EDITOR"
                 space = area.spaces.active
                 space.tree_type = "ScienceBlocksNodeTree"
-                if props and props.active_node_tree:
+                if props and getattr(props, "active_node_tree", None):
                     space.node_tree = props.active_node_tree
-                self.report({"INFO"}, "Science Blocks: Switched dock area to Node Editor.")
+                schedule_node_editor_zoom(context, node_area=area, zoom_in_steps=3)
+                self.report({"INFO"}, "Science Blocks: Switched dock area to Node Editor and zoomed in to a sensible size.")
                 return {"FINISHED"}
 
         self.report({"INFO"}, "Science Blocks: Switch any viewport area to 'Node Editor' and select 'Science Blocks Nodes' in header.")
@@ -1306,33 +1441,33 @@ def setup_simulation_demo(context, demo_type: str = "HIGH_ENERGY_BALL_MILL"):
     if props:
         props.active_node_tree = tree
 
-    # Kinematic Nodes
+    # Kinematic Nodes (Clean, proportional horizontal workflow layout)
     node_sun_obj = tree.nodes.new("ScienceBlocksObjectNode")
     node_sun_obj.label = "Sun Wheel (Mechanism)"
-    node_sun_obj.location = (-750, 300)
+    node_sun_obj.location = (-480, 260)
     node_sun_obj.target_object = sun_wheel
     node_sun_obj.object_role = "SUN_WHEEL"
 
+    node_rpm = tree.nodes.new("ScienceBlocksRPMValueNode")
+    node_rpm.label = f"Drive Speed ({int(sun_rpm)} RPM)"
+    node_rpm.location = (-480, 60)
+    node_rpm.rpm_constant = float(sun_rpm)
+
     node_jar_obj = tree.nodes.new("ScienceBlocksObjectNode")
     node_jar_obj.label = "Grinding Jar (Chamber)"
-    node_jar_obj.location = (-750, -100)
+    node_jar_obj.location = (-480, -140)
     node_jar_obj.target_object = jar_chamber
     node_jar_obj.object_role = "JAR"
 
-    node_rpm = tree.nodes.new("ScienceBlocksRPMValueNode")
-    node_rpm.label = f"Drive Speed ({int(sun_rpm)} RPM)"
-    node_rpm.location = (-750, 100)
-    node_rpm.rpm_constant = float(sun_rpm)
-
     node_gear = tree.nodes.new("ScienceBlocksGearRatioNode")
     node_gear.label = f"Transmission ({jar_gear_ratio}x Invert)"
-    node_gear.location = (-480, 50)
+    node_gear.location = (-220, 60)
     node_gear.gear_ratio = float(jar_gear_ratio)
     node_gear.invert_direction = True
 
     node_rot_sun = tree.nodes.new("ScienceBlocksRotationNode")
     node_rot_sun.label = "Sun Wheel Rotation (CW)"
-    node_rot_sun.location = (-200, 250)
+    node_rot_sun.location = (40, 220)
     node_rot_sun.target_object = sun_wheel
     node_rot_sun.direction = "CW"
     node_rot_sun.rotation_axis = "Z"
@@ -1343,7 +1478,7 @@ def setup_simulation_demo(context, demo_type: str = "HIGH_ENERGY_BALL_MILL"):
 
     node_rot_jar = tree.nodes.new("ScienceBlocksRotationNode")
     node_rot_jar.label = "Jar Counter-Rotation (CCW)"
-    node_rot_jar.location = (-200, -50)
+    node_rot_jar.location = (40, -60)
     node_rot_jar.target_object = jar_chamber
     node_rot_jar.direction = "CCW"
     node_rot_jar.rotation_axis = "Z"
@@ -2541,16 +2676,20 @@ def resolve_simulation_objects(context, props, solver_node=None):
 
 
 def resolve_source_plane_object(context, props=None, solver_node=None, jar_obj=None):
-    """Discovers and resolves the 3D Source Tap / Inlet object for non-overlapping particle emission."""
+    """Discovers and resolves the 3D Source Tap / Inlet plane object for fluid-style particle emission."""
     source_obj = None
 
-    # Priority 1: Target solver node's "Source Tap / Plane" input socket
-    if solver_node and hasattr(solver_node, "inputs"):
+    # Priority 1: Scene property dem_source_plane_obj if set explicitly by user
+    if props:
+        source_obj = getattr(props, "dem_source_plane_obj", None)
+
+    # Priority 2: Target solver node's "Source Tap / Plane" input socket
+    if not source_obj and solver_node and hasattr(solver_node, "inputs"):
         sock_tap = solver_node.inputs.get("Source Tap / Plane")
         if sock_tap and getattr(sock_tap, "is_linked", False):
             source_obj = resolve_object_from_socket(sock_tap)
 
-    # Priority 2: Inspect other solver nodes in active tree
+    # Priority 3: Inspect other solver nodes in active tree
     tree = get_effective_node_tree(context, props) if (context or props) else None
     if not source_obj and tree:
         for node in tree.nodes:
@@ -2561,19 +2700,131 @@ def resolve_source_plane_object(context, props=None, solver_node=None, jar_obj=N
                     if source_obj:
                         break
 
-    # Priority 3: Scene property dem_source_plane_obj
-    if not source_obj and props:
-        source_obj = getattr(props, "dem_source_plane_obj", None)
-
     # Priority 4: Object named 'Particle_Tap_Inlet' or 'Source_Tap' in scene
     if not source_obj and hasattr(bpy, "data"):
-        for name in ("Particle_Tap_Inlet", "Source_Tap", "Particle_Inlet", "Tap_Plane", "Source_Plane"):
+        for name in ("Particle_Tap_Inlet", "Source_Tap", "Particle_Inlet", "Tap_Plane", "Source_Plane", "Inflow_Plane", "Inlet_Plane"):
             candidate = bpy.data.objects.get(name)
             if candidate:
                 source_obj = candidate
                 break
 
+    # Priority 5: Active or selected mesh object if it is a plane and not the jar / carrier
+    if not source_obj and context:
+        sel_objs = getattr(context, "selected_objects", []) or []
+        for obj in sel_objs:
+            if obj != jar_obj and getattr(obj, "type", "") == "MESH":
+                source_obj = obj
+                if props:
+                    props.dem_source_plane_obj = obj
+                break
+
     return source_obj
+
+
+def extract_source_plane_geometry(source_plane_obj, jar_obj, effective_gravity=(0.0, 0.0, -1.0)):
+    """Extracts simulation-space center, normal, tangents, and dimensions of source_plane_obj relative to jar_obj."""
+    if not source_plane_obj or not jar_obj or np is None:
+        return None
+
+    try:
+        # Bounding box center in jar local coordinates
+        cx, cy, cz = 0.0, 0.0, 0.0
+        if hasattr(jar_obj, "bound_box") and jar_obj.bound_box:
+            bb = jar_obj.bound_box
+            cx = (min(v[0] for v in bb) + max(v[0] for v in bb)) / 2.0
+            cy = (min(v[1] for v in bb) + max(v[1] for v in bb)) / 2.0
+            cz = (min(v[2] for v in bb) + max(v[2] for v in bb)) / 2.0
+
+        sx = abs(jar_obj.scale.x) if hasattr(jar_obj.scale, "x") else 1.0
+        sy = abs(jar_obj.scale.y) if hasattr(jar_obj.scale, "y") else 1.0
+        sz = abs(jar_obj.scale.z) if hasattr(jar_obj.scale, "z") else 1.0
+
+        m_jar_inv = jar_obj.matrix_world.inverted()
+
+        def to_sim(w_vec):
+            l_vec = m_jar_inv @ w_vec
+            return np.array([
+                (l_vec[0] - cx) * sx,
+                (l_vec[1] - cy) * sy,
+                (l_vec[2] - cz) * sz,
+            ], dtype=np.float64)
+
+        # 1. If source_plane_obj is a mesh with vertices:
+        if (
+            hasattr(source_plane_obj, "data")
+            and source_plane_obj.data
+            and hasattr(source_plane_obj.data, "vertices")
+            and len(source_plane_obj.data.vertices) >= 3
+        ):
+            sim_verts = [to_sim(source_plane_obj.matrix_world @ v.co) for v in source_plane_obj.data.vertices]
+            center = np.mean(sim_verts, axis=0)
+
+            if len(sim_verts) == 4:
+                v0, v1, v2, v3 = sim_verts[0], sim_verts[1], sim_verts[2], sim_verts[3]
+                eu = 0.5 * (v1 - v0 + v2 - v3)
+                ev = 0.5 * (v3 - v0 + v2 - v1)
+                len_u = float(np.linalg.norm(eu))
+                len_v = float(np.linalg.norm(ev))
+                u_vec = eu / len_u if len_u > 1e-6 else np.array([1.0, 0.0, 0.0])
+                v_vec = ev / len_v if len_v > 1e-6 else np.array([0.0, 1.0, 0.0])
+                n_vec = np.cross(u_vec, v_vec)
+                n_len = float(np.linalg.norm(n_vec))
+                n_vec = n_vec / n_len if n_len > 1e-6 else np.array([0.0, 0.0, -1.0])
+            else:
+                coords = np.array(sim_verts) - center
+                _, _, vh = np.linalg.svd(coords)
+                u_vec = vh[0] / np.linalg.norm(vh[0])
+                v_vec = vh[1] / np.linalg.norm(vh[1])
+                n_vec = np.cross(u_vec, v_vec)
+                n_vec = n_vec / np.linalg.norm(n_vec)
+                pu = coords @ u_vec
+                pv = coords @ v_vec
+                len_u = float(np.max(pu) - np.min(pu))
+                len_v = float(np.max(pv) - np.min(pv))
+        else:
+            # Fallback to object origin & dimensions
+            world_loc = source_plane_obj.matrix_world.translation if hasattr(source_plane_obj.matrix_world, "translation") else Vector((0, 0, 0))
+            center = to_sim(world_loc)
+
+            m_plane_3 = source_plane_obj.matrix_world.to_3x3() if hasattr(source_plane_obj.matrix_world, "to_3x3") else Matrix().to_3x3()
+            m_jar_3_inv = jar_obj.matrix_world.to_3x3().inverted() if hasattr(jar_obj.matrix_world, "to_3x3") else Matrix().to_3x3()
+
+            u_w = m_plane_3 @ Vector((1.0, 0.0, 0.0))
+            v_w = m_plane_3 @ Vector((0.0, 1.0, 0.0))
+            u_l = m_jar_3_inv @ u_w
+            v_l = m_jar_3_inv @ v_w
+
+            u_vec = np.array([u_l[0] * sx, u_l[1] * sy, u_l[2] * sz], dtype=np.float64)
+            v_vec = np.array([v_l[0] * sx, v_l[1] * sy, v_l[2] * sz], dtype=np.float64)
+            dim_x = getattr(source_plane_obj.dimensions, "x", 0.3) if hasattr(source_plane_obj, "dimensions") else 0.3
+            dim_y = getattr(source_plane_obj.dimensions, "y", 0.3) if hasattr(source_plane_obj, "dimensions") else 0.3
+            len_u = float(np.linalg.norm(u_vec)) * dim_x
+            len_v = float(np.linalg.norm(v_vec)) * dim_y
+            u_vec = u_vec / np.linalg.norm(u_vec) if np.linalg.norm(u_vec) > 1e-6 else np.array([1.0, 0.0, 0.0])
+            v_vec = v_vec / np.linalg.norm(v_vec) if np.linalg.norm(v_vec) > 1e-6 else np.array([0.0, 1.0, 0.0])
+            n_vec = np.cross(u_vec, v_vec)
+            n_vec = n_vec / np.linalg.norm(n_vec) if np.linalg.norm(n_vec) > 1e-6 else np.array([0.0, 0.0, -1.0])
+
+        # Flow direction: Ensure normal points downwards along gravity
+        g_arr = np.array(effective_gravity, dtype=np.float64)
+        if np.linalg.norm(g_arr) > 1e-4:
+            g_dir = g_arr / np.linalg.norm(g_arr)
+            if np.dot(n_vec, g_dir) < 0:
+                n_vec = -n_vec
+                v_vec = -v_vec
+
+        radius = max(0.04, max(len_u, len_v) * 0.5)
+        return {
+            "center": tuple(float(x) for x in center),
+            "normal": tuple(float(x) for x in n_vec),
+            "tangent_u": tuple(float(x) for x in u_vec),
+            "tangent_v": tuple(float(x) for x in v_vec),
+            "size_u": float(len_u),
+            "size_v": float(len_v),
+            "radius": float(radius),
+        }
+    except Exception:
+        return None
 
 
 def create_or_update_particle_source_plane(context, jar_obj=None, location=None, radius=None, geom=None):
@@ -3725,30 +3976,226 @@ def get_or_create_chamber_glass_material(opacity: float = 0.25) -> bpy.types.Mat
     return mat
 
 
+def _get_node_socket(sockets, key, fallback_idx=0):
+    """Safely retrieves a socket from node inputs or outputs by string key or index."""
+    if sockets is None:
+        return None
+    # 1. Try named lookup if key is a string
+    if isinstance(key, str):
+        try:
+            if hasattr(sockets, "__getitem__"):
+                return sockets[key]
+        except (KeyError, TypeError, IndexError):
+            pass
+        if hasattr(sockets, "get"):
+            try:
+                res = sockets.get(key)
+                if res is not None:
+                    return res
+            except Exception:
+                pass
+    # 2. Try integer index lookup
+    idx = fallback_idx if isinstance(fallback_idx, int) else (key if isinstance(key, int) else 0)
+    try:
+        if hasattr(sockets, "__getitem__"):
+            return sockets[idx]
+    except (KeyError, TypeError, IndexError):
+        pass
+    if hasattr(sockets, "get"):
+        try:
+            res = sockets.get(idx)
+            if res is not None:
+                return res
+        except Exception:
+            pass
+    return None
+
+
+def ensure_studio_lighting(scene=None):
+    """Ensures a crisp 3-point studio lighting setup (Key, Fill, Rim) exists in the scene."""
+    if bpy is None or not hasattr(bpy, "data"):
+        return
+    scene = scene or (bpy.context.scene if hasattr(bpy, "context") and hasattr(bpy.context, "scene") else None)
+    if not scene:
+        return
+
+    coll_name = "Science_Blocks_Studio_Lighting"
+    coll = bpy.data.collections.get(coll_name) if hasattr(bpy.data, "collections") else None
+    if not coll and hasattr(bpy.data, "collections"):
+        coll = bpy.data.collections.new(coll_name)
+        if hasattr(scene, "collection") and hasattr(scene.collection, "children"):
+            scene.collection.children.link(coll)
+
+    def setup_light(name, light_type, loc, rot_euler, energy, color):
+        light_obj = bpy.data.objects.get(name) if hasattr(bpy.data, "objects") else None
+        if not light_obj:
+            if hasattr(bpy.data, "lights"):
+                ldata = bpy.data.lights.new(name=name, type=light_type)
+                light_obj = bpy.data.objects.new(name, ldata)
+                if coll and hasattr(coll, "objects"):
+                    coll.objects.link(light_obj)
+                elif hasattr(scene, "collection") and hasattr(scene.collection, "objects"):
+                    scene.collection.objects.link(light_obj)
+        else:
+            ldata = getattr(light_obj, "data", None)
+        if light_obj and hasattr(light_obj, "data") and light_obj.data:
+            ldata = light_obj.data
+            ldata.energy = energy
+            ldata.color = color
+            light_obj.location = loc
+            light_obj.rotation_euler = rot_euler
+        return light_obj
+
+    # Key Light (warm soft front-left)
+    setup_light(
+        "Studio_Key_Light", "SUN",
+        (4.0, -4.0, 6.0),
+        (math.radians(45.0), math.radians(20.0), math.radians(35.0)),
+        2.5, (1.0, 0.98, 0.95),
+    )
+    # Fill Light (cool soft fill right)
+    setup_light(
+        "Studio_Fill_Light", "SUN",
+        (-4.0, -3.0, 4.0),
+        (math.radians(50.0), math.radians(-25.0), math.radians(-35.0)),
+        1.2, (0.92, 0.96, 1.0),
+    )
+    # Rim Light (crisp backlight from above rear)
+    setup_light(
+        "Studio_Rim_Light", "SUN",
+        (0.0, 5.0, 7.0),
+        (math.radians(130.0), 0.0, math.radians(180.0)),
+        1.8, (1.0, 1.0, 1.0),
+    )
+
+
+def setup_decoupled_world_background(world, bg_color=(1.0, 1.0, 1.0), camera_strength: float = 1.0):
+    """Configures the World shader node tree so the background color is visible to the camera,
+    but exerts ZERO diffuse illumination, ZERO color bleeding, and ZERO reflections on objects in the scene.
+    Object illumination is driven exclusively by lamps / studio lighting.
+    """
+    if not world:
+        return None
+
+    world.use_nodes = True
+    ntree = getattr(world, "node_tree", None)
+    if not ntree or not hasattr(ntree, "nodes"):
+        return None
+
+    nodes = ntree.nodes
+    links = getattr(ntree, "links", None)
+
+    # 1. Identify or create required nodes
+    out_node = next((n for n in nodes if getattr(n, "type", "") == "OUTPUT_WORLD"), None)
+    if not out_node:
+        out_node = nodes.new("ShaderNodeOutputWorld")
+        out_node.location = (300, 0)
+
+    mix_node = next((n for n in nodes if getattr(n, "type", "") == "MIX_SHADER"), None)
+    if not mix_node:
+        mix_node = nodes.new("ShaderNodeMixShader")
+        mix_node.location = (50, 0)
+
+    lp_node = next((n for n in nodes if getattr(n, "type", "") == "LIGHT_PATH"), None)
+    if not lp_node:
+        lp_node = nodes.new("ShaderNodeLightPath")
+        lp_node.location = (-250, 150)
+
+    cam_bg = next((n for n in nodes if getattr(n, "type", "") == "BACKGROUND" and getattr(n, "label", "") == "Camera Background"), None)
+    env_bg = next((n for n in nodes if getattr(n, "type", "") == "BACKGROUND" and getattr(n, "label", "") == "Environment Lighting"), None)
+
+    # If not explicitly labeled, reuse any existing background nodes or create new ones
+    unassigned_bgs = [n for n in nodes if getattr(n, "type", "") == "BACKGROUND" and n not in (cam_bg, env_bg)]
+    if not cam_bg:
+        cam_bg = unassigned_bgs.pop(0) if unassigned_bgs else nodes.new("ShaderNodeBackground")
+        cam_bg.label = "Camera Background"
+        cam_bg.name = "Camera_Background"
+    cam_bg.location = (-250, -50)
+
+    if not env_bg:
+        env_bg = unassigned_bgs.pop(0) if unassigned_bgs else nodes.new("ShaderNodeBackground")
+        env_bg.label = "Environment Lighting"
+        env_bg.name = "Environment_Background"
+    env_bg.location = (-250, -250)
+
+    # 2. Configure Camera Background (Visible to camera rays)
+    if len(bg_color) == 3:
+        bg_rgba = (bg_color[0], bg_color[1], bg_color[2], 1.0)
+    else:
+        bg_rgba = tuple(bg_color[:4])
+
+    c_in = _get_node_socket(cam_bg.inputs, "Color", 0)
+    if c_in and hasattr(c_in, "default_value"):
+        c_in.default_value = bg_rgba
+    s_in = _get_node_socket(cam_bg.inputs, "Strength", 1)
+    if s_in and hasattr(s_in, "default_value"):
+        s_in.default_value = camera_strength
+
+    # 3. Configure Environment Lighting (Zero emission onto objects)
+    env_c_in = _get_node_socket(env_bg.inputs, "Color", 0)
+    if env_c_in and hasattr(env_c_in, "default_value"):
+        env_c_in.default_value = (0.0, 0.0, 0.0, 1.0)
+    env_s_in = _get_node_socket(env_bg.inputs, "Strength", 1)
+    if env_s_in and hasattr(env_s_in, "default_value"):
+        env_s_in.default_value = 0.0
+
+    # 4. Wire Shader Links
+    if links:
+        # Mix Factor <- Is Camera Ray
+        soc_is_cam = _get_node_socket(lp_node.outputs, "Is Camera Ray", 0)
+        soc_mix_fac = _get_node_socket(mix_node.inputs, "Fac", 0)
+        if soc_is_cam and soc_mix_fac:
+            links.new(soc_is_cam, soc_mix_fac)
+
+        # Mix Shader 1 (Fac=0, Non-camera rays) <- Environment Lighting (Strength 0.0)
+        soc_env_out = _get_node_socket(env_bg.outputs, "Background", 0)
+        soc_mix_s1 = _get_node_socket(mix_node.inputs, 1, 1)
+        if soc_env_out and soc_mix_s1:
+            links.new(soc_env_out, soc_mix_s1)
+
+        # Mix Shader 2 (Fac=1, Camera rays) <- Camera Background (Full Color)
+        soc_cam_out = _get_node_socket(cam_bg.outputs, "Background", 0)
+        soc_mix_s2 = _get_node_socket(mix_node.inputs, 2, 2)
+        if soc_cam_out and soc_mix_s2:
+            links.new(soc_cam_out, soc_mix_s2)
+
+        # World Surface Output <- Mix Shader
+        soc_mix_out = _get_node_socket(mix_node.outputs, "Shader", 0)
+        soc_out_surface = _get_node_socket(out_node.inputs, "Surface", 0)
+        if soc_mix_out and soc_out_surface:
+            links.new(soc_mix_out, soc_out_surface)
+
+    # 5. Cycles Ray Visibility - completely disable indirect lighting hits on World
+    if hasattr(world, "cycles_visibility"):
+        world.cycles_visibility.diffuse = False
+        world.cycles_visibility.glossy = False
+        world.cycles_visibility.transmission = False
+        world.cycles_visibility.scatter = False
+        world.cycles_visibility.camera = True
+
+    # 6. Fallback World Color
+    if hasattr(world, "color"):
+        world.color = (bg_rgba[0], bg_rgba[1], bg_rgba[2])
+
+    return cam_bg
+
+
 def apply_white_studio_environment(context, mode: str = "LIGHT_WHITE"):
-    """Configures a pure white studio lighting and viewport environment."""
+    """Configures a pure white studio lighting and viewport environment with decoupled background."""
     scene = context.scene
     is_light = (mode == "LIGHT_WHITE")
     bg_rgb = (1.0, 1.0, 1.0) if is_light else (0.18, 0.19, 0.22)
-    bg_rgba = (bg_rgb[0], bg_rgb[1], bg_rgb[2], 1.0)
 
-    # 1. Scene World Setup with White Studio Background
+    # 1. Scene World Setup with White Studio Background (Decoupled Camera vs Object Lighting)
     world = scene.world
     if not world:
         world = bpy.data.worlds.new("Science_Blocks_Studio_World")
         scene.world = world
     world.use_nodes = True
-    nodes = world.node_tree.nodes
-    links = world.node_tree.links
-    nodes.clear()
+    if hasattr(world, "node_tree") and hasattr(world.node_tree, "nodes"):
+        world.node_tree.nodes.clear()
 
-    node_out = nodes.new("ShaderNodeOutputWorld")
-    node_out.location = (300, 0)
-    node_bg = nodes.new("ShaderNodeBackground")
-    node_bg.location = (0, 0)
-    node_bg.inputs["Color"].default_value = bg_rgba
-    node_bg.inputs["Strength"].default_value = 1.0 if is_light else 0.8
-    links.new(node_bg.outputs["Background"], node_out.inputs["Surface"])
+    setup_decoupled_world_background(world, bg_color=bg_rgb, camera_strength=1.0 if is_light else 0.8)
 
     # 2. Viewport Shading Configuration
     try:
@@ -3774,47 +4221,7 @@ def apply_white_studio_environment(context, mode: str = "LIGHT_WHITE"):
 
     # 4. Three-Point Studio Lighting Setup
     if is_light:
-        coll_name = "Science_Blocks_Studio_Lighting"
-        coll = bpy.data.collections.get(coll_name)
-        if not coll:
-            coll = bpy.data.collections.new(coll_name)
-            scene.collection.children.link(coll)
-
-        def setup_light(name, light_type, loc, rot_euler, energy, color):
-            light_obj = bpy.data.objects.get(name)
-            if not light_obj:
-                ldata = bpy.data.lights.new(name=name, type=light_type)
-                light_obj = bpy.data.objects.new(name, ldata)
-                coll.objects.link(light_obj)
-            else:
-                ldata = light_obj.data
-            ldata.energy = energy
-            ldata.color = color
-            light_obj.location = loc
-            light_obj.rotation_euler = rot_euler
-            return light_obj
-
-        # Key Light (warm soft front-left)
-        setup_light(
-            "Studio_Key_Light", "SUN",
-            (4.0, -4.0, 6.0),
-            (math.radians(45.0), math.radians(20.0), math.radians(35.0)),
-            2.5, (1.0, 0.98, 0.95),
-        )
-        # Fill Light (cool soft fill right)
-        setup_light(
-            "Studio_Fill_Light", "SUN",
-            (-4.0, -3.0, 4.0),
-            (math.radians(50.0), math.radians(-25.0), math.radians(-35.0)),
-            1.2, (0.92, 0.96, 1.0),
-        )
-        # Rim Light (crisp backlight from above rear)
-        setup_light(
-            "Studio_Rim_Light", "SUN",
-            (0.0, 5.0, 7.0),
-            (math.radians(130.0), 0.0, math.radians(180.0)),
-            1.8, (1.0, 1.0, 1.0),
-        )
+        ensure_studio_lighting(scene)
 
 
 def ensure_standard_materials():
@@ -4616,6 +5023,10 @@ def get_or_create_sci_jar_material(props) -> bpy.types.Material:
         n_bsdf.inputs["Base Color"].default_value = (tint[0], tint[1], tint[2], opacity)
         if "Alpha" in n_bsdf.inputs:
             n_bsdf.inputs["Alpha"].default_value = opacity
+        if "Metallic" in n_bsdf.inputs:
+            n_bsdf.inputs["Metallic"].default_value = getattr(props, "sci_jar_metallic", 0.10)
+        if "Roughness" in n_bsdf.inputs:
+            n_bsdf.inputs["Roughness"].default_value = getattr(props, "sci_jar_roughness", 0.15)
         if opacity < 0.98:
             if "Transmission Weight" in n_bsdf.inputs:
                 n_bsdf.inputs["Transmission Weight"].default_value = 1.0 - opacity
@@ -4696,6 +5107,62 @@ def get_or_create_sci_accent_material(props) -> bpy.types.Material:
     return mat
 
 
+def get_or_create_sci_sphere_material(props) -> bpy.types.Material:
+    """Creates or updates a high-grade PBR material for grinding media spheres."""
+    mat_name = "DEM_Shader_Solid"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    n_out = nodes.new("ShaderNodeOutputMaterial")
+    n_out.location = (300, 0)
+    n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    n_bsdf.location = (0, 0)
+    links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+
+    preset = getattr(props, "sci_sphere_preset", "STEEL").upper()
+    if preset == "CERAMIC":
+        base_color = (0.95, 0.95, 0.92, 1.0)
+        metallic = 0.0
+        roughness = 0.18
+        specular = 0.50
+    elif preset == "TUNGSTEN":
+        base_color = (0.24, 0.26, 0.28, 1.0)
+        metallic = 0.88
+        roughness = 0.25
+        specular = 0.50
+    elif preset == "CUSTOM":
+        c = getattr(props, "sci_sphere_color", (0.85, 0.88, 0.92))
+        base_color = (c[0], c[1], c[2], 1.0)
+        metallic = getattr(props, "sci_sphere_metallic", 0.95)
+        roughness = getattr(props, "sci_sphere_roughness", 0.12)
+        specular = getattr(props, "sci_sphere_specular", 0.50)
+    else:  # STEEL
+        base_color = (0.85, 0.88, 0.92, 1.0)
+        metallic = 0.95
+        roughness = 0.12
+        specular = 0.50
+
+    n_bsdf.inputs["Base Color"].default_value = base_color
+    if "Metallic" in n_bsdf.inputs:
+        n_bsdf.inputs["Metallic"].default_value = metallic
+    if "Roughness" in n_bsdf.inputs:
+        n_bsdf.inputs["Roughness"].default_value = roughness
+    if "Specular IOR Level" in n_bsdf.inputs:
+        n_bsdf.inputs["Specular IOR Level"].default_value = specular
+    elif "Specular" in n_bsdf.inputs:
+        n_bsdf.inputs["Specular"].default_value = specular
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "OPAQUE"
+
+    return mat
+
+
 def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
     """Engine core: applies publication background, object shaders, and viewport cavity to scene."""
     if bpy is None or context is None:
@@ -4714,6 +5181,13 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
             props.sci_jar_finish = "FROSTED_GLASS"
             props.sci_jar_color = (0.80, 0.92, 0.98)
             props.sci_jar_opacity = 0.28
+            props.sci_jar_metallic = 0.10
+            props.sci_jar_roughness = 0.12
+            props.sci_sphere_preset = "STEEL"
+            props.sci_sphere_color = (0.85, 0.88, 0.92)
+            props.sci_sphere_metallic = 0.95
+            props.sci_sphere_roughness = 0.12
+            props.sci_sphere_specular = 0.50
             props.sci_sun_wheel_color = (0.12, 0.14, 0.18)
             props.sci_sun_wheel_metallic = 0.70
             props.sci_sun_wheel_roughness = 0.35
@@ -4726,6 +5200,13 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
             props.sci_jar_finish = "ALUMINA_CERAMIC"
             props.sci_jar_color = (0.95, 0.95, 0.93)
             props.sci_jar_opacity = 0.60
+            props.sci_jar_metallic = 0.0
+            props.sci_jar_roughness = 0.22
+            props.sci_sphere_preset = "CERAMIC"
+            props.sci_sphere_color = (0.95, 0.95, 0.92)
+            props.sci_sphere_metallic = 0.0
+            props.sci_sphere_roughness = 0.18
+            props.sci_sphere_specular = 0.50
             props.sci_sun_wheel_color = (0.75, 0.77, 0.80)
             props.sci_sun_wheel_metallic = 0.85
             props.sci_sun_wheel_roughness = 0.30
@@ -4738,6 +5219,13 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
             props.sci_jar_finish = "STAINLESS_STEEL"
             props.sci_jar_color = (0.85, 0.86, 0.88)
             props.sci_jar_opacity = 1.0
+            props.sci_jar_metallic = 0.92
+            props.sci_jar_roughness = 0.18
+            props.sci_sphere_preset = "STEEL"
+            props.sci_sphere_color = (0.90, 0.92, 0.95)
+            props.sci_sphere_metallic = 0.98
+            props.sci_sphere_roughness = 0.08
+            props.sci_sphere_specular = 0.60
             props.sci_sun_wheel_color = (0.20, 0.22, 0.25)
             props.sci_sun_wheel_metallic = 0.90
             props.sci_sun_wheel_roughness = 0.25
@@ -4750,6 +5238,13 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
             props.sci_jar_finish = "FROSTED_GLASS"
             props.sci_jar_color = (0.10, 0.75, 0.95)
             props.sci_jar_opacity = 0.30
+            props.sci_jar_metallic = 0.10
+            props.sci_jar_roughness = 0.15
+            props.sci_sphere_preset = "TUNGSTEN"
+            props.sci_sphere_color = (0.24, 0.26, 0.28)
+            props.sci_sphere_metallic = 0.88
+            props.sci_sphere_roughness = 0.25
+            props.sci_sphere_specular = 0.50
             props.sci_sun_wheel_color = (0.08, 0.09, 0.12)
             props.sci_sun_wheel_metallic = 0.80
             props.sci_sun_wheel_roughness = 0.25
@@ -4762,6 +5257,13 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
             props.sci_jar_finish = "FROSTED_GLASS"
             props.sci_jar_color = (0.75, 0.90, 0.98)
             props.sci_jar_opacity = 0.25
+            props.sci_jar_metallic = 0.10
+            props.sci_jar_roughness = 0.12
+            props.sci_sphere_preset = "STEEL"
+            props.sci_sphere_color = (0.85, 0.88, 0.92)
+            props.sci_sphere_metallic = 0.95
+            props.sci_sphere_roughness = 0.12
+            props.sci_sphere_specular = 0.50
             props.sci_sun_wheel_color = (0.15, 0.17, 0.22)
             props.sci_sun_wheel_metallic = 0.75
             props.sci_sun_wheel_roughness = 0.35
@@ -4769,36 +5271,27 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
             props.sci_media_palette = "VIRIDIS"
             props.sci_viewport_cavity = True
 
-    # 2. Update World Background & Render Film Transparency
+    # 2. Update World Background & Render Film Transparency (Decoupled Camera vs Object Lighting)
     world = context.scene.world
     if not world:
         world = bpy.data.worlds.new("Science_Blocks_World")
         context.scene.world = world
 
-    world.use_nodes = True
-    ntree = world.node_tree
-    bg_node = None
-    out_node = None
-    for n in ntree.nodes:
-        if n.type == "BACKGROUND":
-            bg_node = n
-        elif n.type == "OUTPUT_WORLD":
-            out_node = n
-    if not bg_node:
-        bg_node = ntree.nodes.new("ShaderNodeBackground")
-        bg_node.location = (0, 0)
-    if not out_node:
-        out_node = ntree.nodes.new("ShaderNodeOutputWorld")
-        out_node.location = (300, 0)
-        ntree.links.new(bg_node.outputs["Background"], out_node.inputs["Surface"])
-
     bg_c = props.sci_background_color
-    bg_node.inputs["Color"].default_value = (bg_c[0], bg_c[1], bg_c[2], 1.0)
-    bg_node.inputs["Strength"].default_value = 1.0
-    if hasattr(world, "color"):
-        world.color = (bg_c[0], bg_c[1], bg_c[2])
+    setup_decoupled_world_background(world, bg_color=bg_c, camera_strength=1.0)
 
-    context.scene.render.film_transparent = props.sci_transparent_background
+    # 2.5 Ensure studio lighting is present so objects are crisply illuminated without background tint
+    has_light = False
+    if hasattr(context.scene, "objects"):
+        for ob in context.scene.objects:
+            if getattr(ob, "type", "") == "LIGHT":
+                has_light = True
+                break
+    if not has_light:
+        ensure_studio_lighting(context.scene)
+
+    if hasattr(context.scene, "render") and hasattr(context.scene.render, "film_transparent"):
+        context.scene.render.film_transparent = getattr(props, "sci_transparent_background", False)
 
     # 3. Viewport Shading Enhancement (Cavity + Ambient Occlusion)
     for screen in bpy.data.screens:
@@ -4811,7 +5304,7 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
                             shd.background_type = "WORLD"
                         if hasattr(shd, "background_color"):
                             shd.background_color = (bg_c[0], bg_c[1], bg_c[2])
-                        if props.sci_viewport_cavity:
+                        if getattr(props, "sci_viewport_cavity", False):
                             if hasattr(shd, "show_cavity"):
                                 shd.show_cavity = True
                                 shd.cavity_type = "BOTH"
@@ -4830,6 +5323,7 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
     jar_mat = get_or_create_sci_jar_material(props)
     carrier_mat = get_or_create_sci_carrier_material(props)
     accent_mat = get_or_create_sci_accent_material(props)
+    sphere_mat = get_or_create_sci_sphere_material(props)
 
     # Grinding Jars (main & side)
     jar_obj = props.jar_chamber_obj or bpy.data.objects.get("Jar_Chamber")
@@ -4856,6 +5350,22 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
         if m_obj:
             assign_material_to_object(m_obj, accent_mat)
 
+    # Media Spheres (PBR finish or Active Analytical Colormap)
+    active_colormap = getattr(props, "dem_viewport_colormap", "VELOCITY")
+    if active_colormap == "SOLID":
+        for coll_name in ("Science_Blocks_Milling_Media", "Science_Blocks_Side_Inspection"):
+            coll = bpy.data.collections.get(coll_name)
+            if coll:
+                for obj in coll.objects:
+                    if obj.name.startswith("DEM_Media_") or "Reference_DEM_Particle" in obj.name:
+                        assign_material_to_object(obj, sphere_mat)
+    else:
+        try:
+            from . import colormaps
+            colormaps.assign_dem_shader_to_particles(context, shader_mode=active_colormap)
+        except Exception:
+            pass
+
     # 5. Dynamic Recolor for Milling Media Particles
     try:
         from . import colormaps
@@ -4864,6 +5374,70 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
         pass
 
     return True
+
+
+class SCIENCE_BLOCKS_OT_set_sphere_finish(bpy.types.Operator):
+    """Quickly apply grinding media sphere finish preset (Steel, Ceramic, Tungsten, Custom)."""
+    bl_idname = "science_blocks.set_sphere_finish"
+    bl_label = "Set Sphere Finish"
+    bl_description = "Apply grinding media sphere finish preset (Steel, Ceramic, Tungsten, Custom)"
+
+    preset: bpy.props.EnumProperty(
+        name="Sphere Preset",
+        items=[
+            ("STEEL", "316L Bearing Steel", "Polished laboratory bearing steel"),
+            ("CERAMIC", "Alumina / Zirconia Ceramic", "White technical ceramic"),
+            ("TUNGSTEN", "Tungsten Carbide", "Dense gunmetal tungsten carbide"),
+            ("CUSTOM", "Custom Color & PBR", "Custom user-defined PBR finish"),
+        ],
+        default="STEEL",
+    )
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props:
+            props.sci_sphere_preset = self.preset
+            if hasattr(props, "dem_viewport_colormap"):
+                props.dem_viewport_colormap = "SOLID"
+            try:
+                from .properties import update_sphere_finish_preset
+                update_sphere_finish_preset(props, context)
+            except Exception:
+                pass
+        apply_scientific_paper_style(context)
+        self.report({"INFO"}, f"Science Blocks: Set sphere finish to {self.preset}.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_set_chamber_finish(bpy.types.Operator):
+    """Quickly apply chamber wall finish preset (Frosted Glass, Stainless Steel, Ceramic, Custom)."""
+    bl_idname = "science_blocks.set_chamber_finish"
+    bl_label = "Set Chamber Finish"
+    bl_description = "Apply chamber wall finish preset (Frosted Glass, Stainless Steel, Ceramic, Custom)"
+
+    finish: bpy.props.EnumProperty(
+        name="Chamber Finish",
+        items=[
+            ("FROSTED_GLASS", "Frosted Glass", "Semi-transparent frosted glass"),
+            ("STAINLESS_STEEL", "316L Stainless", "Polished stainless steel"),
+            ("ALUMINA_CERAMIC", "Alumina Ceramic", "White technical ceramic"),
+            ("CUSTOM", "Custom Tint & Opacity", "Custom tint and opacity"),
+        ],
+        default="FROSTED_GLASS",
+    )
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props:
+            props.sci_jar_finish = self.finish
+            try:
+                from .properties import update_jar_finish_preset
+                update_jar_finish_preset(props, context)
+            except Exception:
+                pass
+        apply_scientific_paper_style(context)
+        self.report({"INFO"}, f"Science Blocks: Set chamber finish to {self.finish}.")
+        return {"FINISHED"}
 
 
 class SCIENCE_BLOCKS_OT_apply_paper_colors(bpy.types.Operator):
@@ -5111,6 +5685,242 @@ class SCIENCE_BLOCKS_OT_toggle_analytical_color_strip(bpy.types.Operator):
 
         st = "Visible" if props.show_analytical_color_strip else "Hidden"
         self.report({"INFO"}, f"Science Blocks: 3D Analytical Color Strip is now {st}.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_reset_color_strip_transform(bpy.types.Operator):
+    """Resets the analytical color strip location, rotation, and scale to default values."""
+    bl_idname = "science_blocks.reset_color_strip_transform"
+    bl_label = "Reset Strip Transform"
+    bl_description = "Reset the 3D analytical color strip location, rotation, and scale to default"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+        props.strip_location = (0.35, 0.0, -0.15)
+        props.strip_rotation = (0.0, 0.0, 0.0)
+        props.strip_scale = (1.0, 1.0, 1.0)
+        props.strip_scale_uniform = 1.0
+        props.strip_relative_to_jar = True
+
+        try:
+            from . import colormaps
+            colormaps.apply_strip_transform(context)
+        except Exception:
+            try:
+                import colormaps
+                colormaps.apply_strip_transform(context)
+            except Exception:
+                pass
+
+        self.report({"INFO"}, "Science Blocks: Color strip transform reset to defaults.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_set_color_strip_text_color(bpy.types.Operator):
+    """Sets the color of analytical color strip text and readouts to White or Black."""
+    bl_idname = "science_blocks.set_color_strip_text_color"
+    bl_label = "Set Strip Text Color"
+    bl_description = "Switch analytical strip text color between White and Black for optimal contrast"
+
+    text_color: bpy.props.StringProperty(name="Text Color", default="WHITE")
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        mode = self.text_color.upper() if self.text_color else "WHITE"
+        if mode not in ("WHITE", "BLACK"):
+            mode = "WHITE"
+        if props:
+            props.strip_text_color = mode
+
+        try:
+            from . import colormaps
+        except (ImportError, ValueError):
+            import colormaps
+
+        colormaps.apply_strip_text_color(context, color_choice=mode)
+        self.report({"INFO"}, f"Science Blocks: Color strip text color set to {mode.capitalize()}.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_sync_strip_transform_from_viewport(bpy.types.Operator):
+    """Synchronizes UI transform properties from the DEM_Analytical_Data_Strip object in the 3D viewport."""
+    bl_idname = "science_blocks.sync_strip_transform_from_viewport"
+    bl_label = "Sync from 3D Viewport"
+    bl_description = "Capture current location, rotation, and scale from the 3D viewport object into UI properties and save"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        active_ob = getattr(context, "active_object", None)
+        if not active_ob and hasattr(context, "view_layer") and hasattr(context.view_layer, "objects"):
+            active_ob = getattr(context.view_layer.objects, "active", None)
+
+        root_obj = None
+        if active_ob and hasattr(active_ob, "name") and (active_ob.name == "DEM_Analytical_Data_Strip" or active_ob.name.startswith("DEM_Analytical_Data_Strip")):
+            root_obj = active_ob
+        else:
+            root_obj = bpy.data.objects.get("DEM_Analytical_Data_Strip")
+            if not root_obj:
+                all_objs = bpy.data.objects.values() if hasattr(bpy.data.objects, "values") else bpy.data.objects
+                for item in all_objs:
+                    obj = item if hasattr(item, "name") else bpy.data.objects.get(item)
+                    if obj and hasattr(obj, "name") and obj.name.startswith("DEM_Analytical_Data_Strip"):
+                        root_obj = obj
+                        break
+
+        if not props or not root_obj:
+            self.report({"WARNING"}, "No 'DEM_Analytical_Data_Strip' object found in scene.")
+            return {"CANCELLED"}
+
+        loc_x, loc_y, loc_z = float(root_obj.location[0]), float(root_obj.location[1]), float(root_obj.location[2])
+        if getattr(props, "strip_relative_to_jar", True):
+            jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+            if jar_obj and hasattr(jar_obj, "location"):
+                loc_x -= float(jar_obj.location[0])
+                loc_y -= float(jar_obj.location[1])
+                loc_z -= float(jar_obj.location[2])
+
+        props.strip_location = (loc_x, loc_y, loc_z)
+
+        # Convert Euler rotation in radians to degrees
+        rot_e = root_obj.rotation_euler
+        props.strip_rotation = (
+            math.degrees(float(rot_e[0])),
+            math.degrees(float(rot_e[1])),
+            math.degrees(float(rot_e[2])),
+        )
+
+        # Scale
+        props.strip_scale = (float(root_obj.scale[0]), float(root_obj.scale[1]), float(root_obj.scale[2]))
+        props.strip_scale_uniform = 1.0
+
+        # Apply synced transforms across all color strips in the scene
+        try:
+            from . import colormaps
+            colormaps.apply_strip_transform(context)
+        except Exception:
+            try:
+                import colormaps
+                colormaps.apply_strip_transform(context)
+            except Exception:
+                pass
+
+        self.report({"INFO"}, f"Science Blocks: Synced transform from viewport object to all strips (Loc: {loc_x:.2f}, {loc_y:.2f}, {loc_z:.2f}).")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_align_strip_to_camera(bpy.types.Operator):
+    """Rotates the analytical color strip so it faces directly towards the active scene camera."""
+    bl_idname = "science_blocks.align_strip_to_camera"
+    bl_label = "Align Strip to Camera"
+    bl_description = "Rotate the analytical color strip to squarely face the active camera for clean visual presentation"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        strip_objs = []
+        all_objs = bpy.data.objects.values() if hasattr(bpy.data.objects, "values") else bpy.data.objects
+        for item in all_objs:
+            obj = item if hasattr(item, "name") else bpy.data.objects.get(item)
+            if obj and hasattr(obj, "name"):
+                if obj.name == "DEM_Analytical_Data_Strip" or obj.name.startswith("DEM_Analytical_Data_Strip"):
+                    strip_objs.append(obj)
+        cam_obj = getattr(context.scene, "camera", None)
+
+        if not strip_objs:
+            self.report({"WARNING"}, "No 'DEM_Analytical_Data_Strip' object found in scene.")
+            return {"CANCELLED"}
+
+        if not cam_obj:
+            if props:
+                props.strip_rotation = (0.0, 0.0, 0.0)
+            for root_obj in strip_objs:
+                root_obj.rotation_mode = "XYZ"
+                root_obj.rotation_euler = (0.0, 0.0, 0.0)
+            self.report({"INFO"}, "Science Blocks: No active camera; aligned color strip to default front view.")
+            return {"FINISHED"}
+
+        cam_rot = cam_obj.rotation_euler
+        if props:
+            props.strip_rotation = (
+                math.degrees(float(cam_rot[0])),
+                math.degrees(float(cam_rot[1])),
+                math.degrees(float(cam_rot[2])),
+            )
+
+        try:
+            from . import colormaps
+            colormaps.apply_strip_transform(context)
+        except Exception:
+            try:
+                import colormaps
+                colormaps.apply_strip_transform(context)
+            except Exception:
+                pass
+
+        self.report({"INFO"}, "Science Blocks: Analytical color strip aligned to active camera.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_export_color_strip_png(bpy.types.Operator):
+    """Exports a high-resolution, publication-ready PNG figure of the active analytical color strip and simulation data."""
+    bl_idname = "science_blocks.export_color_strip_png"
+    bl_label = "Export Publication Color Strip PNG"
+    bl_description = "Generate and save a publication-grade scientific figure of the analytical color strip for research papers"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        try:
+            from . import colormaps
+        except (ImportError, ValueError):
+            import colormaps
+
+        try:
+            out_file = colormaps.export_color_strip_publication_png(context=context)
+            self.report({"INFO"}, f"Science Blocks: Publication figure exported to '{out_file}'.")
+            return {"FINISHED"}
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to export color strip PNG: {e}")
+            return {"CANCELLED"}
+
+
+class SCIENCE_BLOCKS_OT_open_figures_folder(bpy.types.Operator):
+    """Opens the directory containing exported publication figures in the system file browser."""
+    bl_idname = "science_blocks.open_figures_folder"
+    bl_label = "Open Figures Folder"
+    bl_description = "Open the target folder containing exported figures in the file manager"
+
+    def execute(self, context):
+        import sys
+        props = getattr(context.scene, "science_blocks_props", None)
+        export_dir = getattr(props, "strip_export_dir", "//figures") if props else "//figures"
+
+        if export_dir.startswith("//"):
+            blend_path = bpy.data.filepath if (bpy and hasattr(bpy.data, "filepath") and bpy.data.is_saved) else ""
+            if blend_path:
+                target_dir = os.path.join(os.path.dirname(blend_path), export_dir[2:])
+            else:
+                target_dir = os.path.abspath(os.path.join(".", export_dir[2:]))
+        else:
+            target_dir = os.path.abspath(export_dir)
+
+        os.makedirs(target_dir, exist_ok=True)
+
+        try:
+            if hasattr(bpy.ops.wm, "path_open"):
+                bpy.ops.wm.path_open(filepath=target_dir)
+            elif sys.platform.startswith("darwin"):
+                import subprocess
+                subprocess.Popen(["open", target_dir])
+            elif sys.platform.startswith("win"):
+                os.startfile(target_dir)
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", target_dir])
+            self.report({"INFO"}, f"Opened folder: {target_dir}")
+        except Exception as e:
+            self.report({"INFO"}, f"Figures directory: {target_dir}")
+
         return {"FINISHED"}
 
 

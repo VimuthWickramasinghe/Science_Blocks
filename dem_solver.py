@@ -70,6 +70,7 @@ class PlanetaryDEMResult:
         self.rotations = np.zeros((frames, ball_count, 3), dtype=np.float32)
         self.angular_velocities = np.zeros((frames, ball_count, 3), dtype=np.float32)
         self.forces = np.zeros((frames, ball_count), dtype=np.float32)
+        self.impact_forces = np.zeros((frames, ball_count), dtype=np.float32)
         self.ball_radii = np.zeros(ball_count, dtype=np.float64)
         self.ball_masses = np.zeros(ball_count, dtype=np.float64)
 
@@ -942,6 +943,7 @@ def solve_planetary_dem(
         nonlocal impact_count, impacts_in_this_frame
         fn_val = float(jn / max(1e-6, dt))
         frame_forces[idx] = max(frame_forces[idx], fn_val)
+        frame_impact_forces[idx] = max(frame_impact_forces[idx], fn_val)
 
         impact_count += 1
         impacts_in_this_frame += 1
@@ -987,6 +989,7 @@ def solve_planetary_dem(
         res.frame_rpms[f] = float(frame_rpm_val)
 
         frame_forces = np.zeros(ball_count, dtype=np.float32)
+        frame_impact_forces = np.zeros(ball_count, dtype=np.float32)
         impacts_in_this_frame = 0
 
         for _ in range(substeps_per_frame):
@@ -1326,17 +1329,22 @@ def solve_planetary_dem(
                                 s_n = 2.0 * e_star * math.sqrt(r_star * max(1e-6, overlap))
                                 gamma_n = -2.0 * math.sqrt(5.0 / 6.0) * beta * math.sqrt(s_n * m_eff)
                                 fn = (4.0 / 3.0) * e_star * math.sqrt(r_star) * (overlap**1.5) - gamma_n * v_rel_norm
-                                frame_forces[i] = max(frame_forces[i], float(abs(fn)))
-                                frame_forces[j] = max(frame_forces[j], float(abs(fn)))
+                                fn_hit = float(abs(fn))
+                                frame_forces[i] = max(frame_forces[i], fn_hit)
+                                frame_forces[j] = max(frame_forces[j], fn_hit)
+                                frame_impact_forces[i] = max(frame_impact_forces[i], fn_hit)
+                                frame_impact_forces[j] = max(frame_impact_forces[j], fn_hit)
                                 impulse = max(0.0, fn) * dt
                                 max_impulse = (1.0 + rest_eff) * abs(v_rel_norm) * m_eff
                                 impulse = min(impulse, max_impulse)
                                 vel[i] += normal * (impulse / masses[i])
                                 vel[j] -= normal * (impulse / masses[j])
                             else:
-                                fn_ball = m_eff * (1.0 + restitution) * abs(v_rel_norm) / max(1e-6, dt)
-                                frame_forces[i] = max(frame_forces[i], float(fn_ball))
-                                frame_forces[j] = max(frame_forces[j], float(fn_ball))
+                                fn_ball = float(m_eff * (1.0 + restitution) * abs(v_rel_norm) / max(1e-6, dt))
+                                frame_forces[i] = max(frame_forces[i], fn_ball)
+                                frame_forces[j] = max(frame_forces[j], fn_ball)
+                                frame_impact_forces[i] = max(frame_impact_forces[i], fn_ball)
+                                frame_impact_forces[j] = max(frame_impact_forces[j], fn_ball)
                                 impulse = (1.0 + restitution) * abs(v_rel_norm) * m_eff
                                 vel[i] += normal * (impulse / masses[i])
                                 vel[j] -= normal * (impulse / masses[j])
@@ -1372,6 +1380,7 @@ def solve_planetary_dem(
 
         # Frame summary recording
         res.forces[f, :] = frame_forces
+        res.impact_forces[f, :] = frame_impact_forces
         t_frame = float(f + 1) * dt_frame
         res.frame_times.append(t_frame)
         res.frame_impact_counts.append(impacts_in_this_frame)
@@ -1583,9 +1592,20 @@ def instantiate_dem_particles_in_blender(
     # -------------------------------------------------------------------------
     orig_frame = context.scene.frame_current
     dt = 1.0 / max(1.0, result.fps)
-    max_v = float(np.max(np.linalg.norm(result.velocities, axis=2))) if (hasattr(result, "velocities") and result.velocities is not None and result.velocities.size and np.max(np.linalg.norm(result.velocities, axis=2)) > 0) else 5.5
-    max_f = float(np.max(result.forces)) if (hasattr(result, "forces") and result.forces is not None and result.forces.size and np.max(result.forces) > 0) else 100.0
-    max_w = float(np.max(np.linalg.norm(result.angular_velocities, axis=2))) if (hasattr(result, "angular_velocities") and result.angular_velocities is not None and result.angular_velocities.size and np.max(result.angular_velocities) > 0) else 100.0
+    v_mags = np.linalg.norm(result.velocities, axis=2) if (hasattr(result, "velocities") and result.velocities is not None and result.velocities.size) else None
+    max_v = float(np.max(v_mags)) if (v_mags is not None and np.max(v_mags) > 1e-4) else 5.5
+
+    f_arr = result.forces if (hasattr(result, "forces") and result.forces is not None and result.forces.size) else None
+    max_f = float(np.max(f_arr)) if (f_arr is not None and np.max(f_arr) > 1e-4) else 100.0
+
+    imp_arr = getattr(result, "impact_forces", None)
+    if imp_arr is None or not imp_arr.size:
+        imp_arr = f_arr
+    max_imp_f = float(np.max(imp_arr)) if (imp_arr is not None and np.max(imp_arr) > 1e-4) else max_f
+
+    w_mags = np.linalg.norm(result.angular_velocities, axis=2) if (hasattr(result, "angular_velocities") and result.angular_velocities is not None and result.angular_velocities.size) else None
+    max_w = float(np.max(w_mags)) if (w_mags is not None and np.max(w_mags) > 1e-4) else 10.0
+
     max_e = (0.5 * max(result.ball_masses) * (max_v**2)) if (hasattr(result, "ball_masses") and len(result.ball_masses)) else 0.1
 
     for f in range(frames):
@@ -1609,19 +1629,23 @@ def instantiate_dem_particles_in_blender(
             if bake_colors:
                 vel_vec = result.velocities[f, i, :]
                 v_mag = float(np.linalg.norm(vel_vec))
-                v_norm = min(1.0, max(0.0, v_mag / max(0.1, max_v)))
+                v_norm = min(1.0, max(0.0, v_mag / max(1e-4, max_v)))
 
-                f_val = float(result.forces[f, i]) if (hasattr(result, "forces") and result.forces is not None and result.forces.shape[0] > f and result.forces.shape[1] > i) else 0.0
-                f_norm = min(1.0, max(0.0, f_val / max(1.0, max_f)))
+                # Dynamic Impact Force: Strictly 0.0 N during free fall; spikes on sphere-sphere & sphere-wall collisions
+                if hasattr(result, "impact_forces") and result.impact_forces is not None and result.impact_forces.shape[0] > f and result.impact_forces.shape[1] > i:
+                    f_val = float(result.impact_forces[f, i])
+                else:
+                    f_val = float(result.forces[f, i]) if (hasattr(result, "forces") and result.forces is not None and result.forces.shape[0] > f and result.forces.shape[1] > i) else 0.0
+                f_norm = min(1.0, max(0.0, f_val / max(1e-4, max_imp_f)))
 
                 e_kin = 0.5 * result.ball_masses[i] * (v_mag**2) if i < len(result.ball_masses) else 0.0
                 e_norm = min(1.0, max(0.0, e_kin / max(1e-4, max_e)))
 
                 w_vec = result.angular_velocities[f, i, :] if (hasattr(result, "angular_velocities") and result.angular_velocities is not None and result.angular_velocities.shape[0] > f and result.angular_velocities.shape[1] > i) else [0, 0, 0]
                 w_mag = float(np.linalg.norm(w_vec))
-                w_norm = min(1.0, max(0.0, w_mag / max(1.0, max_w)))
+                w_norm = min(1.0, max(0.0, w_mag / max(1e-4, max_w)))
 
-                # Encodes: Red=Velocity, Green=Force, Blue=Energy, Alpha=Spin
+                # Encodes: Red=Velocity, Green=Dynamic Impact Force, Blue=Energy, Alpha=Spin
                 ball.color = (v_norm, f_norm, e_norm, w_norm)
                 ball.keyframe_insert(data_path="color", frame=frame_num)
 
@@ -1636,13 +1660,18 @@ def instantiate_dem_particles_in_blender(
     except Exception:
         pass
 
-    # Ensure 3D viewport shading shows materials
+    # Ensure 3D viewport shading shows materials and shader color ramps
     try:
         for area in context.screen.areas:
             if area.type == "VIEW_3D":
                 for space in area.spaces:
                     if space.type == "VIEW_3D":
-                        space.shading.color_type = "OBJECT"
+                        if hasattr(space, "shading"):
+                            if hasattr(space.shading, "type"):
+                                space.shading.type = "MATERIAL"
+                            if hasattr(space.shading, "color_type"):
+                                space.shading.color_type = "MATERIAL"
+                area.tag_redraw()
     except Exception:
         pass
 
