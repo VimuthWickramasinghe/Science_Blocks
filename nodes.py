@@ -190,6 +190,13 @@ class ScienceBlocksRPMValueNode(bpy.types.Node):
     rpm_start: FloatProperty(name="Start RPM", default=0.0)
     rpm_end: FloatProperty(name="End RPM", default=300.0)
     ramp_duration: FloatProperty(name="Duration (s)", default=5.0, min=0.1)
+    settle_delay: FloatProperty(
+        name="Settle Time (s)",
+        default=1.0,
+        min=0.0,
+        max=60.0,
+        description="Pre-simulation settling time in seconds where rotation is held at 0 RPM before motion begins",
+    )
     sine_amplitude: FloatProperty(name="Amplitude", default=50.0)
     sine_frequency: FloatProperty(name="Freq (Hz)", default=0.5, min=0.01)
     custom_expression: StringProperty(
@@ -198,12 +205,22 @@ class ScienceBlocksRPMValueNode(bpy.types.Node):
         description="Python math expression using variable 't' (seconds)",
     )
 
+    @property
+    def settle_seconds(self) -> float:
+        return self.settle_delay
+
+    @settle_seconds.setter
+    def settle_seconds(self, val: float):
+        self.settle_delay = float(val)
+
     def init(self, context):
         self.outputs.new("ScienceBlocksRPMSocket", "RPM")
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "mode", text="")
         col = layout.column(align=True)
+        col.prop(self, "settle_delay", text="Settle Delay (s)", icon="TIME")
+
         if self.mode == "CONSTANT":
             col.prop(self, "rpm_constant")
         elif self.mode == "RAMP":
@@ -218,21 +235,71 @@ class ScienceBlocksRPMValueNode(bpy.types.Node):
             col.prop(self, "custom_expression", text="")
             col.label(text="Variable: 't' (time in seconds)", icon="INFO")
 
+        # Show live instantaneous RPM readout for user feedback
+        t_cur = getattr(getattr(context, "scene", None), "science_blocks_props", None) if context else None
+        t_val = getattr(t_cur, "kinematics_live_time", 0.0) if t_cur else 0.0
+        r_cur = self.evaluate(t_val)
+        s_del = getattr(self, "settle_delay", 1.0)
+        if t_val < s_del:
+            col.label(text=f"Settling: 0.0 RPM (t={t_val:.2f}s < {s_del:.1f}s)", icon="PAUSE")
+        else:
+            col.label(text=f"Live: {r_cur:.1f} RPM (t={t_val:.2f}s)", icon="TIME")
+
     def evaluate(self, t: float) -> float:
+        s_del = getattr(self, "settle_delay", 1.0)
+        if t < s_del:
+            return 0.0
+        t_rot = t - s_del
         if self.mode == "CONSTANT":
             return self.rpm_constant
         elif self.mode == "RAMP":
-            prog = max(0.0, min(1.0, t / max(0.001, self.ramp_duration)))
+            prog = max(0.0, min(1.0, t_rot / max(0.001, self.ramp_duration)))
             return self.rpm_start + prog * (self.rpm_end - self.rpm_start)
         elif self.mode == "SINE":
-            return self.rpm_constant + self.sine_amplitude * math.sin(2.0 * math.pi * self.sine_frequency * t)
+            return self.rpm_constant + self.sine_amplitude * math.sin(2.0 * math.pi * self.sine_frequency * t_rot)
         elif self.mode == "CUSTOM_EXPR":
-            safe_dict = {"math": math, "sin": math.sin, "cos": math.cos, "pi": math.pi, "t": t}
+            safe_dict = {"math": math, "sin": math.sin, "cos": math.cos, "pi": math.pi, "t": t_rot}
             try:
                 return float(eval(self.custom_expression, {"__builtins__": {}}, safe_dict))
             except Exception:
                 return 0.0
         return self.rpm_constant
+
+    def evaluate_integrated_revolutions(self, t: float) -> float:
+        """Returns total revolutions from 0 to t: integral of (RPM(t') / 60) dt'."""
+        s_del = getattr(self, "settle_delay", 1.0)
+        if t <= s_del:
+            return 0.0
+        t_rot = t - s_del
+        if self.mode == "CONSTANT":
+            return (self.rpm_constant / 60.0) * t_rot
+        elif self.mode == "RAMP":
+            r0 = float(self.rpm_start)
+            r1 = float(self.rpm_end)
+            T = max(0.001, float(self.ramp_duration))
+            if t_rot <= T:
+                # Average RPM over [0, t_rot] is r0 + 0.5 * (r1 - r0) * (t_rot / T)
+                mean_rpm = r0 + 0.5 * (r1 - r0) * (t_rot / T)
+                return (mean_rpm / 60.0) * t_rot
+            else:
+                # Ramp up to T, plus constant r1 for remainder
+                ramp_revs = (0.5 * (r0 + r1) / 60.0) * T
+                const_revs = (r1 / 60.0) * (t_rot - T)
+                return ramp_revs + const_revs
+        elif self.mode == "SINE":
+            base_revs = (self.rpm_constant / 60.0) * t_rot
+            f = max(0.001, float(self.sine_frequency))
+            sine_revs = (self.sine_amplitude / 60.0) * (1.0 - math.cos(2.0 * math.pi * f * t_rot)) / (2.0 * math.pi * f)
+            return base_revs + sine_revs
+        elif self.mode == "CUSTOM_EXPR":
+            n_samples = 30
+            dt = t_rot / n_samples
+            total_rpm_dt = 0.0
+            for i in range(n_samples):
+                t_mid = (i + 0.5) * dt
+                total_rpm_dt += self.evaluate(s_del + t_mid) * dt
+            return total_rpm_dt / 60.0
+        return (self.rpm_constant / 60.0) * t_rot
 
 
 class ScienceBlocksGearRatioNode(bpy.types.Node):
@@ -422,13 +489,13 @@ class ScienceBlocksRotationNode(bpy.types.Node):
         """Resolves target object from linked input socket or internal pointer."""
         if "Object In" in self.inputs and self.inputs["Object In"].is_linked:
             from_node = self.inputs["Object In"].links[0].from_node
-            if hasattr(from_node, "target_object") and from_node.target_object:
-                return from_node.target_object
+            if hasattr(from_node, "target_object") and getattr(from_node, "target_object", None):
+                return getattr(from_node, "target_object", None)
             if hasattr(from_node, "get_target_object"):
                 obj = from_node.get_target_object()
                 if obj:
                     return obj
-        return self.target_object
+        return getattr(self, "target_object", None)
 
     def draw_buttons(self, context, layout):
         col = layout.column(align=True)
@@ -500,13 +567,13 @@ class ScienceBlocksOrbitNode(bpy.types.Node):
     def get_target_object(self):
         if "Object In" in self.inputs and self.inputs["Object In"].is_linked:
             from_node = self.inputs["Object In"].links[0].from_node
-            if hasattr(from_node, "target_object") and from_node.target_object:
-                return from_node.target_object
+            if hasattr(from_node, "target_object") and getattr(from_node, "target_object", None):
+                return getattr(from_node, "target_object", None)
             if hasattr(from_node, "get_target_object"):
                 obj = from_node.get_target_object()
                 if obj:
                     return obj
-        return self.target_object
+        return getattr(self, "target_object", None)
 
     def get_center_object(self):
         if "Center In" in self.inputs and self.inputs["Center In"].is_linked:
@@ -677,6 +744,7 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Sun Mechanism")
         self.inputs.new("ScienceBlocksObjectSocket", "Jar Chamber")
+        self.inputs.new("ScienceBlocksObjectSocket", "Source Tap / Plane")
         self.inputs.new("ScienceBlocksRPMSocket", "Drive RPM")
         self.inputs.new("ScienceBlocksRPMSocket", "Jar RPM")
         self.inputs.new("ScienceBlocksPhysicsSocket", "Ball Physics")
@@ -733,6 +801,37 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
                 r_scale.prop(self, "stl_scale", text="Facet Scale")
                 if getattr(self, "stl_scale", 1.0) == 0.001:
                     r_scale.label(text="mm -> m")
+
+        # Source Tap / Plane status and placement
+        sock_tap = self.inputs.get("Source Tap / Plane")
+        from_tap = None
+        if sock_tap and sock_tap.is_linked:
+            try:
+                from .operators import resolve_object_from_socket
+                from_tap = resolve_object_from_socket(sock_tap)
+            except Exception:
+                try:
+                    from operators import resolve_object_from_socket
+                    from_tap = resolve_object_from_socket(sock_tap)
+                except Exception:
+                    pass
+
+        row_tap = col.row(align=True)
+        tap_in_scene = False
+        if hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
+            if hasattr(bpy.data.objects, "get"):
+                tap_in_scene = bool(bpy.data.objects.get("Particle_Tap_Inlet"))
+            elif isinstance(bpy.data.objects, dict):
+                tap_in_scene = "Particle_Tap_Inlet" in bpy.data.objects
+
+        if from_tap:
+            row_tap.label(text=f"Tap: {from_tap.name}", icon="SNAP_GRID")
+        elif tap_in_scene:
+            row_tap.label(text="Tap: Particle_Tap_Inlet", icon="CHECKMARK")
+        else:
+            row_tap.label(text="Source: Auto Top Tap", icon="CON_LOCLIKE")
+        row_tap.operator("science_blocks.create_particle_source_plane", text="Place Tap", icon="ADD")
+
         col.separator(factor=0.3)
         props = getattr(context.scene, "science_blocks_props", None)
         is_baking = getattr(props, "dem_is_baking", False) if props else False
@@ -762,6 +861,18 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
             btn_text = "Re-Bake DEM Simulation" if getattr(props, "dem_is_simulated", False) else "Bake DEM Simulation"
             btn_icon = "CHECKMARK" if getattr(props, "dem_is_simulated", False) else "PHYSICS"
             row_b.operator("science_blocks.run_dem_simulation", text=btn_text, icon=btn_icon)
+
+            if getattr(props, "dem_is_simulated", False):
+                col.separator(factor=0.3)
+                try:
+                    from .colormaps import draw_analytical_data_strip_ui
+                    draw_analytical_data_strip_ui(col, context, active_mode=getattr(props, "dem_viewport_colormap", "VELOCITY"))
+                except Exception:
+                    try:
+                        from colormaps import draw_analytical_data_strip_ui
+                        draw_analytical_data_strip_ui(col, context, active_mode=getattr(props, "dem_viewport_colormap", "VELOCITY"))
+                    except Exception:
+                        pass
 
 
 class ScienceBlocksSensorNode(bpy.types.Node):
@@ -814,6 +925,7 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         items=[
             ("VELOCITY", "Velocity Magnitude (Heatmap)", "Rainbow color spectrum from pinned to cataracting"),
             ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
+            ("ACCELERATION", "Acceleration (m/s², g-force)", "Color particles by instantaneous impact acceleration in m/s² and g-force"),
             ("ENERGY", "Impact Kinetic Energy", "Highlight high shock particles"),
             ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s)"),
             ("SOLID", "Solid Realistic Material", "Metallic/ceramic rendering"),
@@ -842,6 +954,17 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         row_b = col.row(align=True)
         row_b.scale_y = 1.25
         row_b.operator("science_blocks.apply_particle_colormap", text="Apply Colormap (Post-Process)", icon="COLOR")
+
+        # Particle Analytical Data Strip and Shader Editor integration
+        try:
+            from .colormaps import draw_analytical_data_strip_ui
+            draw_analytical_data_strip_ui(col, context, active_mode=getattr(self, "colormap_mode", "VELOCITY"))
+        except Exception:
+            try:
+                from colormaps import draw_analytical_data_strip_ui
+                draw_analytical_data_strip_ui(col, context, active_mode=getattr(self, "colormap_mode", "VELOCITY"))
+            except Exception:
+                pass
 
         props = getattr(context.scene, "science_blocks_props", None)
         is_baking = getattr(props, "dem_is_baking", False) if props else False
@@ -1037,7 +1160,7 @@ def get_input_rpm(node, socket_name: str, t: float) -> float:
                 for other_node in from_node.id_data.nodes:
                     if isinstance(other_node, ScienceBlocksRotationNode):
                         tgt = other_node.get_target_object()
-                        if tgt and ("Sun" in tgt.name or "Wheel" in tgt.name or other_node.label.startswith("Sun")):
+                        if tgt and ("Sun" in tgt.name or "Wheel" in tgt.name or getattr(other_node, "label", "").startswith("Sun")):
                             dir_m = -1.0 if other_node.direction == "CW" else 1.0
                             in_val = abs(in_val) * dir_m
                             break
@@ -1051,6 +1174,134 @@ def get_input_rpm(node, socket_name: str, t: float) -> float:
         return abs(base_rpm) * dir_mult
 
     return getattr(sock, "default_value", 0.0)
+
+
+def get_effective_settle_delay(node) -> float:
+    """Finds configured settle delay from node property, upstream RPM node, or scene default."""
+    if hasattr(node, "settle_delay") and getattr(node, "settle_delay", None) is not None:
+        return float(getattr(node, "settle_delay", 1.0))
+    if hasattr(bpy, "data") and hasattr(bpy.data, "scenes") and bpy.data.scenes:
+        for scn in bpy.data.scenes:
+            p = getattr(scn, "science_blocks_props", None)
+            if p and hasattr(p, "dem_settle_delay_s"):
+                return float(p.dem_settle_delay_s)
+    if hasattr(bpy, "context") and hasattr(bpy.context, "scene"):
+        p = getattr(bpy.context.scene, "science_blocks_props", None)
+        if p and hasattr(p, "dem_settle_delay_s"):
+            return float(p.dem_settle_delay_s)
+    return 1.0
+
+
+def get_input_integrated_angle(node, socket_name: str, t: float) -> float:
+    """Computes continuous integrated rotation angle in radians: theta(t) = integral_0^t omega(t') dt'.
+
+    Guarantees mathematically exact rotation for constant RPM, linear ramps, sine oscillations, and expressions.
+    """
+    if not node or socket_name not in node.inputs:
+        return 0.0
+
+    sock = node.inputs[socket_name]
+    if not sock.is_linked or not sock.links:
+        val = getattr(sock, "default_value", 0.0)
+        s_del = get_effective_settle_delay(node)
+        t_rot = max(0.0, t - s_del)
+        return (val * 2.0 * math.pi / 60.0) * t_rot
+
+    from_node = sock.links[0].from_node
+
+    if isinstance(from_node, ScienceBlocksRPMValueNode):
+        return from_node.evaluate_integrated_revolutions(t) * 2.0 * math.pi
+    elif isinstance(from_node, ScienceBlocksGearRatioNode):
+        in_angle = get_input_integrated_angle(from_node, "RPM In", t)
+        rpm_in_sock = from_node.inputs.get("RPM In")
+        if rpm_in_sock and rpm_in_sock.is_linked:
+            src = rpm_in_sock.links[0].from_node
+            if not isinstance(src, ScienceBlocksRotationNode) and from_node.id_data:
+                for other_node in from_node.id_data.nodes:
+                    if isinstance(other_node, ScienceBlocksRotationNode):
+                        tgt = other_node.get_target_object()
+                        if tgt and ("Sun" in tgt.name or "Wheel" in tgt.name or getattr(other_node, "label", "").startswith("Sun")):
+                            dir_m = -1.0 if other_node.direction == "CW" else 1.0
+                            in_angle = abs(in_angle) * dir_m
+                            break
+        base_ratio = from_node.gear_ratio if from_node.calc_mode == "RATIO" else (from_node.teeth_in / max(1, from_node.teeth_out))
+        if from_node.invert_direction:
+            base_ratio = -base_ratio
+        return in_angle * base_ratio
+    elif isinstance(from_node, ScienceBlocksRotationNode):
+        in_angle = get_input_integrated_angle(from_node, "RPM", t)
+        dir_mult = -1.0 if from_node.direction == "CW" else 1.0
+        return abs(in_angle) * dir_mult
+    elif isinstance(from_node, ScienceBlocksOffsetNode):
+        return get_input_integrated_angle(from_node, "Value In", t)
+
+    val = getattr(sock, "default_value", 0.0)
+    s_del = get_effective_settle_delay(node)
+    t_rot = max(0.0, t - s_del)
+    return (val * 2.0 * math.pi / 60.0) * t_rot
+
+
+def get_rpm_source_profile(node, socket_name: str) -> dict:
+    """Discovers and resolves RPM source characteristics (CONSTANT, RAMP, settle_delay, etc.) by tracing upstream wiring."""
+    default_profile = {
+        "mode": "CONSTANT",
+        "rpm_constant": 0.0,
+        "rpm_start": 0.0,
+        "rpm_end": 0.0,
+        "ramp_duration": 5.0,
+        "settle_delay": 1.0,
+        "direction_sign": 1.0,
+    }
+    if not node or socket_name not in node.inputs:
+        return default_profile
+
+    sock = node.inputs[socket_name]
+    if not sock.is_linked or not sock.links:
+        v = float(getattr(sock, "default_value", 0.0))
+        default_profile["rpm_constant"] = v
+        default_profile["rpm_start"] = v
+        default_profile["rpm_end"] = v
+        return default_profile
+
+    from_node = sock.links[0].from_node
+
+    if isinstance(from_node, ScienceBlocksRPMValueNode):
+        return {
+            "mode": getattr(from_node, "mode", "CONSTANT"),
+            "rpm_constant": float(getattr(from_node, "rpm_constant", 200.0)),
+            "rpm_start": float(getattr(from_node, "rpm_start", 0.0)),
+            "rpm_end": float(getattr(from_node, "rpm_end", 300.0)),
+            "ramp_duration": float(getattr(from_node, "ramp_duration", 5.0)),
+            "settle_delay": float(getattr(from_node, "settle_delay", 1.0)),
+            "sine_amplitude": float(getattr(from_node, "sine_amplitude", 50.0)),
+            "sine_frequency": float(getattr(from_node, "sine_frequency", 0.5)),
+            "direction_sign": 1.0,
+        }
+    elif isinstance(from_node, ScienceBlocksGearRatioNode):
+        sub = get_rpm_source_profile(from_node, "RPM In")
+        ratio = from_node.gear_ratio if from_node.calc_mode == "RATIO" else (from_node.teeth_in / max(1, from_node.teeth_out))
+        if from_node.invert_direction:
+            ratio = -ratio
+        sub["rpm_constant"] *= ratio
+        sub["rpm_start"] *= ratio
+        sub["rpm_end"] *= ratio
+        return sub
+    elif isinstance(from_node, ScienceBlocksRotationNode):
+        sub = get_rpm_source_profile(from_node, "RPM")
+        dir_mult = -1.0 if from_node.direction == "CW" else 1.0
+        sub["rpm_constant"] = abs(sub["rpm_constant"]) * dir_mult
+        sub["rpm_start"] = abs(sub["rpm_start"]) * dir_mult
+        sub["rpm_end"] = abs(sub["rpm_end"]) * dir_mult
+        sub["direction_sign"] = dir_mult
+        return sub
+    elif isinstance(from_node, ScienceBlocksOffsetNode):
+        return get_rpm_source_profile(from_node, "Value In")
+
+    v = float(getattr(sock, "default_value", 0.0))
+    default_profile["rpm_constant"] = v
+    default_profile["rpm_start"] = v
+    default_profile["rpm_end"] = v
+    return default_profile
 
 
 def get_input_float(node, socket_name: str, t: float, default: float = 0.0) -> float:
@@ -1120,18 +1371,49 @@ def get_chamber_rotation_state(scene, t: float) -> dict:
     """Extracts continuous rotation angle, active axis (X, Y, Z), direction (CW, CCW),
     and RPM for the container / jar (supporting any mesh: Jar, Cube, Suzanne, Cylinder)."""
     props = getattr(scene, "science_blocks_props", None)
-    jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
-    sun_obj = (
-        getattr(props, "sun_wheel_obj", None)
-        or (jar_obj.parent if jar_obj else None)
-        or bpy.data.objects.get("Sun_Wheel_Plate")
-        or bpy.data.objects.get("Sun_Wheel")
-    )
+    jar_obj = getattr(props, "jar_chamber_obj", None)
+    if not jar_obj:
+        for name in ("Jar_Chamber", "Cube", "Jar", "Drum", "Container", "Chamber"):
+            jar_obj = bpy.data.objects.get(name)
+            if jar_obj:
+                break
+
+    # Discover if planetary mill or sun wheel rotation is present
+    has_gear_node = False
+    active_sun_node = None
+    active_tree = getattr(props, "active_node_tree", None)
+    trees_to_check = [active_tree] if active_tree else list(bpy.data.node_groups)
+    for group in trees_to_check:
+        if getattr(group, "bl_idname", "") == "ScienceBlocksNodeTree":
+            if any(getattr(n, "bl_idname", "") == "ScienceBlocksGearRatioNode" for n in group.nodes):
+                has_gear_node = True
+            for n in group.nodes:
+                if isinstance(n, ScienceBlocksRotationNode):
+                    tgt = n.get_target_object()
+                    lbl = (n.label or n.name).lower()
+                    if (tgt and ("sun" in tgt.name.lower())) or "sun" in lbl:
+                        active_sun_node = n
+
+    jar_parent_sun = bool(jar_obj and jar_obj.parent and ("sun" in jar_obj.parent.name.lower()))
+    is_planetary = bool(has_gear_node or (active_sun_node and jar_parent_sun))
+
+    sun_obj = None
+    if is_planetary:
+        sun_obj = (
+            getattr(props, "sun_wheel_obj", None)
+            or (jar_obj.parent if jar_obj else None)
+            or bpy.data.objects.get("Sun_Wheel_Plate")
+            or bpy.data.objects.get("Sun_Wheel")
+        )
 
     jar_node = None
+    solver_node = None
     for group in bpy.data.node_groups:
         if group.bl_idname != "ScienceBlocksNodeTree":
             continue
+        for n in group.nodes:
+            if n.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+                solver_node = n
         all_rot = [n for n in group.nodes if isinstance(n, ScienceBlocksRotationNode)]
         for node in all_rot:
             tgt = node.get_target_object()
@@ -1145,8 +1427,18 @@ def get_chamber_rotation_state(scene, t: float) -> dict:
         if jar_node:
             break
 
+    # Determine axis: priority to solver node override if set, otherwise rotation node
+    axis = "Z"
     if jar_node:
         axis = getattr(jar_node, "rotation_axis", "Z")
+    if solver_node:
+        solv_ax = getattr(solver_node, "rotation_axis", "AUTO")
+        if solv_ax and solv_ax in ("X", "Y", "Z"):
+            axis = solv_ax
+            if jar_node and getattr(jar_node, "rotation_axis", "") != solv_ax:
+                jar_node.rotation_axis = solv_ax
+
+    if jar_node:
         direction = getattr(jar_node, "direction", "CW")
         rpm = get_input_rpm(jar_node, "RPM", t)
         offset_deg = getattr(jar_node, "angle_offset", 0.0)
@@ -1154,10 +1446,7 @@ def get_chamber_rotation_state(scene, t: float) -> dict:
             offset_deg += get_input_float(jar_node, "Offset (°)", t)
 
         dir_sign = -1.0 if direction == "CW" else 1.0
-        rad_per_sec = (abs(rpm) * 2.0 * math.pi / 60.0) * dir_sign
-        settle_delay = getattr(props, "dem_settle_delay_s", 1.0) if props else 1.0
-        t_rot = max(0.0, t - settle_delay)
-        angle = rad_per_sec * t_rot + math.radians(offset_deg)
+        angle = abs(get_input_integrated_angle(jar_node, "RPM", t)) * dir_sign + math.radians(offset_deg)
         return {
             "node": jar_node,
             "axis": axis,
@@ -1168,7 +1457,7 @@ def get_chamber_rotation_state(scene, t: float) -> dict:
         }
 
     # Fallback to properties if available
-    axis = getattr(props, "kinematics_jar_axis", "Z") if props else "Z"
+    axis = getattr(props, "kinematics_jar_axis", axis) if props else axis
     angle = getattr(props, "kinematics_jar_rot_rad", 0.0) if props else 0.0
     return {
         "node": None,
@@ -1238,17 +1527,44 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
         g_world = mathutils.Vector((0.0, 0.0, -1.0))
 
     # Discover carrier and container objects
-    jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
-    sun_obj = (
-        getattr(props, "sun_wheel_obj", None)
-        or (jar_obj.parent if jar_obj else None)
-        or bpy.data.objects.get("Sun_Wheel_Plate")
-        or bpy.data.objects.get("Sun_Wheel")
-    )
+    jar_obj = getattr(props, "jar_chamber_obj", None)
+    if not jar_obj:
+        for name in ("Jar_Chamber", "Cube", "Jar", "Drum", "Container", "Chamber"):
+            jar_obj = bpy.data.objects.get(name)
+            if jar_obj:
+                break
+
+    # Discover if planetary mill or sun wheel rotation is present
+    has_gear_node = False
+    active_sun_node = None
+    active_tree = getattr(props, "active_node_tree", None)
+    trees_to_check = [active_tree] if active_tree else list(bpy.data.node_groups)
+    for group in trees_to_check:
+        if getattr(group, "bl_idname", "") == "ScienceBlocksNodeTree":
+            if any(getattr(n, "bl_idname", "") == "ScienceBlocksGearRatioNode" for n in group.nodes):
+                has_gear_node = True
+            for n in group.nodes:
+                if isinstance(n, ScienceBlocksRotationNode):
+                    tgt = n.get_target_object()
+                    lbl = (n.label or n.name).lower()
+                    if (tgt and ("sun" in tgt.name.lower())) or "sun" in lbl:
+                        active_sun_node = n
+
+    jar_parent_sun = bool(jar_obj and jar_obj.parent and ("sun" in jar_obj.parent.name.lower()))
+    is_planetary = bool(has_gear_node or (active_sun_node and jar_parent_sun))
+
+    sun_obj = None
+    if is_planetary:
+        sun_obj = (
+            getattr(props, "sun_wheel_obj", None)
+            or (jar_obj.parent if jar_obj else None)
+            or bpy.data.objects.get("Sun_Wheel_Plate")
+            or bpy.data.objects.get("Sun_Wheel")
+        )
 
     # Check if carrier (Sun Wheel) is actively spinning
-    sun_rot = get_parent_wheel_rotation_angle(scene, t)
-    has_sun_spin = abs(sun_rot) > 1e-6 or (sun_obj and hasattr(sun_obj, "rotation_euler") and abs(sun_obj.rotation_euler.z) > 1e-4)
+    sun_rot = get_parent_wheel_rotation_angle(scene, t) if is_planetary else 0.0
+    has_sun_spin = is_planetary and (abs(sun_rot) > 1e-6 or (sun_obj and hasattr(sun_obj, "rotation_euler") and abs(sun_obj.rotation_euler.z) > 1e-4))
 
     if has_sun_spin and sun_obj:
         # Carrier (Sun Wheel) Spin Axis in World Space
@@ -1273,16 +1589,8 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
         }
         local_axis = axis_map.get(c_axis, mathutils.Vector((0.0, 0.0, 1.0)))
         tgt = chamber_state.get("target") or jar_obj
-        if tgt and tgt.parent and hasattr(tgt.parent, "matrix_world") and tgt.parent.matrix_world:
+        if tgt and tgt.parent and hasattr(tgt.parent, "matrix_world") and tgt.parent.matrix_world and has_gear_node:
             u_spin = (tgt.parent.matrix_world.to_3x3() @ local_axis).normalized()
-        elif tgt and hasattr(tgt, "matrix_world") and tgt.matrix_world and chamber_state.get("node"):
-            rn = chamber_state["node"]
-            base_mat = mathutils.Euler((
-                math.radians(getattr(rn, "base_rot_x", 0.0)),
-                math.radians(getattr(rn, "base_rot_y", 0.0)),
-                math.radians(getattr(rn, "base_rot_z", 0.0)),
-            )).to_matrix()
-            u_spin = (base_mat @ local_axis).normalized()
         else:
             u_spin = local_axis
 
@@ -1357,13 +1665,24 @@ def evaluate_kinematics_frame(scene):
                 axis_map = {"X": 0, "Y": 1, "Z": 2}
                 active_axis = getattr(node, "rotation_axis", "Z")
 
-                # 1. Capture base rest pose once if not yet captured
+                # 1. Capture base rest pose once if not yet captured (strictly at frame_start or rest)
                 if not getattr(node, "has_captured_base", False):
-                    node.base_rot_x = math.degrees(obj.rotation_euler.x)
-                    node.base_rot_y = math.degrees(obj.rotation_euler.y)
-                    node.base_rot_z = math.degrees(obj.rotation_euler.z)
-                    node.has_captured_base = True
+                    if current_frame <= frame_start or t <= 1e-5:
+                        node.base_rot_x = math.degrees(obj.rotation_euler.x)
+                        node.base_rot_y = math.degrees(obj.rotation_euler.y)
+                        node.base_rot_z = math.degrees(obj.rotation_euler.z)
+                        node.has_captured_base = True
                 node.last_axis = active_axis
+
+                # Check if solver node in tree specifies active rotation axis
+                if getattr(node, "id_data", None):
+                    for n in node.id_data.nodes:
+                        if n.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+                            solv_ax = getattr(n, "rotation_axis", "AUTO")
+                            if solv_ax and solv_ax in ("X", "Y", "Z") and active_axis != solv_ax:
+                                active_axis = solv_ax
+                                node.rotation_axis = solv_ax
+                                break
 
                 # 2. Dynamic angle offset (socket or property)
                 offset_deg = getattr(node, "angle_offset", 0.0)
@@ -1383,21 +1702,25 @@ def evaluate_kinematics_frame(scene):
 
                 if is_driven:
                     # Input RPM is signed by the transmission (positive = CCW, negative = CW)
-                    rad_per_sec = (rpm * 2.0 * math.pi / 60.0)
+                    angle = get_input_integrated_angle(node, "RPM", t)
                     computed_dir = "CCW" if rpm >= 0 else "CW"
                     if node.direction != computed_dir:
                         node.direction = computed_dir
                 else:
                     direction_sign = -1.0 if node.direction == "CW" else 1.0
-                    rad_per_sec = (abs(rpm) * 2.0 * math.pi / 60.0) * direction_sign
+                    angle = abs(get_input_integrated_angle(node, "RPM", t)) * direction_sign
 
-                settle_delay = getattr(props, "dem_settle_delay_s", 1.0)
-                t_rot = max(0.0, t - settle_delay)
-                angle = rad_per_sec * t_rot
+                # When at frame 1 / start frame, strictly ensure angle is 0.0
+                if current_frame <= frame_start or t <= 1e-5:
+                    angle = 0.0
 
                 # 3. Set rotation on active axis and strictly lock inactive axes to base rest pose
                 if active_axis in axis_map:
                     active_base = getattr(node, f"base_rot_{active_axis.lower()}", 0.0)
+                    if (current_frame <= frame_start or t <= 1e-5) and abs(active_base) < 15.0:
+                        active_base = 0.0
+                        setattr(node, f"base_rot_{active_axis.lower()}", 0.0)
+
                     tot_rad = math.radians(active_base) + angle + math.radians(offset_deg)
                     obj.rotation_mode = "XYZ"
                     for ax_name, ax_idx in axis_map.items():
@@ -1405,6 +1728,10 @@ def evaluate_kinematics_frame(scene):
                             obj.rotation_euler[ax_idx] = tot_rad
                         else:
                             base_val = getattr(node, f"base_rot_{ax_name.lower()}", 0.0)
+                            # Eliminate residual Z angles on inactive axes when container is resting upright
+                            if ax_name == "Z" and abs(base_val) < 15.0 and (current_frame <= frame_start or t <= 1e-5):
+                                base_val = 0.0
+                                setattr(node, "base_rot_z", 0.0)
                             obj.rotation_euler[ax_idx] = math.radians(base_val)
 
                     # Live telemetry readouts
@@ -1479,7 +1806,7 @@ def evaluate_kinematics_frame(scene):
                     offset_deg += get_input_float(node, "Offset (°)", t)
 
                 dir_sign = -1.0 if getattr(node, "direction", "CW") == "CW" else 1.0
-                ang = (rpm * 2.0 * math.pi / 60.0) * dir_sign * t + math.radians(offset_deg)
+                ang = abs(get_input_integrated_angle(node, "RPM", t)) * dir_sign + math.radians(offset_deg)
 
                 base_z = getattr(node, "base_loc_z", 0.0)
                 base_y = getattr(node, "base_loc_y", 0.0)

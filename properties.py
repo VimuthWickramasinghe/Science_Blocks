@@ -660,17 +660,44 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default="YADE",
         description="Discrete Element Method simulation engine backend",
     )
+    def _on_dem_colormap_update(self, context):
+        try:
+            from . import colormaps
+            colormaps.assign_dem_shader_to_particles(context, shader_mode=self.dem_viewport_colormap)
+        except Exception:
+            pass
+
+    def _on_analytical_strip_toggle(self, context):
+        try:
+            from . import colormaps
+            colormaps.create_or_update_analytical_color_strip(
+                context,
+                mode=getattr(self, "dem_viewport_colormap", "VELOCITY"),
+                show=self.show_analytical_color_strip,
+            )
+        except Exception:
+            pass
+
     dem_viewport_colormap: EnumProperty(
         name="Viewport Colormap",
         items=[
-            ("VELOCITY", "Speed / Velocity Magnitude", "Color particles dynamically from blue (stationary) to yellow to crimson red (high speed)"),
-            ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
-            ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock"),
-            ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s)"),
+            ("VELOCITY", "Speed / Velocity Magnitude", "Color particles dynamically from blue to yellow to crimson red with editable ColorRamp in Shader Editor"),
+            ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force with editable ColorRamp in Shader Editor"),
+            ("ACCELERATION", "Acceleration (m/s², g-force)", "Color particles by instantaneous impact acceleration in m/s² and g-force with editable ColorRamp in Shader Editor"),
+            ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock with editable ColorRamp in Shader Editor"),
+            ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s) with editable ColorRamp in Shader Editor"),
             ("SOLID", "Solid Realistic Material", "Realistic metallic/ceramic material rendering"),
         ],
         default="VELOCITY",
-        description="Dynamic color-coding of milling media in 3D viewport",
+        description="Active shader and dynamic color-coding of milling media in 3D viewport and Shader Editor",
+        update=_on_dem_colormap_update,
+    )
+
+    show_analytical_color_strip: BoolProperty(
+        name="Show Analytical Color Strip",
+        default=True,
+        description="Display in-viewport 3D analytical color gradient strip and telemetry data",
+        update=_on_analytical_strip_toggle,
     )
 
     # Physical Material Constants
@@ -760,6 +787,16 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default="",
         subtype="FILE_PATH",
     )
+    dem_source_plane_obj: PointerProperty(
+        name="Source Tap / Plane",
+        type=bpy.types.Object,
+        description="Source tap or planar inlet object that introduces particles into the jar without overlap",
+    )
+    dem_use_source_plane: BoolProperty(
+        name="Use Source Tap",
+        description="Feed particles into the jar through a non-overlapping planar source tap",
+        default=True,
+    )
     dem_is_simulated: BoolProperty(
         name="DEM Simulated",
         description="Whether a simulation has been computed and baked",
@@ -787,6 +824,11 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         name="Bake Spinner Tick",
         description="Tick counter driving the circular rotating progress spinner",
         default=0,
+    )
+    auto_play_after_bake: BoolProperty(
+        name="Auto Play After Bake",
+        description="Automatically start animation playback after simulation bake completes",
+        default=False,
     )
 
     # Professional Planetary Mill Analytics & Regime Diagnostics

@@ -34,13 +34,31 @@ except ImportError:
     mathutils = None
 
 try:
-    from .colormaps import evaluate_scientific_colormap, recolor_dem_particles_in_scene
+    from .colormaps import (
+        evaluate_scientific_colormap,
+        recolor_dem_particles_in_scene,
+        ensure_dem_particle_shaders,
+        get_dem_shader_for_mode,
+        assign_dem_shader_to_particles,
+        create_or_update_analytical_color_strip,
+    )
 except ImportError:
     try:
-        from colormaps import evaluate_scientific_colormap, recolor_dem_particles_in_scene
+        from colormaps import (
+            evaluate_scientific_colormap,
+            recolor_dem_particles_in_scene,
+            ensure_dem_particle_shaders,
+            get_dem_shader_for_mode,
+            assign_dem_shader_to_particles,
+            create_or_update_analytical_color_strip,
+        )
     except ImportError:
         evaluate_scientific_colormap = None
         recolor_dem_particles_in_scene = None
+        ensure_dem_particle_shaders = None
+        get_dem_shader_for_mode = None
+        assign_dem_shader_to_particles = None
+        create_or_update_analytical_color_strip = None
 
 
 class PlanetaryDEMResult:
@@ -87,6 +105,11 @@ class PlanetaryDEMResult:
         # Operating & Physical Parameters
         self.sun_rpm = 200.0
         self.jar_rpm = -300.0
+        self.rpm_mode = "CONSTANT"
+        self.jar_rpm_start = -300.0
+        self.jar_rpm_end = -300.0
+        self.jar_ramp_duration = 5.0
+        self.frame_rpms = np.zeros(frames, dtype=np.float32)
         self.r_sun = 1.3
         self.r_jar = 0.42
         self.h_jar = 1.0
@@ -140,6 +163,79 @@ def generate_charge_radii(
         return np.clip(radii, 0.6 * mean_radius_m, 1.5 * mean_radius_m)
     # Default: Monodisperse (all uniform)
     return np.full(ball_count, mean_radius_m, dtype=np.float64)
+
+
+def generate_non_overlapping_source_particles(
+    ball_count: int,
+    radii: np.ndarray,
+    source_center: tuple = (0.0, 0.0, 0.40),
+    source_normal: tuple = (0.0, 0.0, -1.0),
+    source_radius: float = 0.15,
+    min_clearance_factor: float = 1.15,
+) -> np.ndarray:
+    """Generates strictly non-overlapping initial particle positions from a source tap / plane.
+
+    Uses hexagonal close-packed (HCP) multi-layer planar emission:
+    - Centers spheres across the source plane disc/rectangle with clearance gap >= 15% diameter.
+    - If ball_count exceeds single-layer capacity, stacks subsequent layers backwards along -normal.
+    - Guaranteed ZERO pairwise overlap at initial generation time.
+    """
+    if ball_count <= 0:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    max_r = float(np.max(radii)) if len(radii) else 0.012
+    d_step = max_r * 2.0 * max(1.05, float(min_clearance_factor))
+
+    # Orthonormal basis for source plane: normal n, tangents u, v
+    n = np.array(source_normal, dtype=np.float64)
+    n_len = np.linalg.norm(n)
+    if n_len < 1e-6:
+        n = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    else:
+        n = n / n_len
+
+    ref_vec = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(n[0]) < 0.85 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    u = np.cross(ref_vec, n)
+    u_len = np.linalg.norm(u)
+    u = u / (u_len if u_len > 1e-9 else 1.0)
+    v = np.cross(n, u)
+    v_len = np.linalg.norm(v)
+    v = v / (v_len if v_len > 1e-9 else 1.0)
+
+    c0 = np.array(source_center, dtype=np.float64)
+    r_tap = max(d_step * 1.5, float(source_radius))
+
+    # Generate candidate (u, v) offsets on hexagonal grid
+    grid_span = int(math.ceil(r_tap / d_step)) + 2
+    in_plane_offsets = []
+
+    for j in range(-grid_span, grid_span + 1):
+        v_coord = j * d_step * (math.sqrt(3.0) / 2.0)
+        u_off = (d_step * 0.5) if (j % 2 != 0) else 0.0
+        for i in range(-grid_span, grid_span + 1):
+            u_coord = i * d_step + u_off
+            dist_sq = u_coord**2 + v_coord**2
+            if dist_sq <= r_tap**2:
+                in_plane_offsets.append((u_coord, v_coord, dist_sq))
+
+    # Sort concentric inward to outward so inner tap slots fill first
+    in_plane_offsets.sort(key=lambda item: item[2])
+    slots_per_layer = max(1, len(in_plane_offsets))
+
+    positions = []
+    idx = 0
+    while len(positions) < ball_count:
+        layer_idx = idx // slots_per_layer
+        slot_idx = idx % slots_per_layer
+        u_c, v_c, _ = in_plane_offsets[slot_idx]
+
+        # Stack subsequent layers along +normal (downstream into the chamber)
+        layer_offset = n * (layer_idx * d_step)
+        pt = c0 + u_c * u + v_c * v + layer_offset
+        positions.append(pt)
+        idx += 1
+
+    return np.array(positions, dtype=np.float64)
 
 
 def velocity_to_rainbow_rgb(v_mag: float, v_max: float = 6.0) -> tuple:
@@ -218,13 +314,14 @@ def compute_planetary_accelerations(
     ball_masses: np.ndarray = None,
     settle_delay_s: float = 1.0,
     rotation_axis: str = "Z",
+    **kwargs,
 ) -> np.ndarray:
     """Calculates non-inertial centrifugal, Coriolis, gravitational, and slurry drag accelerations in jar frame."""
     ball_count = pos.shape[0]
     acc = np.zeros_like(pos)
 
     # 0. Settle Phase: If before settle_delay_s, container is completely stationary (Omega = 0)
-    if current_time < settle_delay_s:
+    if current_time < (settle_delay_s - 1e-5):
         # Stationary container: downward gravity acts
         if mill_orientation == "HORIZONTAL" and (rotation_axis or "Z").upper() == "Z":
             acc[:, 1] = -gravity
@@ -232,18 +329,62 @@ def compute_planetary_accelerations(
             acc[:, 2] = -gravity
         return acc
 
-    # Active rotation time with smooth spin-up ramp (0.5s ramp)
-    t_rot = current_time - settle_delay_s
-    ramp = min(1.0, t_rot / 0.5)
-    w_jar = omega_jar * ramp
-    w_sun = omega_sun * ramp
-    w_eff = w_jar + w_sun
+    t_rot = max(0.0, current_time - settle_delay_s)
 
+    # Support Variable Speed RPM Source (Linear Ramp or Constant)
+    rpm_mode = kwargs.get("rpm_mode", "CONSTANT")
+    jar_rpm_start = kwargs.get("jar_rpm_start")
+    jar_rpm_end = kwargs.get("jar_rpm_end")
+    jar_ramp_duration = kwargs.get("jar_ramp_duration")
+
+    if rpm_mode == "RAMP" and jar_rpm_start is not None:
+        T_j = max(0.001, float(jar_ramp_duration or 5.0))
+        r_j0 = float(jar_rpm_start)
+        r_j1 = float(jar_rpm_end if jar_rpm_end is not None else (omega_jar * 30.0 / math.pi))
+        if t_rot <= T_j:
+            p_j = t_rot / T_j
+            cur_jar_rpm = r_j0 + p_j * (r_j1 - r_j0)
+            mean_j_rpm = r_j0 + 0.5 * p_j * (r_j1 - r_j0)
+            theta_jar = (mean_j_rpm * 2.0 * math.pi / 60.0) * t_rot
+        else:
+            cur_jar_rpm = r_j1
+            theta_jar = (0.5 * (r_j0 + r_j1) * 2.0 * math.pi / 60.0) * T_j + (r_j1 * 2.0 * math.pi / 60.0) * (t_rot - T_j)
+        w_jar = cur_jar_rpm * (2.0 * math.pi / 60.0)
+    else:
+        # Standard spin-up ramp (0.5s ramp)
+        ramp = min(1.0, t_rot / 0.5)
+        w_jar = omega_jar * ramp
+        theta_jar = omega_jar * t_rot
+
+    # Sun wheel carrier variable speed
+    sun_rpm_start = kwargs.get("sun_rpm_start")
+    sun_rpm_end = kwargs.get("sun_rpm_end")
+    sun_ramp_duration = kwargs.get("sun_ramp_duration")
+
+    if kwargs.get("sun_rpm_mode") == "RAMP" and sun_rpm_start is not None:
+        T_s = max(0.001, float(sun_ramp_duration or 5.0))
+        r_s0 = float(sun_rpm_start)
+        r_s1 = float(sun_rpm_end if sun_rpm_end is not None else (omega_sun * 30.0 / math.pi))
+        if t_rot <= T_s:
+            p_s = t_rot / T_s
+            cur_sun_rpm = r_s0 + p_s * (r_s1 - r_s0)
+            mean_s_rpm = r_s0 + 0.5 * p_s * (r_s1 - r_s0)
+            theta_sun = (mean_s_rpm * 2.0 * math.pi / 60.0) * t_rot
+        else:
+            cur_sun_rpm = r_s1
+            theta_sun = (0.5 * (r_s0 + r_s1) * 2.0 * math.pi / 60.0) * T_s + (r_s1 * 2.0 * math.pi / 60.0) * (t_rot - T_s)
+        w_sun = cur_sun_rpm * (2.0 * math.pi / 60.0)
+    else:
+        ramp_sun = min(1.0, t_rot / 0.5)
+        w_sun = omega_sun * ramp_sun
+        theta_sun = omega_sun * t_rot
+
+    w_eff = w_jar + w_sun
     axis = (rotation_axis or "Z").upper()
 
     # 1. Sun Centrifugal acceleration (only if planetary carrier is active)
     if r_sun > 0.001 and abs(w_sun) > 0.001:
-        rel_angle = (w_sun - w_jar) * t_rot
+        rel_angle = theta_sun - theta_jar
         a_sun_cf_x = (w_sun**2) * r_sun * math.cos(rel_angle)
         a_sun_cf_y = (w_sun**2) * r_sun * math.sin(rel_angle)
         acc[:, 0] += a_sun_cf_x
@@ -258,17 +399,15 @@ def compute_planetary_accelerations(
         # Rotating around Y axis (e.g. horizontal tumbling drum or cube)
         acc[:, 0] += (w_jar**2) * pos[:, 0] - 2.0 * w_eff * vel[:, 2]
         acc[:, 2] += (w_jar**2) * pos[:, 2] + 2.0 * w_eff * vel[:, 0]
-        # Dynamic gravity tumbling in XZ plane
-        theta_g = w_jar * t_rot
-        acc[:, 0] += gravity * math.sin(theta_g)
-        acc[:, 2] += -gravity * math.cos(theta_g)
+        # Dynamic gravity tumbling in XZ plane with integrated angle
+        acc[:, 0] += gravity * math.sin(theta_jar)
+        acc[:, 2] += -gravity * math.cos(theta_jar)
     elif axis == "X":
         # Rotating around X axis
         acc[:, 1] += (w_jar**2) * pos[:, 1] + 2.0 * w_eff * vel[:, 2]
         acc[:, 2] += (w_jar**2) * pos[:, 2] - 2.0 * w_eff * vel[:, 1]
-        theta_g = w_jar * t_rot
-        acc[:, 1] += -gravity * math.sin(theta_g)
-        acc[:, 2] += -gravity * math.cos(theta_g)
+        acc[:, 1] += -gravity * math.sin(theta_jar)
+        acc[:, 2] += -gravity * math.cos(theta_jar)
     else:
         acc[:, 0] += (w_jar**2) * pos[:, 0] + 2.0 * w_eff * vel[:, 1]
         acc[:, 1] += (w_jar**2) * pos[:, 1] - 2.0 * w_eff * vel[:, 0]
@@ -276,9 +415,8 @@ def compute_planetary_accelerations(
 
     # 3. Horizontal orientation override if specified
     if mill_orientation == "HORIZONTAL" and axis == "Z":
-        theta_g = w_jar * t_rot
-        acc[:, 0] += -gravity * math.sin(theta_g)
-        acc[:, 1] += -gravity * math.cos(theta_g)
+        acc[:, 0] += -gravity * math.sin(theta_jar)
+        acc[:, 1] += -gravity * math.cos(theta_jar)
         acc[:, 2] = 0.0
 
     # 4. Viscous Hydrodynamic Drag (for wet milling slurries)
@@ -480,6 +618,23 @@ def solve_planetary_dem(
     """Industrial Discrete Element Method (DEM) Particle Solver supporting any container shape (Box, Cylinder, Mesh)."""
     res = PlanetaryDEMResult(frames, ball_count)
 
+    # Operating kinematic parameters (supports Constant RPM or Linear Ramp)
+    rpm_mode = kwargs.get("rpm_mode", "CONSTANT")
+    jar_rpm_start = float(kwargs.get("jar_rpm_start", jar_rpm))
+    jar_rpm_end = float(kwargs.get("jar_rpm_end", jar_rpm))
+    jar_ramp_duration = float(kwargs.get("jar_ramp_duration", 5.0))
+    sun_rpm_mode = kwargs.get("sun_rpm_mode", "CONSTANT")
+    sun_rpm_start = float(kwargs.get("sun_rpm_start", sun_rpm))
+    sun_rpm_end = float(kwargs.get("sun_rpm_end", sun_rpm))
+    sun_ramp_duration = float(kwargs.get("sun_ramp_duration", 5.0))
+
+    res.rpm_mode = rpm_mode
+    res.jar_rpm = jar_rpm
+    res.sun_rpm = sun_rpm
+    res.jar_rpm_start = jar_rpm_start
+    res.jar_rpm_end = jar_rpm_end
+    res.jar_ramp_duration = jar_ramp_duration
+
     # Angular kinematics in rad/s
     omega_sun = (sun_rpm * 2.0 * math.pi) / 60.0
     omega_jar = (jar_rpm * 2.0 * math.pi) / 60.0
@@ -540,55 +695,99 @@ def solve_planetary_dem(
     log_e = math.log(safe_rest)
     beta = log_e / math.sqrt(log_e**2 + (math.pi**2))
 
-    # Initialize positions resting near the bottom floor of the container
-    np.random.seed(42)
+    # -------------------------------------------------------------------------
+    # Initial Particle Inflow & Placement: Source Tap / Plane vs Random
+    # -------------------------------------------------------------------------
+    use_source_plane = kwargs.get("use_source_plane", True)
+    source_plane_center = kwargs.get("source_plane_center")
+    source_plane_normal = kwargs.get("source_plane_normal")
+    source_plane_radius = kwargs.get("source_plane_radius")
+
+    is_horiz_z = (axis_c == "Z" and mill_orientation == "HORIZONTAL")
+    settle_g_axis = 1 if is_horiz_z else 2
+
     shape_mode = (container_shape or "BOX").upper()
     if bvh_tree is not None:
         shape_mode = "MESH"
     env_mode = (kwargs.get("envelope_shape") or ("BOX" if shape_mode == "BOX" else "CYLINDER")).upper()
 
-    if shape_mode == "BOX":
-        pos_x = np.random.uniform(-hx * 0.70, hx * 0.70, ball_count)
-        pos_y = np.random.uniform(-hy * 0.70, hy * 0.70, ball_count)
-        pos_z = np.random.uniform(-hz + max_radius * 1.2, -hz * 0.2, ball_count)
-    elif shape_mode == "CYLINDER":
-        angles = np.random.uniform(0, 2 * math.pi, ball_count)
-        r_pos = np.random.uniform(0, effective_wall_r * 0.70, ball_count)
-        if axis_c == "Y":
-            pos_x = r_pos * np.cos(angles)
-            pos_z = r_pos * np.sin(angles)
-            pos_y = np.random.uniform(-half_h * 0.70, half_h * 0.70, ball_count)
-        elif axis_c == "X":
-            pos_y = r_pos * np.cos(angles)
-            pos_z = r_pos * np.sin(angles)
-            pos_x = np.random.uniform(-half_h * 0.70, half_h * 0.70, ball_count)
-        else:  # Z
-            pos_x = r_pos * np.cos(angles)
-            pos_y = r_pos * np.sin(angles)
-            pos_z = np.random.uniform(-half_h + max_radius * 1.2, -half_h * 0.2, ball_count)
-    else:  # MESH (Modeled Ridges, Lifter Bars, CAD, Suzanne)
-        if cyl_r > 0.05:
-            # Seed safely inside the central chamber core, well clear of any wall ridges
+    cavity_info = kwargs.get("cavity_info")
+    if use_source_plane:
+        # Non-overlapping emission from 3D Source Tap / Plane inlet
+        if source_plane_center is not None:
+            tap_center = np.array(source_plane_center, dtype=np.float64)
+            tap_normal = np.array(source_plane_normal or ([0.0, -1.0, 0.0] if is_horiz_z else [0.0, 0.0, -1.0]), dtype=np.float64)
+            tap_radius = float(source_plane_radius or 0.15)
+        elif cavity_info is not None and "inlet_pos_sim" in cavity_info:
+            # Auto-position tap inlet at opening of detected interior cavity / inward extrusion
+            tap_center = np.array(cavity_info["inlet_pos_sim"], dtype=np.float64)
+            tap_normal = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            tap_radius = min(float(cavity_info.get("cavity_radius_sim", 0.15)) * 0.70, 0.18)
+        else:
+            # Auto-position tap inlet at top of chamber
+            if is_horiz_z:
+                tap_center = np.array([0.0, effective_wall_r * 0.80, 0.0], dtype=np.float64)
+                tap_normal = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+            elif axis_c in ("X", "Y"):
+                tap_center = np.array([0.0, 0.0, effective_wall_r * 0.80], dtype=np.float64)
+                tap_normal = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            else:  # Z vertical
+                tap_center = np.array([0.0, 0.0, half_h * 0.85], dtype=np.float64)
+                tap_normal = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            tap_radius = min(effective_wall_r * 0.65, 0.18)
+
+        pos = generate_non_overlapping_source_particles(
+            ball_count=ball_count,
+            radii=radii,
+            source_center=tap_center,
+            source_normal=tap_normal,
+            source_radius=tap_radius,
+            min_clearance_factor=1.15,
+        )
+    else:
+        # Legacy random placement inside container volume
+        np.random.seed(42)
+        if shape_mode == "BOX":
+            pos_x = np.random.uniform(-hx * 0.70, hx * 0.70, ball_count)
+            pos_y = np.random.uniform(-hy * 0.70, hy * 0.70, ball_count)
+            pos_z = np.random.uniform(-hz + max_radius * 1.2, -hz * 0.2, ball_count)
+        elif shape_mode == "CYLINDER":
             angles = np.random.uniform(0, 2 * math.pi, ball_count)
-            r_pos = np.random.uniform(0, min(effective_wall_r * 0.55, cyl_r * 0.60), ball_count)
+            r_pos = np.random.uniform(0, effective_wall_r * 0.70, ball_count)
             if axis_c == "Y":
                 pos_x = r_pos * np.cos(angles)
                 pos_z = r_pos * np.sin(angles)
-                pos_y = np.random.uniform(-half_h * 0.50, half_h * 0.50, ball_count)
+                pos_y = np.random.uniform(-half_h * 0.70, half_h * 0.70, ball_count)
             elif axis_c == "X":
                 pos_y = r_pos * np.cos(angles)
                 pos_z = r_pos * np.sin(angles)
-                pos_x = np.random.uniform(-half_h * 0.50, half_h * 0.50, ball_count)
+                pos_x = np.random.uniform(-half_h * 0.70, half_h * 0.70, ball_count)
             else:  # Z
                 pos_x = r_pos * np.cos(angles)
                 pos_y = r_pos * np.sin(angles)
                 pos_z = np.random.uniform(-half_h + max_radius * 1.2, -half_h * 0.2, ball_count)
-        else:
-            pos_x = np.random.uniform(-hx * 0.40, hx * 0.40, ball_count)
-            pos_y = np.random.uniform(-hy * 0.40, hy * 0.40, ball_count)
-            pos_z = np.random.uniform(-hz * 0.50, -hz * 0.10, ball_count)
+        else:  # MESH (Modeled Ridges, Lifter Bars, CAD)
+            if cyl_r > 0.05:
+                angles = np.random.uniform(0, 2 * math.pi, ball_count)
+                r_pos = np.random.uniform(0, min(effective_wall_r * 0.55, cyl_r * 0.60), ball_count)
+                if axis_c == "Y":
+                    pos_x = r_pos * np.cos(angles)
+                    pos_z = r_pos * np.sin(angles)
+                    pos_y = np.random.uniform(-half_h * 0.50, half_h * 0.50, ball_count)
+                elif axis_c == "X":
+                    pos_y = r_pos * np.cos(angles)
+                    pos_z = r_pos * np.sin(angles)
+                    pos_x = np.random.uniform(-half_h * 0.50, half_h * 0.50, ball_count)
+                else:  # Z
+                    pos_x = r_pos * np.cos(angles)
+                    pos_y = r_pos * np.sin(angles)
+                    pos_z = np.random.uniform(-half_h + max_radius * 1.2, -half_h * 0.2, ball_count)
+            else:
+                pos_x = np.random.uniform(-hx * 0.40, hx * 0.40, ball_count)
+                pos_y = np.random.uniform(-hy * 0.40, hy * 0.40, ball_count)
+                pos_z = np.random.uniform(-hz * 0.50, -hz * 0.10, ball_count)
+        pos = np.column_stack((pos_x, pos_y, pos_z)).astype(np.float64)
 
-    pos = np.column_stack((pos_x, pos_y, pos_z)).astype(np.float64)
     vel = np.zeros_like(pos)
     omega = np.zeros_like(pos)
     theta = np.zeros_like(pos)
@@ -597,7 +796,7 @@ def solve_planetary_dem(
     # Pre-simulation Gravity Settling (Pack particles into a resting floor bed)
     # -------------------------------------------------------------------------
     if progress_callback:
-        progress_callback(2.0, "Pre-simulation settling particles into resting bed...")
+        progress_callback(2.0, "Pre-simulation settling: introducing non-overlapping particles into resting bed...")
 
     if ball_count > 1:
         iu0, iu1 = np.triu_indices(ball_count, k=1)
@@ -608,23 +807,61 @@ def solve_planetary_dem(
         min_dist_arr = np.array([], dtype=float)
         min_dist_sq_arr = np.array([], dtype=float)
 
-    dt_settle = dt * 1.5
-    is_horiz_z = (axis_c == "Z" and mill_orientation == "HORIZONTAL")
-    settle_g_axis = 1 if is_horiz_z else 2
+    dt_settle = max(0.004, dt * 2.0)
+    settle_steps = 180 if use_source_plane else 60
 
-    for _ in range(60):
+    for step in range(settle_steps):
         # Apply initial resting gravity downward along effective vertical axis
         vel[:, settle_g_axis] -= gravity * dt_settle
         pos += vel * dt_settle
 
-        # Floor collision
-        if shape_mode == "BOX":
+        # Floor and container boundary collision
+        if bvh_tree is not None:
+            # Exact 3D facet contact for meshes, modeled ridges, inward extrusions, and cavities
+            for idx in range(ball_count):
+                p_tuple = (float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2]))
+                p_vec = mathutils.Vector(p_tuple) if mathutils is not None else p_tuple
+                loc, face_normal, f_idx, dist = bvh_tree.find_nearest(p_vec)
+                r_i = radii[idx]
+                if loc is not None and dist < r_i:
+                    overlap = r_i - dist
+                    loc_arr = np.array([loc[0], loc[1], loc[2]], dtype=np.float64)
+                    delta = pos[idx] - loc_arr
+                    d_len = float(np.linalg.norm(delta))
+                    if d_len > 1e-7:
+                        n_vec = delta / d_len
+                    else:
+                        fn = np.array([face_normal[0], face_normal[1], face_normal[2]], dtype=np.float64) if face_normal is not None else np.array([0.0, 0.0, 1.0])
+                        fn_norm = np.linalg.norm(fn)
+                        n_vec = fn / fn_norm if fn_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
+                    pos[idx] += n_vec * overlap
+                    v_dot_n = float(np.dot(vel[idx], n_vec))
+                    if v_dot_n < 0:
+                        vel[idx] -= (1.0 + 0.15) * v_dot_n * n_vec
+                        vel[idx] *= 0.65
+
+            # Outer boundary safety confinement
+            if env_mode == "CYLINDER":
+                r_sq = pos[:, r_ax1]**2 + pos[:, r_ax2]**2
+                rad_bound = effective_wall_r - radii
+                out = r_sq > (rad_bound**2)
+                if np.any(out):
+                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                    sc = rad_bound[out] / r_val
+                    pos[out, r_ax1] *= sc
+                    pos[out, r_ax2] *= sc
+                pos[:, end_ax] = np.clip(pos[:, end_ax], -half_h + radii, half_h - radii)
+            else:
+                pos[:, 0] = np.clip(pos[:, 0], -hx + radii, hx - radii)
+                pos[:, 1] = np.clip(pos[:, 1], -hy + radii, hy - radii)
+                pos[:, 2] = np.clip(pos[:, 2], -hz + radii, hz - radii)
+        elif shape_mode == "BOX":
             hit_f = pos[:, settle_g_axis] < (-half_extents[settle_g_axis] + radii)
             if np.any(hit_f):
                 pos[hit_f, settle_g_axis] = -half_extents[settle_g_axis] + radii[hit_f]
-                vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.1
-                vel[hit_f, (settle_g_axis + 1) % 3] *= 0.6
-                vel[hit_f, (settle_g_axis + 2) % 3] *= 0.6
+                vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.15
+                vel[hit_f, (settle_g_axis + 1) % 3] *= 0.70
+                vel[hit_f, (settle_g_axis + 2) % 3] *= 0.70
             pos[:, 0] = np.clip(pos[:, 0], -hx + radii, hx - radii)
             pos[:, 1] = np.clip(pos[:, 1], -hy + radii, hy - radii)
             pos[:, 2] = np.clip(pos[:, 2], -hz + radii, hz - radii)
@@ -633,9 +870,41 @@ def solve_planetary_dem(
             hit_f = pos[:, settle_g_axis] < floor_limit
             if np.any(hit_f):
                 pos[hit_f, settle_g_axis] = floor_limit[hit_f] if isinstance(floor_limit, np.ndarray) else floor_limit
-                vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.1
-                vel[hit_f, (settle_g_axis + 1) % 3] *= 0.6
-                vel[hit_f, (settle_g_axis + 2) % 3] *= 0.6
+                vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.15
+                vel[hit_f, (settle_g_axis + 1) % 3] *= 0.70
+                vel[hit_f, (settle_g_axis + 2) % 3] *= 0.70
+
+            # Keep radial confinement during settling
+            if axis_c == "Y":
+                r_sq = pos[:, 0]**2 + pos[:, 2]**2
+                rad_bound = effective_wall_r - radii
+                out = r_sq > (rad_bound**2)
+                if np.any(out):
+                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                    sc = rad_bound[out] / r_val
+                    pos[out, 0] *= sc
+                    pos[out, 2] *= sc
+                pos[:, 1] = np.clip(pos[:, 1], -half_h + radii, half_h - radii)
+            elif axis_c == "X":
+                r_sq = pos[:, 1]**2 + pos[:, 2]**2
+                rad_bound = effective_wall_r - radii
+                out = r_sq > (rad_bound**2)
+                if np.any(out):
+                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                    sc = rad_bound[out] / r_val
+                    pos[out, 1] *= sc
+                    pos[out, 2] *= sc
+                pos[:, 0] = np.clip(pos[:, 0], -half_h + radii, half_h - radii)
+            else:  # Z
+                r_sq = pos[:, 0]**2 + pos[:, 1]**2
+                rad_bound = effective_wall_r - radii
+                out = r_sq > (rad_bound**2)
+                if np.any(out):
+                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                    sc = rad_bound[out] / r_val
+                    pos[out, 0] *= sc
+                    pos[out, 1] *= sc
+                pos[:, 2] = np.clip(pos[:, 2], -half_h + radii, half_h - radii)
 
         # Fast ball-ball repulsion during pre-settle
         if ball_count > 1:
@@ -651,10 +920,14 @@ def solve_planetary_dem(
                     n = diffs[k] / d
                     pos[i] += n * (overlap * 0.5)
                     pos[j] -= n * (overlap * 0.5)
-                    vel[i] *= 0.90
-                    vel[j] *= 0.90
+                    vel[i] *= 0.85
+                    vel[j] *= 0.85
 
-        vel *= 0.92  # Rapid kinetic energy dissipation for resting bed
+        # In flight: slight air resistance; in the final stages of settling, rapidly damp residual motion
+        if step < settle_steps - 40:
+            vel *= 0.985
+        else:
+            vel *= 0.88
 
     # Ensure resting bed starts with zero velocity, zero angular velocity, and zero rotation
     vel.fill(0.0)
@@ -701,17 +974,33 @@ def solve_planetary_dem(
         res.rotations[f, :, :] = theta.astype(np.float32)
         res.angular_velocities[f, :, :] = omega.astype(np.float32)
 
+        # Track instantaneous jar RPM across simulation frames
+        if current_time >= (settle_delay_s - 1e-5):
+            t_rot_frame = max(0.0, current_time - settle_delay_s)
+            if rpm_mode == "RAMP":
+                p_frame = max(0.0, min(1.0, t_rot_frame / max(0.001, jar_ramp_duration)))
+                frame_rpm_val = jar_rpm_start + p_frame * (jar_rpm_end - jar_rpm_start)
+            else:
+                frame_rpm_val = jar_rpm * min(1.0, t_rot_frame / 0.5)
+        else:
+            frame_rpm_val = 0.0
+        res.frame_rpms[f] = float(frame_rpm_val)
+
         frame_forces = np.zeros(ball_count, dtype=np.float32)
         impacts_in_this_frame = 0
 
         for _ in range(substeps_per_frame):
-            # Compute accelerations (respects settle_delay_s and rotation_axis)
+            # Compute accelerations (respects settle_delay_s, rotation_axis, and variable linear ramp)
             acc_kin = compute_planetary_accelerations(
                 pos, vel, omega_sun, omega_jar, r_sun, current_time,
                 gravity=gravity, mill_orientation=mill_orientation,
                 slurry_drag=slurry_drag, slurry_viscosity=slurry_viscosity,
                 slurry_density=slurry_density, ball_radii=radii, ball_masses=masses,
                 settle_delay_s=settle_delay_s, rotation_axis=rotation_axis,
+                rpm_mode=rpm_mode, jar_rpm_start=jar_rpm_start, jar_rpm_end=jar_rpm_end,
+                jar_ramp_duration=jar_ramp_duration,
+                sun_rpm_mode=sun_rpm_mode, sun_rpm_start=sun_rpm_start,
+                sun_rpm_end=sun_rpm_end, sun_ramp_duration=sun_ramp_duration,
             )
 
             if integrator == "VELOCITY_VERLET":
@@ -723,10 +1012,15 @@ def solve_planetary_dem(
             current_time += dt
 
             # Gyroscopic precession in rotating jar frame
-            if current_time >= settle_delay_s:
-                t_rot = current_time - settle_delay_s
-                ramp = min(1.0, t_rot / 0.5)
-                w_jar_act = omega_jar * ramp
+            if current_time >= (settle_delay_s - 1e-5):
+                t_rot = max(0.0, current_time - settle_delay_s)
+                if rpm_mode == "RAMP":
+                    p_j = max(0.0, min(1.0, t_rot / max(0.001, jar_ramp_duration)))
+                    cur_jar_rpm = jar_rpm_start + p_j * (jar_rpm_end - jar_rpm_start)
+                    w_jar_act = (cur_jar_rpm * 2.0 * math.pi) / 60.0
+                else:
+                    ramp = min(1.0, t_rot / 0.5)
+                    w_jar_act = omega_jar * ramp
             else:
                 w_jar_act = 0.0
 
@@ -935,10 +1229,10 @@ def solve_planetary_dem(
                                     fn = fn / fn_norm
                                 n_vec = -fn if np.dot(pos[idx], fn) > 0 else fn
 
-                            # Suppress spurious axial kicks for longitudinal ridges/lifters:
+                            # Suppress spurious axial kicks for longitudinal ridges/lifters in cylindrical drums:
                             # If the contact normal is predominantly transverse (|n[end_ax]| < 0.35),
                             # the feature runs along the rotation axis. Eliminate axial edge noise.
-                            if abs(n_vec[end_ax]) < 0.35:
+                            if env_mode == "CYLINDER" and abs(n_vec[end_ax]) < 0.35:
                                 n_vec[end_ax] = 0.0
                                 n_plane_len = math.sqrt(n_vec[r_ax1]**2 + n_vec[r_ax2]**2)
                                 if n_plane_len > 1e-6:
@@ -1069,6 +1363,10 @@ def solve_planetary_dem(
                     slurry_drag=slurry_drag, slurry_viscosity=slurry_viscosity,
                     slurry_density=slurry_density, ball_radii=radii, ball_masses=masses,
                     settle_delay_s=settle_delay_s, rotation_axis=rotation_axis,
+                    rpm_mode=rpm_mode, jar_rpm_start=jar_rpm_start, jar_rpm_end=jar_rpm_end,
+                    jar_ramp_duration=jar_ramp_duration,
+                    sun_rpm_mode=sun_rpm_mode, sun_rpm_start=sun_rpm_start,
+                    sun_rpm_end=sun_rpm_end, sun_ramp_duration=sun_ramp_duration,
                 )
                 vel += 0.5 * (acc_kin + acc_kin_new) * dt
 
@@ -1150,9 +1448,9 @@ def instantiate_dem_particles_in_blender(
     result: PlanetaryDEMResult,
     jar_obj: "bpy.types.Object" = None,
     colormap_mode: str = "VELOCITY",
-    bake_colors: bool = False,
+    bake_colors: bool = True,
 ):
-    """Instantiates milling particle meshes in Blender with PSD scaling and dynamic velocity colormaps."""
+    """Instantiates milling particle meshes in Blender with PSD scaling and multi-variable shader-driven colormaps."""
     if bpy is None:
         return
 
@@ -1195,37 +1493,40 @@ def instantiate_dem_particles_in_blender(
     radii = result.ball_radii if len(result.ball_radii) == num_balls else np.full(num_balls, result.ball_radius_m)
 
     # -------------------------------------------------------------------------
-    # Scientific Material Setup with Object Color / Heatmap support
+    # Scientific Material Setup with Shader-Driven ColorRamp
     # -------------------------------------------------------------------------
-    mat_name = "DEM_Particle_Heatmap_Material"
-    mat = bpy.data.materials.get(mat_name)
+    if ensure_dem_particle_shaders:
+        ensure_dem_particle_shaders(context)
+
+    mat = get_dem_shader_for_mode(colormap_mode) if get_dem_shader_for_mode else None
     if not mat:
-        mat = bpy.data.materials.new(mat_name)
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
-        nodes.clear()
+        mat_name = "DEM_Particle_Heatmap_Material"
+        mat = bpy.data.materials.get(mat_name)
+        if not mat:
+            mat = bpy.data.materials.new(mat_name)
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            nodes.clear()
 
-        # Nodes: Output, Principled BSDF, and Object Info
-        n_out = nodes.new("ShaderNodeOutputMaterial")
-        n_out.location = (400, 0)
-        n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-        n_bsdf.location = (100, 0)
-        n_info = nodes.new("ShaderNodeObjectInfo")
-        n_info.location = (-200, 0)
+            n_out = nodes.new("ShaderNodeOutputMaterial")
+            n_out.location = (400, 0)
+            n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+            n_bsdf.location = (100, 0)
+            n_info = nodes.new("ShaderNodeObjectInfo")
+            n_info.location = (-200, 0)
 
-        # Wire Object Color to Base Color and Emission Color
-        links.new(n_info.outputs["Color"], n_bsdf.inputs["Base Color"])
-        if "Emission Color" in n_bsdf.inputs:
-            links.new(n_info.outputs["Color"], n_bsdf.inputs["Emission Color"])
-        if "Emission Strength" in n_bsdf.inputs:
-            n_bsdf.inputs["Emission Strength"].default_value = 0.35
-        if "Metallic" in n_bsdf.inputs:
-            n_bsdf.inputs["Metallic"].default_value = 0.50
-        if "Roughness" in n_bsdf.inputs:
-            n_bsdf.inputs["Roughness"].default_value = 0.20
+            links.new(n_info.outputs["Color"], n_bsdf.inputs["Base Color"])
+            if "Emission Color" in n_bsdf.inputs:
+                links.new(n_info.outputs["Color"], n_bsdf.inputs["Emission Color"])
+            if "Emission Strength" in n_bsdf.inputs:
+                n_bsdf.inputs["Emission Strength"].default_value = 0.35
+            if "Metallic" in n_bsdf.inputs:
+                n_bsdf.inputs["Metallic"].default_value = 0.50
+            if "Roughness" in n_bsdf.inputs:
+                n_bsdf.inputs["Roughness"].default_value = 0.20
 
-        links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+            links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
 
     # Reference spherical mesh (unit sphere of radius 1.0, scaled individually per PSD)
     bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=1.0)
@@ -1282,8 +1583,10 @@ def instantiate_dem_particles_in_blender(
     # -------------------------------------------------------------------------
     orig_frame = context.scene.frame_current
     dt = 1.0 / max(1.0, result.fps)
+    max_v = float(np.max(np.linalg.norm(result.velocities, axis=2))) if (hasattr(result, "velocities") and result.velocities is not None and result.velocities.size and np.max(np.linalg.norm(result.velocities, axis=2)) > 0) else 5.5
     max_f = float(np.max(result.forces)) if (hasattr(result, "forces") and result.forces is not None and result.forces.size and np.max(result.forces) > 0) else 100.0
     max_w = float(np.max(np.linalg.norm(result.angular_velocities, axis=2))) if (hasattr(result, "angular_velocities") and result.angular_velocities is not None and result.angular_velocities.size and np.max(result.angular_velocities) > 0) else 100.0
+    max_e = (0.5 * max(result.ball_masses) * (max_v**2)) if (hasattr(result, "ball_masses") and len(result.ball_masses)) else 0.1
 
     for f in range(frames):
         frame_num = f + 1
@@ -1291,9 +1594,9 @@ def instantiate_dem_particles_in_blender(
             ball = ball_objects[i]
             pos = result.trajectories[f, i, :]
             ball.location = (
-                pos[0] + center_offset[0],
-                pos[1] + center_offset[1],
-                pos[2] + center_offset[2],
+                pos[0] / parent_scale[0] + center_offset[0],
+                pos[1] / parent_scale[1] + center_offset[1],
+                pos[2] / parent_scale[2] + center_offset[2],
             )
             ball.keyframe_insert(data_path="location", frame=frame_num)
 
@@ -1306,38 +1609,34 @@ def instantiate_dem_particles_in_blender(
             if bake_colors:
                 vel_vec = result.velocities[f, i, :]
                 v_mag = float(np.linalg.norm(vel_vec))
-                e_kin = 0.5 * result.ball_masses[i] * (v_mag**2) if i < len(result.ball_masses) else None
+                v_norm = min(1.0, max(0.0, v_mag / max(0.1, max_v)))
 
-                mode_clean = (colormap_mode or "VELOCITY").upper()
-                if mode_clean == "FORCE":
-                    f_val = float(result.forces[f, i]) if (hasattr(result, "forces") and result.forces is not None and result.forces.shape[0] > f and result.forces.shape[1] > i) else 0.0
-                    rgba = force_to_colormap_rgb(f_val, f_max=max_f)
-                elif mode_clean == "SPIN":
-                    w_vec = result.angular_velocities[f, i, :] if (hasattr(result, "angular_velocities") and result.angular_velocities is not None and result.angular_velocities.shape[0] > f and result.angular_velocities.shape[1] > i) else [0, 0, 0]
-                    w_mag = float(np.linalg.norm(w_vec))
-                    rgba = spin_to_colormap_rgb(w_mag, w_max=max_w)
-                elif mode_clean == "ENERGY":
-                    norm_e = min(1.0, (e_kin or 0.0) / max(1e-4, result.mean_impact_energy_j * 3.0))
-                    rgba = (norm_e, 0.2, 1.0 - norm_e, 1.0)
-                elif mode_clean in ("SOLID", "STEEL", "CERAMIC", "TUNGSTEN"):
-                    rgba = (0.85, 0.88, 0.92, 1.0)
-                elif evaluate_scientific_colormap is not None:
-                    rgba = evaluate_scientific_colormap(
-                        mode_clean,
-                        v_mag,
-                        v_max=5.5,
-                        e_kin=e_kin,
-                        mean_e=result.mean_impact_energy_j,
-                    )
-                else:
-                    rgba = velocity_to_rainbow_rgb(v_mag, v_max=5.5)
+                f_val = float(result.forces[f, i]) if (hasattr(result, "forces") and result.forces is not None and result.forces.shape[0] > f and result.forces.shape[1] > i) else 0.0
+                f_norm = min(1.0, max(0.0, f_val / max(1.0, max_f)))
 
-                ball.color = rgba
+                e_kin = 0.5 * result.ball_masses[i] * (v_mag**2) if i < len(result.ball_masses) else 0.0
+                e_norm = min(1.0, max(0.0, e_kin / max(1e-4, max_e)))
+
+                w_vec = result.angular_velocities[f, i, :] if (hasattr(result, "angular_velocities") and result.angular_velocities is not None and result.angular_velocities.shape[0] > f and result.angular_velocities.shape[1] > i) else [0, 0, 0]
+                w_mag = float(np.linalg.norm(w_vec))
+                w_norm = min(1.0, max(0.0, w_mag / max(1.0, max_w)))
+
+                # Encodes: Red=Velocity, Green=Force, Blue=Energy, Alpha=Spin
+                ball.color = (v_norm, f_norm, e_norm, w_norm)
                 ball.keyframe_insert(data_path="color", frame=frame_num)
 
-    context.scene.frame_set(orig_frame)
+    context.scene.frame_set(1)
 
-    # Ensure 3D viewport shading is set to OBJECT color so dynamic colors show immediately in Solid mode
+    # Create or update in-viewport 3D analytical color & data strip
+    try:
+        if create_or_update_analytical_color_strip:
+            props = getattr(context.scene, "science_blocks_props", None) if context else None
+            show_s = getattr(props, "show_analytical_color_strip", True) if props else True
+            create_or_update_analytical_color_strip(context, result=result, mode=colormap_mode, show=show_s)
+    except Exception:
+        pass
+
+    # Ensure 3D viewport shading shows materials
     try:
         for area in context.screen.areas:
             if area.type == "VIEW_3D":
@@ -1356,11 +1655,21 @@ def apply_particle_colormap_postprocess(
     """Applies dynamic colormapping (Velocity, Force, Energy, Spin, Solid) as a fast post-processing pass."""
     global last_dem_result
     res = result or last_dem_result
-    if res is None or not hasattr(res, "trajectories") or res.trajectories is None:
+
+    if bpy is None or context is None:
         return 0
 
-    if bpy is None:
-        return 0
+    mode_clean = (colormap_mode or "VELOCITY").upper()
+
+    # 1. Update shader materials on all particle meshes
+    if assign_dem_shader_to_particles:
+        assign_dem_shader_to_particles(context, shader_mode=mode_clean)
+
+    # 2. Update 3D Analytical Color & Data Strip
+    if create_or_update_analytical_color_strip:
+        props = getattr(context.scene, "science_blocks_props", None) if context else None
+        show_s = getattr(props, "show_analytical_color_strip", True) if props else True
+        create_or_update_analytical_color_strip(context, result=res, mode=mode_clean, show=show_s)
 
     coll = bpy.data.collections.get("Science_Blocks_Milling_Media")
     if not coll:
@@ -1373,68 +1682,4 @@ def apply_particle_colormap_postprocess(
     if not ball_objects:
         return 0
 
-    frames, num_balls, _ = res.trajectories.shape
-    num_to_color = min(len(ball_objects), num_balls)
-    orig_frame = context.scene.frame_current
-
-    max_f = float(np.max(res.forces)) if (hasattr(res, "forces") and res.forces is not None and res.forces.size and np.max(res.forces) > 0) else 100.0
-    max_w = float(np.max(np.linalg.norm(res.angular_velocities, axis=2))) if (hasattr(res, "angular_velocities") and res.angular_velocities is not None and res.angular_velocities.size and np.max(res.angular_velocities) > 0) else 100.0
-    mode_clean = (colormap_mode or "VELOCITY").upper()
-
-    if mode_clean in ("SOLID", "STEEL", "CERAMIC", "TUNGSTEN"):
-        # Static realistic material - clear color animation and set solid color
-        for i in range(num_to_color):
-            ball = ball_objects[i]
-            if ball.animation_data and ball.animation_data.action:
-                act = ball.animation_data.action
-                if hasattr(act, "fcurves"):
-                    fcs = [fc for fc in act.fcurves if fc.data_path == "color"]
-                    for fc in fcs:
-                        act.fcurves.remove(fc)
-            ball.color = (0.85, 0.88, 0.92, 1.0)
-    else:
-        for f in range(frames):
-            frame_num = f + 1
-            for i in range(num_to_color):
-                ball = ball_objects[i]
-                vel_vec = res.velocities[f, i, :]
-                v_mag = float(np.linalg.norm(vel_vec))
-                e_kin = 0.5 * res.ball_masses[i] * (v_mag**2) if i < len(res.ball_masses) else None
-
-                if mode_clean == "FORCE":
-                    f_val = float(res.forces[f, i]) if (hasattr(res, "forces") and res.forces is not None and res.forces.shape[0] > f and res.forces.shape[1] > i) else 0.0
-                    rgba = force_to_colormap_rgb(f_val, f_max=max_f)
-                elif mode_clean == "SPIN":
-                    w_vec = res.angular_velocities[f, i, :] if (hasattr(res, "angular_velocities") and res.angular_velocities is not None and res.angular_velocities.shape[0] > f and res.angular_velocities.shape[1] > i) else [0, 0, 0]
-                    w_mag = float(np.linalg.norm(w_vec))
-                    rgba = spin_to_colormap_rgb(w_mag, w_max=max_w)
-                elif mode_clean == "ENERGY":
-                    norm_e = min(1.0, (e_kin or 0.0) / max(1e-4, res.mean_impact_energy_j * 3.0))
-                    rgba = (norm_e, 0.2, 1.0 - norm_e, 1.0)
-                elif evaluate_scientific_colormap is not None:
-                    rgba = evaluate_scientific_colormap(
-                        mode_clean,
-                        v_mag,
-                        v_max=5.5,
-                        e_kin=e_kin,
-                        mean_e=res.mean_impact_energy_j,
-                    )
-                else:
-                    rgba = velocity_to_rainbow_rgb(v_mag, v_max=5.5)
-
-                ball.color = rgba
-                ball.keyframe_insert(data_path="color", frame=frame_num)
-
-    context.scene.frame_set(orig_frame)
-
-    # Ensure 3D viewport shows object colors
-    try:
-        for area in context.screen.areas:
-            if area.type == "VIEW_3D":
-                for space in area.spaces:
-                    if space.type == "VIEW_3D":
-                        space.shading.color_type = "OBJECT"
-    except Exception:
-        pass
-
-    return num_to_color
+    return len(ball_objects)

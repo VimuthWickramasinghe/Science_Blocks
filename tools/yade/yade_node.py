@@ -106,6 +106,7 @@ class ScienceBlocksYadeNode(bpy.types.Node):
 
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Jar Chamber")
+        self.inputs.new("ScienceBlocksObjectSocket", "Source Tap / Plane")
         self.inputs.new("ScienceBlocksRPMSocket", "Drive RPM")
         self.inputs.new("ScienceBlocksPhysicsSocket", "Media Physics")
         self.outputs.new("ScienceBlocksSimSocket", "Milling Particles")
@@ -175,12 +176,58 @@ class ScienceBlocksYadeNode(bpy.types.Node):
                 if getattr(self, "stl_scale", 1.0) == 0.001:
                     r_scale.label(text="mm -> m")
 
-        row_phys = col.row(align=True)
-        row_phys.prop(self, "restitution", text="Bounciness")
-        row_phys.prop(self, "settle_delay", text="Settle (s)")
+        col.prop(self, "restitution", text="Bounciness (Restitution)")
+
+        # Settle seconds is configured intuitively on the Variable RPM Source node
+        sock_rpm = self.inputs.get("Drive RPM")
+        s_val = None
+        if sock_rpm and sock_rpm.is_linked:
+            try:
+                from ...nodes import get_rpm_source_profile
+                prof = get_rpm_source_profile(self, "Drive RPM")
+                s_val = prof.get("settle_delay")
+            except Exception:
+                try:
+                    from nodes import get_rpm_source_profile
+                    prof = get_rpm_source_profile(self, "Drive RPM")
+                    s_val = prof.get("settle_delay")
+                except Exception:
+                    pass
+        if s_val is not None:
+            col.label(text=f"Settle Time: {s_val:.2f}s (from RPM Node)", icon="TIME")
 
         if "Media Physics" not in self.inputs or not self.inputs["Media Physics"].is_linked:
             col.prop(self, "ball_radius_mm", text="Ball Radius (mm)")
+
+        # Source Tap / Plane status and placement
+        sock_tap = self.inputs.get("Source Tap / Plane")
+        from_tap = None
+        if sock_tap and sock_tap.is_linked:
+            try:
+                from ...operators import resolve_object_from_socket
+                from_tap = resolve_object_from_socket(sock_tap)
+            except Exception:
+                try:
+                    from operators import resolve_object_from_socket
+                    from_tap = resolve_object_from_socket(sock_tap)
+                except Exception:
+                    pass
+
+        row_tap = col.row(align=True)
+        tap_in_scene = False
+        if hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
+            if hasattr(bpy.data.objects, "get"):
+                tap_in_scene = bool(bpy.data.objects.get("Particle_Tap_Inlet"))
+            elif isinstance(bpy.data.objects, dict):
+                tap_in_scene = "Particle_Tap_Inlet" in bpy.data.objects
+
+        if from_tap:
+            row_tap.label(text=f"Tap: {from_tap.name}", icon="SNAP_GRID")
+        elif tap_in_scene:
+            row_tap.label(text="Tap: Particle_Tap_Inlet", icon="CHECKMARK")
+        else:
+            row_tap.label(text="Source: Auto Top Tap", icon="CON_LOCLIKE")
+        row_tap.operator("science_blocks.create_particle_source_plane", text="Place Tap", icon="ADD")
 
         col.separator(factor=0.3)
         props = getattr(context.scene, "science_blocks_props", None)
@@ -211,4 +258,16 @@ class ScienceBlocksYadeNode(bpy.types.Node):
             btn_text = "Re-Bake Yade Simulation" if getattr(props, "dem_is_simulated", False) else "Bake Yade Simulation"
             btn_icon = "CHECKMARK" if getattr(props, "dem_is_simulated", False) else "PHYSICS"
             row_b.operator("science_blocks.run_dem_simulation", text=btn_text, icon=btn_icon)
+
+            if getattr(props, "dem_is_simulated", False):
+                col.separator(factor=0.3)
+                try:
+                    from ...colormaps import draw_analytical_data_strip_ui
+                    draw_analytical_data_strip_ui(col, context, active_mode=getattr(props, "dem_viewport_colormap", "VELOCITY"))
+                except Exception:
+                    try:
+                        from colormaps import draw_analytical_data_strip_ui
+                        draw_analytical_data_strip_ui(col, context, active_mode=getattr(props, "dem_viewport_colormap", "VELOCITY"))
+                    except Exception:
+                        pass
 

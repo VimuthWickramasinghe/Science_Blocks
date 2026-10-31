@@ -8,6 +8,11 @@ import os
 import math
 import struct
 import mathutils
+try:
+    from mathutils import Vector, Matrix
+except ImportError:
+    Vector = getattr(mathutils, "Vector", None)
+    Matrix = getattr(mathutils, "Matrix", None)
 import bmesh
 import subprocess
 import shutil
@@ -745,10 +750,20 @@ class SCIENCE_BLOCKS_OT_save_setup(bpy.types.Operator):
         jar_rpm = -300.0
         gear_ratio = 1.5
         invert_dir = True
+        rpm_mode = "CONSTANT"
+        rpm_start = 0.0
+        rpm_end = 200.0
+        ramp_duration = 5.0
+        settle_delay = getattr(props, "dem_settle_delay_s", 1.0)
         if props.active_node_tree:
             for node in props.active_node_tree.nodes:
                 if node.bl_idname == "ScienceBlocksRPMValueNode":
                     sun_rpm = node.rpm_constant
+                    rpm_mode = getattr(node, "mode", "CONSTANT")
+                    rpm_start = getattr(node, "rpm_start", 0.0)
+                    rpm_end = getattr(node, "rpm_end", 200.0)
+                    ramp_duration = getattr(node, "ramp_duration", 5.0)
+                    settle_delay = getattr(node, "settle_delay", settle_delay)
                 elif node.bl_idname == "ScienceBlocksGearRatioNode":
                     gear_ratio = node.gear_ratio
                     invert_dir = node.invert_direction
@@ -768,6 +783,11 @@ class SCIENCE_BLOCKS_OT_save_setup(bpy.types.Operator):
                 "jar_rpm": jar_rpm,
                 "gear_ratio": gear_ratio,
                 "invert_direction": invert_dir,
+                "rpm_mode": rpm_mode,
+                "rpm_start": rpm_start,
+                "rpm_end": rpm_end,
+                "ramp_duration": ramp_duration,
+                "settle_delay": settle_delay,
             },
             "dem_parameters": {
                 "ball_count": props.dem_ball_count,
@@ -886,8 +906,19 @@ class SCIENCE_BLOCKS_OT_load_setup(bpy.types.Operator):
             node_kin = config_data.get("node_kinematics", {})
             if props.active_node_tree and node_kin:
                 for node in props.active_node_tree.nodes:
-                    if node.bl_idname == "ScienceBlocksRPMValueNode" and "sun_rpm" in node_kin:
-                        node.rpm_constant = float(node_kin["sun_rpm"])
+                    if node.bl_idname == "ScienceBlocksRPMValueNode":
+                        if "sun_rpm" in node_kin:
+                            node.rpm_constant = float(node_kin["sun_rpm"])
+                        if "rpm_mode" in node_kin:
+                            node.mode = node_kin["rpm_mode"]
+                        if "rpm_start" in node_kin:
+                            node.rpm_start = float(node_kin["rpm_start"])
+                        if "rpm_end" in node_kin:
+                            node.rpm_end = float(node_kin["rpm_end"])
+                        if "ramp_duration" in node_kin:
+                            node.ramp_duration = float(node_kin["ramp_duration"])
+                        if "settle_delay" in node_kin:
+                            node.settle_delay = float(node_kin["settle_delay"])
                     elif node.bl_idname == "ScienceBlocksGearRatioNode":
                         if "gear_ratio" in node_kin:
                             node.gear_ratio = float(node_kin["gear_ratio"])
@@ -1878,6 +1909,82 @@ class SCIENCE_BLOCKS_OT_export_container_stl(bpy.types.Operator):
             return {"CANCELLED"}
 
 
+def detect_cavity_geometry(verts_local, polys, half_extents, center_offset=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0)):
+    """Detects internal cavities, pockets, inward extruded faces, or wells in a mesh object.
+
+    Returns:
+        dict with cavity centroid, bounds, radius, inlet position in simulation & local space,
+        or None if the mesh is a primitive envelope without interior faces.
+    """
+    if not verts_local or not polys:
+        return None
+
+    verts_arr = np.array(verts_local, dtype=np.float64)
+    hx, hy, hz = half_extents
+    cx, cy, cz = center_offset
+    sx, sy, sz = scale
+
+    sim_coords = np.zeros_like(verts_arr)
+    sim_coords[:, 0] = (verts_arr[:, 0] - cx) * sx
+    sim_coords[:, 1] = (verts_arr[:, 1] - cy) * sy
+    sim_coords[:, 2] = (verts_arr[:, 2] - cz) * sz
+
+    eps = max(1e-4, 1e-3 * max(hx, hy, hz, 0.1))
+
+    interior_polys = []
+    interior_vert_indices = set()
+
+    for p in polys:
+        pts = sim_coords[p]
+        on_boundary = (
+            np.all(np.abs(pts[:, 0] - (-hx)) < eps) or
+            np.all(np.abs(pts[:, 0] - (+hx)) < eps) or
+            np.all(np.abs(pts[:, 1] - (-hy)) < eps) or
+            np.all(np.abs(pts[:, 1] - (+hy)) < eps) or
+            np.all(np.abs(pts[:, 2] - (-hz)) < eps) or
+            np.all(np.abs(pts[:, 2] - (+hz)) < eps)
+        )
+        if not on_boundary:
+            interior_polys.append(p)
+            for vi in p:
+                interior_vert_indices.add(vi)
+
+    if not interior_polys or len(interior_vert_indices) < 3:
+        return None
+
+    int_coords = sim_coords[list(interior_vert_indices)]
+    min_c = np.min(int_coords, axis=0)
+    max_c = np.max(int_coords, axis=0)
+    cav_center = (min_c + max_c) / 2.0
+
+    r_xy = float(np.max(np.sqrt((int_coords[:, 0] - cav_center[0])**2 + (int_coords[:, 1] - cav_center[1])**2)))
+    w_z = float(max_c[2] - min_c[2])
+    # Inlet point positioned at upper opening of the cavity feature
+    if max_c[2] < (hz - 0.15 * hz):
+        # Feature is in the lower portion of container (e.g. floor extrusion, recess, or well)
+        # Position inlet above the extruded surface so particles drop cleanly onto the floor
+        inlet_z = float(max_c[2] + max(0.06, 0.10 * w_z))
+    else:
+        # Cavity opens at top of container (e.g. hollow cup, jar, or drum chamber)
+        inlet_z = float(max_c[2] - 0.08 * w_z) if w_z > 1e-4 else float(max_c[2])
+    inlet_pos_sim = (float(cav_center[0]), float(cav_center[1]), inlet_z)
+
+    local_inlet = (
+        float(inlet_pos_sim[0] / sx + cx),
+        float(inlet_pos_sim[1] / sy + cy),
+        float(inlet_pos_sim[2] / sz + cz),
+    )
+
+    return {
+        "cavity_center_sim": (float(cav_center[0]), float(cav_center[1]), float(cav_center[2])),
+        "cavity_bounds_sim": (min_c.tolist(), max_c.tolist()),
+        "cavity_radius_sim": max(0.02, r_xy),
+        "inlet_pos_sim": inlet_pos_sim,
+        "local_inlet": local_inlet,
+        "interior_poly_count": len(interior_polys),
+    }
+
+
 def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl_filepath=None):
     """Analyzes 3D container mesh and returns shape type (BOX, CYLINDER, MESH), half-extents, centered BVH, and exported STL."""
     if not jar_obj or jar_obj.type != "MESH":
@@ -1936,10 +2043,51 @@ def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl
     hy = max(0.05, float(dy / 2.0))
     hz = max(0.05, float(dz / 2.0))
 
+    sx = abs(jar_obj.scale.x) if hasattr(jar_obj.scale, "x") else 1.0
+    sy = abs(jar_obj.scale.y) if hasattr(jar_obj.scale, "y") else 1.0
+    sz = abs(jar_obj.scale.z) if hasattr(jar_obj.scale, "z") else 1.0
+
+    # Detect internal cavity, pocket, well, or inward extruded features
+    cavity_info = None
+    if n_polys > 0:
+        cavity_info = detect_cavity_geometry(
+            verts_local=[(v.co.x, v.co.y, v.co.z) for v in mesh.vertices],
+            polys=[list(p.vertices) for p in mesh.polygons],
+            half_extents=(hx, hy, hz),
+            center_offset=(cx, cy, cz),
+            scale=(sx, sy, sz),
+        )
+
+    # Calculate face orthogonality for envelope determination & shape detection
+    ortho_ratio = 0.0
+    if n_polys > 0:
+        axis_aligned_count = 0
+        for p in mesh.polygons:
+            if hasattr(p, "normal") and p.normal is not None:
+                fn = p.normal
+                fn_vec = (float(fn[0]), float(fn[1]), float(fn[2]))
+            elif len(p.vertices) >= 3:
+                v0 = mesh.vertices[p.vertices[0]].co
+                v1 = mesh.vertices[p.vertices[1]].co
+                v2 = mesh.vertices[p.vertices[2]].co
+                e1 = np.array([v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]], dtype=np.float64)
+                e2 = np.array([v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]], dtype=np.float64)
+                cp = np.cross(e1, e2)
+                cp_len = np.linalg.norm(cp)
+                fn_vec = cp / cp_len if cp_len > 1e-9 else (0.0, 0.0, 1.0)
+            else:
+                fn_vec = (0.0, 0.0, 1.0)
+
+            if max(abs(fn_vec[0]), abs(fn_vec[1]), abs(fn_vec[2])) > 0.90:
+                axis_aligned_count += 1
+
+        ortho_ratio = axis_aligned_count / max(1, n_polys)
+
     mode = (shape_override or "AUTO").upper()
 
     # Determine if mesh has modeled ridges, lifters, or non-primitive geometry
     detected_shape = "BOX"
+    detected_axis = "Z"
     has_modeled_ridge = False
 
     if mode == "BOX":
@@ -1953,39 +2101,23 @@ def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl
         if "suzanne" in name or "monkey" in name:
             detected_shape = "MESH"
             has_modeled_ridge = True
+        elif cavity_info is not None and cavity_info.get("interior_poly_count", 0) > 0:
+            # Modeled cavity, pocket, well, or inward extrusion detected inside object
+            detected_shape = "MESH"
+            has_modeled_ridge = True
         elif n_polys > 0:
-            # Orthogonality test: on any box/cuboid (regardless of subdivisions, thickness, or name),
-            # virtually all face normals are aligned with principal axes (ortho_ratio >= 0.82).
-            # On curved surfaces like cylinders or spheres, ortho_ratio is typically < 0.25.
-            axis_aligned_count = 0
-            for p in mesh.polygons:
-                if hasattr(p, "normal") and p.normal is not None:
-                    fn = p.normal
-                    fn_vec = (float(fn[0]), float(fn[1]), float(fn[2]))
-                elif len(p.vertices) >= 3:
-                    v0 = mesh.vertices[p.vertices[0]].co
-                    v1 = mesh.vertices[p.vertices[1]].co
-                    v2 = mesh.vertices[p.vertices[2]].co
-                    e1 = np.array([v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]], dtype=np.float64)
-                    e2 = np.array([v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]], dtype=np.float64)
-                    cp = np.cross(e1, e2)
-                    cp_len = np.linalg.norm(cp)
-                    fn_vec = cp / cp_len if cp_len > 1e-9 else (0.0, 0.0, 1.0)
-                else:
-                    fn_vec = (0.0, 0.0, 1.0)
-
-                if max(abs(fn_vec[0]), abs(fn_vec[1]), abs(fn_vec[2])) > 0.90:
-                    axis_aligned_count += 1
-
-            ortho_ratio = axis_aligned_count / max(1, n_polys)
-
             if ortho_ratio >= 0.82:
-                # Flat planar orthogonal walls -> Box Container (even if object is named Jar_Chamber)
-                detected_shape = "BOX"
+                # Flat planar orthogonal walls: differentiate simple 6-sided primitive box from modeled mesh
+                is_primitive_box = (n_polys <= 6 and n_verts <= 8) or (n_polys <= 12 and n_verts <= 8)
+                if is_primitive_box and (cavity_info is None or cavity_info.get("interior_poly_count", 0) == 0):
+                    detected_shape = "BOX"
+                else:
+                    detected_shape = "MESH"
+                    has_modeled_ridge = True
             else:
                 # Non-orthogonal geometry: differentiate smooth cylinder from modeled ridges / lifters / CAD
                 coords = np.array([
-                    [(v.co.x - cx) * jar_obj.scale.x, (v.co.y - cy) * jar_obj.scale.y, (v.co.z - cz) * jar_obj.scale.z]
+                    [(v.co.x - cx) * sx, (v.co.y - cy) * sy, (v.co.z - cz) * sz]
                     for v in mesh.vertices
                 ], dtype=np.float64)
 
@@ -2007,9 +2139,9 @@ def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl
                 spread_xz, max_xz = compute_radial_spread(r_xz)
                 spread_yz, max_yz = compute_radial_spread(r_yz)
 
-                candidates = [(spread_xy, max_xy), (spread_xz, max_xz), (spread_yz, max_yz)]
+                candidates = [(spread_xy, max_xy, "Z"), (spread_xz, max_xz, "Y"), (spread_yz, max_yz, "X")]
                 candidates.sort(key=lambda item: item[0])
-                min_spread, nominal_r = candidates[0]
+                min_spread, nominal_r, detected_axis = candidates[0]
 
                 if "ridge" in name or "lifter" in name or "baffle" in name:
                     has_modeled_ridge = True
@@ -2024,18 +2156,19 @@ def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl
                     detected_shape = "CYLINDER"
         else:
             detected_shape = "BOX"
+            detected_axis = "Z"
 
     # Build BVHTree centered at (cx, cy, cz) so BVH aligns with DEM simulation coordinates
     bvh = None
-    if detected_shape == "MESH" or has_modeled_ridge:
+    if detected_shape == "MESH" or has_modeled_ridge or (n_polys > 6 and n_verts > 8) or cavity_info:
         try:
             from mathutils.bvhtree import BVHTree
             import mathutils
             verts = [
                 mathutils.Vector((
-                    (v.co.x - cx) * jar_obj.scale.x,
-                    (v.co.y - cy) * jar_obj.scale.y,
-                    (v.co.z - cz) * jar_obj.scale.z
+                    (v.co.x - cx) * sx,
+                    (v.co.y - cy) * sy,
+                    (v.co.z - cz) * sz
                 ))
                 for v in mesh.vertices
             ]
@@ -2064,8 +2197,11 @@ def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl
         "half_extents": (hx, hy, hz),
         "r_jar": r_jar,
         "h_jar": h_jar,
+        "axis": detected_axis if detected_shape != "BOX" else "Z",
+        "center_offset": (cx, cy, cz),
         "bvh_tree": bvh,
         "stl_filepath": stl_path,
+        "cavity_info": cavity_info,
     }
 
 
@@ -2081,7 +2217,7 @@ def detect_mill_orientation(sun_obj, mode_setting="AUTO") -> str:
             return "HORIZONTAL"
 
     check_obj = sun_obj
-    if not check_obj and props and props.jar_chamber_obj:
+    if not check_obj and props and getattr(props, "jar_chamber_obj", None):
         check_obj = props.jar_chamber_obj
 
     if not check_obj:
@@ -2115,7 +2251,7 @@ def get_effective_node_tree(context=None, props=None):
                     props.active_node_tree = tree
                 return tree
 
-    for group in bpy.data.node_groups:
+    for group in getattr(bpy.data, "node_groups", []):
         if getattr(group, "bl_idname", None) == "ScienceBlocksNodeTree":
             if props:
                 props.active_node_tree = group
@@ -2226,6 +2362,24 @@ def extract_solver_settings_from_tree(tree, jar_obj=None):
     if not solver_node:
         return {}
 
+    # Resolve settle delay prioritizing Variable RPM Source node (even through gear ratio chains)
+    settle_delay = getattr(solver_node, "settle_delay", 1.0)
+    try:
+        try:
+            from .nodes import get_rpm_source_profile
+        except (ImportError, ValueError):
+            from nodes import get_rpm_source_profile
+        if solver_node and "Drive RPM" in solver_node.inputs and solver_node.inputs["Drive RPM"].is_linked:
+            prof = get_rpm_source_profile(solver_node, "Drive RPM")
+            settle_delay = prof.get("settle_delay", settle_delay)
+        elif tree:
+            for n in tree.nodes:
+                if n.bl_idname == "ScienceBlocksRPMValueNode":
+                    settle_delay = getattr(n, "settle_delay", settle_delay)
+                    break
+    except Exception:
+        pass
+
     return {
         "solver_node": solver_node,
         "ball_count": getattr(solver_node, "ball_count", 25),
@@ -2233,7 +2387,7 @@ def extract_solver_settings_from_tree(tree, jar_obj=None):
         "ball_radius_mm": getattr(solver_node, "ball_radius_mm", 12.0),
         "contact_model": getattr(solver_node, "contact_model", "HERTZ_MINDLIN"),
         "restitution": getattr(solver_node, "restitution", 0.35),
-        "settle_delay": getattr(solver_node, "settle_delay", 1.0),
+        "settle_delay": settle_delay,
         "substeps": getattr(solver_node, "substeps", 40),
         "charge_distribution": getattr(solver_node, "charge_distribution", "MONODISPERSE"),
         "integrator": getattr(solver_node, "integrator", "VELOCITY_VERLET"),
@@ -2255,8 +2409,8 @@ def resolve_object_from_socket(sock):
     visited = set()
     curr_node = sock.links[0].from_node
 
-    while curr_node and curr_node not in visited:
-        visited.add(curr_node)
+    while curr_node and id(curr_node) not in visited:
+        visited.add(id(curr_node))
 
         # 1. Check get_target_object method on node (ScienceBlocksObjectNode, ScienceBlocksRotationNode, etc.)
         if hasattr(curr_node, "get_target_object"):
@@ -2384,6 +2538,219 @@ def resolve_simulation_objects(context, props, solver_node=None):
         props.sun_wheel_obj = sun_obj
 
     return jar_obj, sun_obj
+
+
+def resolve_source_plane_object(context, props=None, solver_node=None, jar_obj=None):
+    """Discovers and resolves the 3D Source Tap / Inlet object for non-overlapping particle emission."""
+    source_obj = None
+
+    # Priority 1: Target solver node's "Source Tap / Plane" input socket
+    if solver_node and hasattr(solver_node, "inputs"):
+        sock_tap = solver_node.inputs.get("Source Tap / Plane")
+        if sock_tap and getattr(sock_tap, "is_linked", False):
+            source_obj = resolve_object_from_socket(sock_tap)
+
+    # Priority 2: Inspect other solver nodes in active tree
+    tree = get_effective_node_tree(context, props) if (context or props) else None
+    if not source_obj and tree:
+        for node in tree.nodes:
+            if node.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+                sock = node.inputs.get("Source Tap / Plane")
+                if sock and getattr(sock, "is_linked", False):
+                    source_obj = resolve_object_from_socket(sock)
+                    if source_obj:
+                        break
+
+    # Priority 3: Scene property dem_source_plane_obj
+    if not source_obj and props:
+        source_obj = getattr(props, "dem_source_plane_obj", None)
+
+    # Priority 4: Object named 'Particle_Tap_Inlet' or 'Source_Tap' in scene
+    if not source_obj and hasattr(bpy, "data"):
+        for name in ("Particle_Tap_Inlet", "Source_Tap", "Particle_Inlet", "Tap_Plane", "Source_Plane"):
+            candidate = bpy.data.objects.get(name)
+            if candidate:
+                source_obj = candidate
+                break
+
+    return source_obj
+
+
+def create_or_update_particle_source_plane(context, jar_obj=None, location=None, radius=None, geom=None):
+    """Creates or positions a stylized 3D Particle Source Tap / Inlet object above the jar opening."""
+    if bpy is None or context is None:
+        return None
+
+    props = getattr(context.scene, "science_blocks_props", None)
+    if not jar_obj:
+        jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+
+    # Analyze container geometry to position the tap inlet accurately above opening
+    if not geom and jar_obj:
+        geom = analyze_container_geometry(jar_obj, context)
+    r_jar = geom["r_jar"] if geom else 0.45
+    h_jar = geom["h_jar"] if geom else 1.0
+    cavity_info = geom.get("cavity_info") if geom else None
+    if cavity_info and "cavity_radius_sim" in cavity_info:
+        r_tap = float(radius or max(0.04, min(float(cavity_info["cavity_radius_sim"]) * 0.65, 0.18)))
+    else:
+        r_tap = float(radius or max(0.06, min(r_jar * 0.60, 0.18)))
+    h_tap = r_tap * 0.40
+
+    coll_name = "Science_Blocks_DEM"
+    coll = bpy.data.collections.get(coll_name)
+    if not coll:
+        coll = bpy.data.collections.new(coll_name)
+        if hasattr(context.scene, "collection") and hasattr(context.scene.collection, "children"):
+            if hasattr(context.scene.collection.children, "link"):
+                context.scene.collection.children.link(coll)
+            elif hasattr(context.scene.collection.children, "append"):
+                context.scene.collection.children.append(coll)
+
+    tap_name = "Particle_Tap_Inlet"
+    tap_obj = bpy.data.objects.get(tap_name)
+
+    if not tap_obj:
+        mesh = bpy.data.meshes.new(tap_name + "_Mesh")
+        n_seg = 16
+        verts = []
+        # Top ring
+        for i in range(n_seg):
+            th = 2.0 * math.pi * i / n_seg
+            verts.append((r_tap * math.cos(th), r_tap * math.sin(th), h_tap * 0.5))
+        # Bottom nozzle ring
+        r_nozzle = r_tap * 0.65
+        for i in range(n_seg):
+            th = 2.0 * math.pi * i / n_seg
+            verts.append((r_nozzle * math.cos(th), r_nozzle * math.sin(th), -h_tap * 0.5))
+
+        faces = []
+        for i in range(n_seg):
+            nxt = (i + 1) % n_seg
+            faces.append((i, nxt, n_seg + nxt, n_seg + i))
+
+        mesh.from_pydata(verts, [], faces)
+        mesh.update()
+
+        tap_obj = bpy.data.objects.new(tap_name, mesh)
+        if coll and hasattr(coll, "objects"):
+            if hasattr(coll.objects, "link"):
+                coll.objects.link(tap_obj)
+            elif hasattr(coll.objects, "append"):
+                coll.objects.append(tap_obj)
+        elif hasattr(context.scene, "collection") and hasattr(context.scene.collection, "objects"):
+            if hasattr(context.scene.collection.objects, "link"):
+                context.scene.collection.objects.link(tap_obj)
+            elif hasattr(context.scene.collection.objects, "append"):
+                context.scene.collection.objects.append(tap_obj)
+
+    # Material: sleek cyan semi-transparent glass
+    mat_name = "DEM_Source_Tap_Material"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        nodes.clear()
+        n_out = nodes.new("ShaderNodeOutputMaterial")
+        n_out.location = (300, 0)
+        n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        n_bsdf.location = (0, 0)
+        if "Base Color" in n_bsdf.inputs:
+            n_bsdf.inputs["Base Color"].default_value = (0.15, 0.75, 0.95, 0.7)
+        if "Roughness" in n_bsdf.inputs:
+            n_bsdf.inputs["Roughness"].default_value = 0.15
+        if "Metallic" in n_bsdf.inputs:
+            n_bsdf.inputs["Metallic"].default_value = 0.40
+        if "Transmission Weight" in n_bsdf.inputs:
+            n_bsdf.inputs["Transmission Weight"].default_value = 0.65
+        elif "Transmission" in n_bsdf.inputs:
+            n_bsdf.inputs["Transmission"].default_value = 0.65
+        if "Alpha" in n_bsdf.inputs:
+            n_bsdf.inputs["Alpha"].default_value = 0.7
+        mat.node_tree.links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+        if hasattr(mat, "blend_method"):
+            mat.blend_method = "BLEND"
+        if hasattr(mat, "shadow_method"):
+            mat.shadow_method = "NONE"
+
+    if hasattr(tap_obj, "data") and hasattr(tap_obj.data, "materials"):
+        if not tap_obj.data.materials:
+            tap_obj.data.materials.append(mat)
+        else:
+            tap_obj.data.materials[0] = mat
+
+    # Position tap inlet relative to jar chamber
+    if location is not None:
+        tap_obj.location = location
+    elif jar_obj:
+        cavity_info = geom.get("cavity_info") if geom else None
+        if cavity_info and "local_inlet" in cavity_info:
+            local_top = Vector(cavity_info["local_inlet"])
+            r_cav = float(cavity_info.get("cavity_radius_sim", r_jar))
+            tap_obj.scale = (r_cav * 0.70, r_cav * 0.70, 0.005)
+        else:
+            axis_c = "Z"
+            if geom:
+                axis_c = geom.get("axis", "Z")
+            bb = getattr(jar_obj, "bound_box", None)
+            if bb:
+                cx = (min(v[0] for v in bb) + max(v[0] for v in bb)) / 2.0
+                cy = (min(v[1] for v in bb) + max(v[1] for v in bb)) / 2.0
+                cz = (min(v[2] for v in bb) + max(v[2] for v in bb)) / 2.0
+                max_x = max(v[0] for v in bb)
+                max_y = max(v[1] for v in bb)
+                max_z = max(v[2] for v in bb)
+                if axis_c == "X":
+                    local_top = Vector((max_x, cy, cz))
+                elif axis_c == "Y":
+                    local_top = Vector((cx, max_y, cz))
+                else:
+                    local_top = Vector((cx, cy, max_z))
+            else:
+                loc = getattr(jar_obj, "location", (0.0, 0.0, 0.0))
+                cx = float(loc.x if hasattr(loc, "x") else loc[0])
+                cy = float(loc.y if hasattr(loc, "y") else loc[1])
+                cz = float(loc.z if hasattr(loc, "z") else loc[2])
+                local_top = Vector((cx, cy, cz + h_jar * 0.5))
+
+        world_pos = jar_obj.matrix_world @ local_top
+        tap_obj.location = world_pos
+        tap_obj.rotation_euler = jar_obj.rotation_euler.copy()
+
+    if props:
+        props.dem_source_plane_obj = tap_obj
+        props.dem_use_source_plane = True
+
+    return tap_obj
+
+
+class SCIENCE_BLOCKS_OT_create_particle_source_plane(bpy.types.Operator):
+    """Create or position a 3D Source Tap / Inlet object above the jar opening for non-overlapping particle emission."""
+    bl_idname = "science_blocks.create_particle_source_plane"
+    bl_label = "Place Source Tap Plane"
+    bl_description = "Create or position a 3D Source Tap Inlet object above the jar opening for non-overlapping particle emission"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        jar_obj = None
+        tree = get_effective_node_tree(context, props)
+        active_node = None
+        if tree:
+            for n in tree.nodes:
+                if n.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+                    active_node = n
+                    break
+        jar_obj, _ = resolve_simulation_objects(context, props, solver_node=active_node)
+        tap_obj = create_or_update_particle_source_plane(context, jar_obj=jar_obj)
+
+        if tap_obj:
+            self.report({"INFO"}, f"Science Blocks: Placed source tap '{tap_obj.name}' above jar chamber.")
+            return {"FINISHED"}
+        else:
+            self.report({"WARNING"}, "Science Blocks: Could not create source tap.")
+            return {"CANCELLED"}
 
 
 def _solve_dem_background_worker(params, props_dict, thread_state):
@@ -2518,11 +2885,26 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             self.report({"ERROR"}, "No Jar Chamber object selected or found. Connect your 3D object to 'Jar Chamber' or select an object in the scene.")
             return None
 
-        # 4. Read RPM from node tree if available
+        # 4. Read RPM & Speed profile from node tree if available (supports Constant or Linear Ramp)
         sun_rpm = 0.0 if not sun_obj else 200.0
         jar_rpm = 300.0
+        rpm_mode = "CONSTANT"
+        jar_rpm_start = 300.0
+        jar_rpm_end = 300.0
+        jar_ramp_duration = 5.0
+        settle_delay_s = getattr(props, "dem_settle_delay_s", 1.0)
+        sun_rpm_mode = "CONSTANT"
+        sun_rpm_start = 200.0
+        sun_rpm_end = 200.0
+        sun_ramp_duration = 5.0
+
         if tree:
             has_gear_node = any(n.bl_idname == "ScienceBlocksGearRatioNode" for n in tree.nodes)
+            try:
+                from .nodes import get_rpm_source_profile, get_input_rpm
+            except (ImportError, ValueError):
+                from nodes import get_rpm_source_profile, get_input_rpm
+
             if not has_gear_node or not sun_obj:
                 # Standalone Rotating Container Mode (e.g. single rotating Cube or drum):
                 sun_rpm = 0.0
@@ -2531,22 +2913,42 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
                     if node.bl_idname == "ScienceBlocksRotationNode":
                         target = node.get_target_object()
                         if target == jar_obj or not jar_obj or not jar_rpm_found:
-                            from .nodes import get_input_rpm
-                            val = get_input_rpm(node, "RPM", 0.0)
+                            prof = get_rpm_source_profile(node, "RPM")
                             direction_sign = -1.0 if node.direction == "CW" else 1.0
-                            jar_rpm = abs(val) * direction_sign
+                            rpm_mode = prof.get("mode", "CONSTANT")
+                            jar_rpm = abs(prof.get("rpm_constant", 300.0)) * direction_sign
+                            jar_rpm_start = abs(prof.get("rpm_start", 0.0)) * direction_sign
+                            jar_rpm_end = abs(prof.get("rpm_end", 300.0)) * direction_sign
+                            jar_ramp_duration = prof.get("ramp_duration", 5.0)
+                            settle_delay_s = prof.get("settle_delay", settle_delay_s)
                             jar_rpm_found = True
                     elif node.bl_idname == "ScienceBlocksRPMValueNode" and not jar_rpm_found:
+                        rpm_mode = getattr(node, "mode", "CONSTANT")
                         jar_rpm = node.rpm_constant
+                        jar_rpm_start = getattr(node, "rpm_start", 0.0)
+                        jar_rpm_end = getattr(node, "rpm_end", 300.0)
+                        jar_ramp_duration = getattr(node, "ramp_duration", 5.0)
+                        settle_delay_s = getattr(node, "settle_delay", settle_delay_s)
             else:
                 for node in tree.nodes:
                     if node.bl_idname == "ScienceBlocksRPMValueNode":
+                        sun_rpm_mode = getattr(node, "mode", "CONSTANT")
                         sun_rpm = node.rpm_constant
+                        sun_rpm_start = getattr(node, "rpm_start", 0.0)
+                        sun_rpm_end = getattr(node, "rpm_end", 200.0)
+                        sun_ramp_duration = getattr(node, "ramp_duration", 5.0)
+                        settle_delay_s = getattr(node, "settle_delay", settle_delay_s)
                     elif node.bl_idname == "ScienceBlocksGearRatioNode":
+                        sub = get_rpm_source_profile(node, "RPM In")
+                        rpm_mode = sub.get("mode", "CONSTANT")
+                        jar_ramp_duration = sub.get("ramp_duration", 5.0)
+                        settle_delay_s = sub.get("settle_delay", settle_delay_s)
                         ratio = node.gear_ratio if node.calc_mode == "RATIO" else (node.teeth_in / max(1, node.teeth_out))
                         if node.invert_direction:
                             ratio = -ratio
                         jar_rpm = sun_rpm * ratio
+                        jar_rpm_start = sun_rpm_start * ratio
+                        jar_rpm_end = sun_rpm_end * ratio
 
         # Re-resolve rotation axis with the resolved jar_obj
         solver_cfg["rotation_axis"] = solver_cfg.get("rotation_axis") or find_rotation_axis_for_solver(tree, solver_node=active_node, jar_obj=jar_obj)
@@ -2607,14 +3009,14 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
 
                 sock_rpm = active_node.inputs.get("Drive RPM")
                 if sock_rpm and sock_rpm.is_linked:
-                    fn = sock_rpm.links[0].from_node
-                    if hasattr(fn, "rpm_constant"):
-                        jar_rpm = fn.rpm_constant
-                    elif hasattr(fn, "direction"):
-                        from .nodes import get_input_rpm
-                        val = get_input_rpm(fn, "RPM", 0.0)
-                        dir_m = -1.0 if fn.direction == "CW" else 1.0
-                        jar_rpm = abs(val) * dir_m
+                    prof = get_rpm_source_profile(active_node, "Drive RPM")
+                    rpm_mode = prof.get("mode", "CONSTANT")
+                    jar_rpm = prof.get("rpm_constant", jar_rpm)
+                    jar_rpm_start = prof.get("rpm_start", jar_rpm_start)
+                    jar_rpm_end = prof.get("rpm_end", jar_rpm_end)
+                    jar_ramp_duration = prof.get("ramp_duration", jar_ramp_duration)
+                    settle_delay_s = prof.get("settle_delay", settle_delay_s)
+                    props.dem_settle_delay_s = settle_delay_s
 
         fps = context.scene.render.fps / max(1, context.scene.render.fps_base)
 
@@ -2664,12 +3066,63 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
 
         if props and stl_filepath:
             props.dem_container_stl_path = stl_filepath
-        settle_delay_s = getattr(props, "dem_settle_delay_s", 1.0)
+        settle_delay_s = getattr(props, "dem_settle_delay_s", settle_delay_s)
         restitution = getattr(props, "dem_restitution", 0.35)
         static_friction = getattr(props, "dem_static_friction", 0.35)
 
         # Detect effective mill orientation (Auto-detect from sun wheel normal vector if AUTO)
         effective_orientation = detect_mill_orientation(sun_obj, props.mill_orientation)
+
+        # Resolve 3D Source Tap / Inlet object
+        source_plane_obj = resolve_source_plane_object(context, props, solver_node=active_node, jar_obj=jar_obj)
+        use_source_plane = getattr(props, "dem_use_source_plane", True)
+
+        source_plane_center = None
+        source_plane_normal = None
+        source_plane_radius = None
+
+        if source_plane_obj and jar_obj:
+            try:
+                # Bounding box center in jar local coordinates
+                cx, cy, cz = 0.0, 0.0, 0.0
+                if hasattr(jar_obj, "bound_box") and jar_obj.bound_box:
+                    bb = jar_obj.bound_box
+                    cx = (min(v[0] for v in bb) + max(v[0] for v in bb)) / 2.0
+                    cy = (min(v[1] for v in bb) + max(v[1] for v in bb)) / 2.0
+                    cz = (min(v[2] for v in bb) + max(v[2] for v in bb)) / 2.0
+
+                m_jar_inv = jar_obj.matrix_world.inverted()
+                world_loc = source_plane_obj.matrix_world.translation
+                local_loc = m_jar_inv @ world_loc
+
+                # In simulation coordinates: origin (0,0,0) is at bounding box center (cx, cy, cz)
+                # scaled into physical meters
+                sx = abs(jar_obj.scale.x) if hasattr(jar_obj.scale, "x") else 1.0
+                sy = abs(jar_obj.scale.y) if hasattr(jar_obj.scale, "y") else 1.0
+                sz = abs(jar_obj.scale.z) if hasattr(jar_obj.scale, "z") else 1.0
+
+                sim_x = (local_loc.x - cx) * sx
+                sim_y = (local_loc.y - cy) * sy
+                sim_z = (local_loc.z - cz) * sz
+                source_plane_center = (float(sim_x), float(sim_y), float(sim_z))
+
+                world_norm = source_plane_obj.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))
+                local_norm = jar_obj.matrix_world.to_3x3().inverted() @ world_norm
+                if local_norm.length > 1e-6:
+                    local_norm.normalize()
+                    source_plane_normal = (float(local_norm.x), float(local_norm.y), float(local_norm.z))
+
+                dims = source_plane_obj.dimensions
+                r_est = max(0.04, max(dims.x, dims.y) * 0.5)
+                source_plane_radius = float(r_est)
+            except Exception:
+                pass
+
+        cavity_info = geom.get("cavity_info")
+        if source_plane_center is None and cavity_info and "inlet_pos_sim" in cavity_info:
+            source_plane_center = cavity_info["inlet_pos_sim"]
+            source_plane_normal = (0.0, 0.0, -1.0)
+            source_plane_radius = min(float(cavity_info.get("cavity_radius_sim", 0.15)) * 0.70, 0.18)
 
         # Prepare parameters dictionary
         params = {
@@ -2706,6 +3159,19 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             "stl_filepath": stl_filepath,
             "stl_scale": s_scale,
             "cap_open_ends": cap_ends,
+            "use_source_plane": use_source_plane,
+            "source_plane_center": source_plane_center,
+            "source_plane_normal": source_plane_normal,
+            "source_plane_radius": source_plane_radius,
+            "cavity_info": cavity_info,
+            "rpm_mode": rpm_mode,
+            "jar_rpm_start": jar_rpm_start,
+            "jar_rpm_end": jar_rpm_end,
+            "jar_ramp_duration": jar_ramp_duration,
+            "sun_rpm_mode": sun_rpm_mode,
+            "sun_rpm_start": sun_rpm_start,
+            "sun_rpm_end": sun_rpm_end,
+            "sun_ramp_duration": sun_ramp_duration,
         }
 
         # Export native Yade simulation script (yade_simulation.py) into project / blend directory
@@ -2782,10 +3248,39 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         props.analytics_milling_regime = res.milling_regime
         props.analytics_filling_ratio_pct = res.filling_ratio_pct
 
-        # Set timeline and start playback so user sees results immediately
+        # Set timeline cleanly to frame 1
         context.scene.frame_start = 1
         context.scene.frame_end = frames
         context.scene.frame_set(1)
+
+        # Normalize jar chamber and side inspection chamber rest pose at frame 1 (zero out residual angles)
+        if jar_obj and hasattr(jar_obj, "rotation_euler"):
+            jar_obj.rotation_mode = "XYZ"
+            jar_obj.rotation_euler.z = 0.0
+            if effective_orientation == "VERTICAL":
+                jar_obj.rotation_euler.x = 0.0
+                jar_obj.rotation_euler.y = 0.0
+
+        if props.active_node_tree:
+            for n in props.active_node_tree.nodes:
+                if n.bl_idname == "ScienceBlocksRotationNode":
+                    n.base_rot_z = 0.0
+                    n.has_captured_base = True
+
+        side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+        if side_jar and hasattr(side_jar, "rotation_euler"):
+            side_jar.rotation_euler.z = 0.0
+
+        # Synchronize live kinematics and apparent gravity arrow at frame 1 rest pose
+        try:
+            from .nodes import evaluate_kinematics_frame, update_gravity_arrow_transform
+        except (ImportError, ValueError):
+            from nodes import evaluate_kinematics_frame, update_gravity_arrow_transform
+        try:
+            evaluate_kinematics_frame(context.scene)
+            update_gravity_arrow_transform(context.scene, 0.0)
+        except Exception:
+            pass
 
         # Professional post-bake jar focus & camera inspection framing
         try:
@@ -2793,10 +3288,11 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         except Exception:
             pass
 
-        try:
-            bpy.ops.screen.animation_play()
-        except Exception:
-            pass
+        if getattr(props, "auto_play_after_bake", False):
+            try:
+                bpy.ops.screen.animation_play()
+            except Exception:
+                pass
 
         engine_label = "Yade DEM" if props.dem_solver_engine == "YADE" else "DEM"
         self.report({"INFO"}, f"{engine_label} Complete: {res.total_impacts} impacts, Mean Energy: {res.mean_impact_energy_j:.4f} J, Power: {res.estimated_power_watts:.1f} W")
@@ -3800,8 +4296,10 @@ def sync_side_jar_view(context_or_scene=None) -> bool:
             side_pointer.scale = orig_pointer.scale
             updated = True
 
-    # 6. Stationary side jar stabilization when side_jar_spin is false
-    if not getattr(props, "side_jar_spin", False):
+    # 6. Stationary side jar stabilization when side_jar_spin is false or at rest frame
+    scene_cur = getattr(bpy, "context", None) and getattr(bpy.context, "scene", None)
+    is_at_rest = scene_cur and getattr(scene_cur, "frame_current", 1) <= getattr(scene_cur, "frame_start", 1)
+    if not getattr(props, "side_jar_spin", False) or is_at_rest:
         if abs(side_jar.rotation_euler.z) > 1e-4:
             side_jar.rotation_euler.z = 0.0
             updated = True
@@ -4472,6 +4970,147 @@ class SCIENCE_BLOCKS_OT_apply_particle_colormap(bpy.types.Operator):
             return {"CANCELLED"}
 
         self.report({"INFO"}, f"Science Blocks: Applied '{mode}' colormap post-processing to {count} particles.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_set_particle_shader(bpy.types.Operator):
+    """Sets active particle shader and analytical variable (Velocity, Force, Energy, Spin, Solid)."""
+    bl_idname = "science_blocks.set_particle_shader"
+    bl_label = "Set Media Shader"
+    bl_description = "Switch active particle shader and analytical variable"
+
+    shader_mode: bpy.props.StringProperty(name="Shader Mode", default="VELOCITY")
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        mode = self.shader_mode.upper() if self.shader_mode else "VELOCITY"
+        if props:
+            props.dem_viewport_colormap = mode
+        try:
+            from . import colormaps
+            colormaps.assign_dem_shader_to_particles(context, shader_mode=mode)
+        except Exception:
+            try:
+                import colormaps
+                colormaps.assign_dem_shader_to_particles(context, shader_mode=mode)
+            except Exception:
+                pass
+        self.report({"INFO"}, f"Science Blocks: Media Shader set to '{mode}'. Edit colors in Shader Editor.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_open_particle_shader_editor(bpy.types.Operator):
+    """Selects particles and opens/focuses the active ColorRamp material in the Shader Editor."""
+    bl_idname = "science_blocks.open_particle_shader_editor"
+    bl_label = "Edit in Shader Editor"
+    bl_description = "Selects media particles to allow direct editing of ColorRamp in the Shader Editor"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        mode = getattr(props, "dem_viewport_colormap", "VELOCITY") if props else "VELOCITY"
+
+        try:
+            from . import colormaps
+            colormaps.ensure_dem_particle_shaders(context)
+            mat = colormaps.get_dem_shader_for_mode(mode)
+        except Exception:
+            try:
+                import colormaps
+                colormaps.ensure_dem_particle_shaders(context)
+                mat = colormaps.get_dem_shader_for_mode(mode)
+            except Exception:
+                mat = None
+
+        coll = bpy.data.collections.get("Science_Blocks_Milling_Media")
+        target_obj = None
+        if coll and coll.objects:
+            for obj in coll.objects:
+                if obj.name.startswith("DEM_Media_") or "Reference_DEM_Particle" in obj.name:
+                    target_obj = obj
+                    break
+
+        if target_obj and hasattr(context, "view_layer"):
+            try:
+                context.view_layer.objects.active = target_obj
+                target_obj.select_set(True)
+                if mat and target_obj.data and hasattr(target_obj.data, "materials"):
+                    if not target_obj.data.materials:
+                        target_obj.data.materials.append(mat)
+                    else:
+                        target_obj.data.materials[0] = mat
+            except Exception:
+                pass
+
+        for screen in bpy.data.screens:
+            for area in screen.areas:
+                if area.type == "NODE_EDITOR":
+                    for space in area.spaces:
+                        if space.type == "NODE_EDITOR":
+                            space.tree_type = "ShaderNodeTree"
+                            space.shader_type = "OBJECT"
+
+        self.report({"INFO"}, f"Science Blocks: '{mode}' shader active. Adjust ColorRamp node stops in the Shader Editor.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_apply_shader_palette_preset(bpy.types.Operator):
+    """Loads a scientific color ramp palette preset (Viridis, Plasma, Turbo, Heat, Coolwarm, Rainbow) into the active shader."""
+    bl_idname = "science_blocks.apply_shader_palette_preset"
+    bl_label = "Apply Palette Preset"
+    bl_description = "Load scientific color ramp stops into the active shader's ColorRamp node in Shader Editor"
+
+    palette: bpy.props.StringProperty(name="Palette", default="VIRIDIS")
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        mode = getattr(props, "dem_viewport_colormap", "VELOCITY") if props else "VELOCITY"
+        pal = self.palette.upper() if self.palette else "VIRIDIS"
+
+        try:
+            from . import colormaps
+            mat = colormaps.get_dem_shader_for_mode(mode)
+            if mat and mat.use_nodes:
+                ramp_node = None
+                for n in mat.node_tree.nodes:
+                    if n.type == "VALTORGB":
+                        ramp_node = n
+                        break
+                if ramp_node:
+                    stops = colormaps.get_palette_stops(pal, num_stops=5)
+                    colormaps.configure_color_ramp(ramp_node, stops)
+                    colormaps.create_or_update_analytical_color_strip(context, mode=mode)
+                    self.report({"INFO"}, f"Science Blocks: Loaded '{pal}' preset into {mat.name} ColorRamp.")
+                    return {"FINISHED"}
+        except Exception as e:
+            self.report({"WARNING"}, f"Could not apply preset: {e}")
+
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_toggle_analytical_color_strip(bpy.types.Operator):
+    """Toggles or refreshes the 3D Analytical Color & Data Strip in the 3D Viewport."""
+    bl_idname = "science_blocks.toggle_analytical_color_strip"
+    bl_label = "Toggle Viewport Legend Strip"
+    bl_description = "Shows or hides the in-viewport 3D analytical color & telemetry strip"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        props.show_analytical_color_strip = not props.show_analytical_color_strip
+        try:
+            from . import colormaps
+            colormaps.create_or_update_analytical_color_strip(
+                context,
+                mode=getattr(props, "dem_viewport_colormap", "VELOCITY"),
+                show=props.show_analytical_color_strip,
+            )
+        except Exception:
+            pass
+
+        st = "Visible" if props.show_analytical_color_strip else "Hidden"
+        self.report({"INFO"}, f"Science Blocks: 3D Analytical Color Strip is now {st}.")
         return {"FINISHED"}
 
 

@@ -241,6 +241,17 @@ def draw_step_2_kinematics(layout, context, props):
     row_stl.operator("science_blocks.export_container_stl", text="Convert Chamber to STL", icon="EXPORT")
     if getattr(props, "dem_container_stl_path", ""):
         row_stl.label(text="STL Ready", icon="CHECKMARK")
+
+    # Particle Source Tap / Inlet Control
+    box_tap = col.box()
+    r_tap = box_tap.row(align=True)
+    r_tap.prop(props, "dem_use_source_plane", text="Use Source Tap Inlet", icon="SNAP_GRID")
+    if getattr(props, "dem_use_source_plane", True):
+        c_tap = box_tap.column(align=True)
+        r_sel = c_tap.row(align=True)
+        r_sel.prop(props, "dem_source_plane_obj", text="Tap Object")
+        r_sel.operator("science_blocks.create_particle_source_plane", text="", icon="ADD")
+
     col.separator(factor=0.3)
 
     # Side Chamber Inspection Station
@@ -382,6 +393,17 @@ def draw_scientific_styling_panel(layout, context, props):
         text="Recolor Particles in Scene",
         icon="COLOR",
     )
+
+    c_part.separator(factor=0.3)
+    try:
+        from .colormaps import draw_analytical_data_strip_ui
+        draw_analytical_data_strip_ui(c_part, context)
+    except Exception:
+        try:
+            from colormaps import draw_analytical_data_strip_ui
+            draw_analytical_data_strip_ui(c_part, context)
+        except Exception:
+            pass
 
     col.separator(factor=0.3)
 
