@@ -427,6 +427,11 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default=False,
         update=update_gravity_arrow_orientation,
     )
+    side_jar_spin: BoolProperty(
+        name="Spin Side Chamber",
+        description="Whether the side inspection chamber spins on its spindle or remains stationary in the co-rotating reference frame",
+        default=False,
+    )
 
     # Professional Chamber Inspection & Framing (Focus Jar)
     show_chamber_cutaway: BoolProperty(
@@ -587,6 +592,16 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default=0.0,
         precision=1,
     )
+    kinematics_jar_rot_rad: FloatProperty(
+        name="Jar Continuous Angle (rad)",
+        description="Continuous chamber/jar rotation in radians for gravity arrow",
+        default=0.0,
+    )
+    kinematics_jar_axis: StringProperty(
+        name="Jar Active Axis",
+        description="Active rotation axis of the chamber/jar (X, Y, or Z)",
+        default="Z",
+    )
     kinematics_status_text: StringProperty(
         name="Status",
         description="Live kinematics readout",
@@ -651,6 +666,7 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
             ("VELOCITY", "Speed / Velocity Magnitude", "Color particles dynamically from blue (stationary) to yellow to crimson red (high speed)"),
             ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
             ("ENERGY", "Impact Kinetic Energy", "Highlight particles experiencing severe collision kinetic shock"),
+            ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s)"),
             ("SOLID", "Solid Realistic Material", "Realistic metallic/ceramic material rendering"),
         ],
         default="VELOCITY",
@@ -695,14 +711,21 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
     dem_restitution: FloatProperty(
         name="Restitution (e)",
         description="Coefficient of normal restitution",
-        default=0.82,
+        default=0.35,
         min=0.01,
         max=0.99,
+    )
+    dem_settle_delay_s: FloatProperty(
+        name="Settle Delay (s)",
+        description="Time in seconds particles settle on the floor before container begins rotating",
+        default=1.0,
+        min=0.0,
+        max=10.0,
     )
     dem_static_friction: FloatProperty(
         name="Static Friction (μs)",
         description="Coulomb coefficient of static friction",
-        default=0.20,
+        default=0.35,
         min=0.0,
         max=1.0,
     )
@@ -720,10 +743,50 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         min=10,
         max=2000,
     )
+    dem_container_shape: EnumProperty(
+        name="Chamber Collision Shape",
+        items=[
+            ("AUTO", "Auto Detect (CAD / Mesh)", "Automatically detect shape: uses 3D Mesh with BVH for modeled ridges, lifters, or CAD"),
+            ("MESH", "3D Mesh (Ridges / Lifters)", "Use exact 3D polygon mesh surface with BVH tree for ridges and lifter bars"),
+            ("CYLINDER", "Analytical Cylinder", "Ideal smooth cylinder (faster, ignores custom ridges)"),
+            ("BOX", "Analytical Box", "Ideal rectangular box container"),
+        ],
+        default="AUTO",
+        description="Collision surface representation for the grinding chamber",
+    )
+    dem_container_stl_path: StringProperty(
+        name="Chamber STL Path",
+        description="Path to the exported STL mesh file used for DEM simulation and external solvers",
+        default="",
+        subtype="FILE_PATH",
+    )
     dem_is_simulated: BoolProperty(
         name="DEM Simulated",
         description="Whether a simulation has been computed and baked",
         default=False,
+    )
+    dem_is_baking: BoolProperty(
+        name="DEM Baking Active",
+        description="Whether a DEM simulation bake is actively running",
+        default=False,
+    )
+    dem_bake_progress: FloatProperty(
+        name="Bake Progress",
+        description="Percentage completion of DEM physics simulation and keyframe baking",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        subtype="PERCENTAGE",
+    )
+    dem_bake_status: StringProperty(
+        name="Bake Status",
+        description="Current phase description of simulation bake",
+        default="",
+    )
+    dem_bake_spinner: IntProperty(
+        name="Bake Spinner Tick",
+        description="Tick counter driving the circular rotating progress spinner",
+        default=0,
     )
 
     # Professional Planetary Mill Analytics & Regime Diagnostics

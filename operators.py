@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import math
+import struct
 import mathutils
 import bmesh
 import subprocess
@@ -13,7 +14,23 @@ import shutil
 import urllib.request
 import urllib.parse
 import threading
-from . import dem_solver
+try:
+    import numpy as np
+except ImportError:
+    np = None
+try:
+    from . import dem_solver
+except (ImportError, ValueError):
+    import dem_solver
+
+CIRCULAR_SPINNERS = ["◐", "◓", "◑", "◒"]
+SPINNER_ICONS = ["TIME", "FILE_REFRESH", "COLOR", "RADIOBUT_ON"]
+
+def get_spinner_glyph(tick: int):
+    """Return an animated circular rotating progress glyph and Blender icon based on tick counter."""
+    char = CIRCULAR_SPINNERS[tick % len(CIRCULAR_SPINNERS)]
+    icon = SPINNER_ICONS[tick % len(SPINNER_ICONS)]
+    return char, icon
 
 
 def ensure_user_site_in_path():
@@ -962,12 +979,14 @@ class SCIENCE_BLOCKS_OT_reset_animation(bpy.types.Operator):
 
     def execute(self, context):
         context.scene.frame_set(context.scene.frame_start)
-        from . import nodes
+        try:
+            from . import nodes
+        except (ImportError, ValueError):
+            import nodes
         nodes.evaluate_kinematics_frame(context.scene)
         arrow = bpy.data.objects.get("Gravity_Force_Arrow")
         if arrow:
-            arrow.rotation_mode = "XYZ"
-            arrow.rotation_euler = (0.0, 0.0, 0.0)
+            nodes.update_gravity_arrow_transform(context.scene, 0.0)
         context.view_layer.update()
         self.report({"INFO"}, "Science Blocks: Rewound to start frame & rest pose restored.")
         return {"FINISHED"}
@@ -1534,16 +1553,449 @@ def compute_effective_mill_geometry(sun_obj, jar_obj, props):
     return r_sun, r_jar, h_jar
 
 
+def export_object_to_stl(obj, filepath: str = None, context=None) -> str:
+    """Exports evaluated Blender mesh object to a standard binary STL file centered in container space."""
+    if not obj:
+        raise ValueError("No object provided for STL export.")
+
+    # 1. Determine destination filepath
+    if not filepath:
+        clean_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in obj.name)
+        base_dir = None
+        if context and hasattr(context, "blend_data") and hasattr(context.blend_data, "filepath") and context.blend_data.filepath:
+            base_dir = os.path.dirname(context.blend_data.filepath)
+        if not base_dir:
+            try:
+                base_dir = get_effective_config_dir()
+            except Exception:
+                base_dir = None
+        if not base_dir or not os.access(os.path.abspath(base_dir), os.W_OK):
+            import tempfile
+            base_dir = tempfile.gettempdir()
+        cache_dir = os.path.join(base_dir, "stl_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        filepath = os.path.join(cache_dir, f"{clean_name}_simulation.stl")
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+    # 2. Extract evaluated mesh geometry (including modifiers, booleans, ridges, geometry nodes)
+    eval_obj = None
+    mesh = None
+    if context and hasattr(context, "evaluated_depsgraph_get"):
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+            eval_obj = obj.evaluated_get(depsgraph)
+            mesh = eval_obj.to_mesh()
+        except Exception:
+            mesh = None
+    if not mesh:
+        mesh = getattr(obj, "data", None)
+
+    if not mesh or not hasattr(mesh, "vertices") or not hasattr(mesh, "polygons"):
+        header = b"ScienceBlocks DEM Container: Empty\x00" + b"\x00" * 45
+        with open(filepath, "wb") as f:
+            f.write(header)
+            f.write(struct.pack("<I", 0))
+        return filepath
+
+    # 3. Compute bounding box center and scale
+    bb = getattr(obj, "bound_box", None)
+    if bb:
+        cx = (min(v[0] for v in bb) + max(v[0] for v in bb)) / 2.0
+        cy = (min(v[1] for v in bb) + max(v[1] for v in bb)) / 2.0
+        cz = (min(v[2] for v in bb) + max(v[2] for v in bb)) / 2.0
+    else:
+        loc = getattr(obj, "location", (0.0, 0.0, 0.0))
+        cx = float(loc.x if hasattr(loc, "x") else loc[0])
+        cy = float(loc.y if hasattr(loc, "y") else loc[1])
+        cz = float(loc.z if hasattr(loc, "z") else loc[2])
+
+    scale = getattr(obj, "scale", (1.0, 1.0, 1.0))
+    sx = abs(float(scale.x if hasattr(scale, "x") else scale[0]))
+    sy = abs(float(scale.y if hasattr(scale, "y") else scale[1]))
+    sz = abs(float(scale.z if hasattr(scale, "z") else scale[2]))
+
+    # 4. Extract centered, scaled vertex coordinates
+    raw_verts = []
+    for v in mesh.vertices:
+        vx = float(v.co.x if hasattr(v.co, "x") else v.co[0])
+        vy = float(v.co.y if hasattr(v.co, "y") else v.co[1])
+        vz = float(v.co.z if hasattr(v.co, "z") else v.co[2])
+        raw_verts.append((
+            (vx - cx) * sx,
+            (vy - cy) * sy,
+            (vz - cz) * sz,
+        ))
+
+    # 5. Triangulate all polygons into 3-vertex facets
+    triangles = []
+    for poly in mesh.polygons:
+        p_verts = poly.vertices
+        n_p = len(p_verts)
+        if n_p < 3:
+            continue
+        v0 = raw_verts[p_verts[0]]
+        for k in range(1, n_p - 1):
+            v1 = raw_verts[p_verts[k]]
+            v2 = raw_verts[p_verts[k + 1]]
+
+            # Facet normal: (v1 - v0) x (v2 - v0)
+            e1 = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
+            e2 = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
+            nx = e1[1] * e2[2] - e1[2] * e2[1]
+            ny = e1[2] * e2[0] - e1[0] * e2[2]
+            nz = e1[0] * e2[1] - e1[1] * e2[0]
+            n_len = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if n_len > 1e-9:
+                n = (nx / n_len, ny / n_len, nz / n_len)
+            else:
+                n = (0.0, 0.0, 1.0)
+            triangles.append((n, v0, v1, v2))
+
+    # 6. Write standard binary STL
+    header_str = f"ScienceBlocks DEM Container: {obj.name}"
+    header = header_str.encode("ascii", errors="replace")[:80].ljust(80, b"\x00")
+    num_tris = len(triangles)
+
+    with open(filepath, "wb") as f:
+        f.write(header)
+        f.write(struct.pack("<I", num_tris))
+        for n, v0, v1, v2 in triangles:
+            f.write(struct.pack("<3f", float(n[0]), float(n[1]), float(n[2])))
+            f.write(struct.pack("<3f", float(v0[0]), float(v0[1]), float(v0[2])))
+            f.write(struct.pack("<3f", float(v1[0]), float(v1[1]), float(v1[2])))
+            f.write(struct.pack("<3f", float(v2[0]), float(v2[1]), float(v2[2])))
+            f.write(struct.pack("<H", 0))
+
+    if eval_obj and hasattr(eval_obj, "to_mesh_clear"):
+        try:
+            eval_obj.to_mesh_clear()
+        except Exception:
+            pass
+
+    return filepath
+
+
+def load_stl_facets(filepath: str):
+    """Loads triangle facets and normals from a binary or ASCII STL file into NumPy arrays."""
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    if len(data) < 84:
+        raise ValueError(f"File {filepath} is too small to be a valid STL file.")
+
+    num_tris = struct.unpack("<I", data[80:84])[0]
+    expected_bin_size = 84 + num_tris * 50
+
+    if len(data) >= expected_bin_size and num_tris > 0:
+        tri_dtype = np.dtype([
+            ('normal', '<f4', (3,)),
+            ('v0', '<f4', (3,)),
+            ('v1', '<f4', (3,)),
+            ('v2', '<f4', (3,)),
+            ('attr', '<u2')
+        ])
+        raw = np.frombuffer(data[84:84 + num_tris * 50], dtype=tri_dtype)
+        normals = np.ascontiguousarray(raw['normal'], dtype=np.float64)
+        v0 = raw['v0']
+        v1 = raw['v1']
+        v2 = raw['v2']
+        tris = np.stack([v0, v1, v2], axis=1).astype(np.float64)
+        return tris, normals
+    else:
+        # Fallback for ASCII STL files
+        text = data.decode("ascii", errors="replace")
+        lines = text.splitlines()
+        normals_list = []
+        tris_list = []
+        cur_normal = [0.0, 0.0, 1.0]
+        cur_verts = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith("facet normal"):
+                parts = line.split()
+                if len(parts) >= 5:
+                    cur_normal = [float(parts[2]), float(parts[3]), float(parts[4])]
+                cur_verts = []
+            elif line.startswith("vertex"):
+                parts = line.split()
+                if len(parts) >= 4:
+                    cur_verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            elif line.startswith("endfacet"):
+                if len(cur_verts) == 3:
+                    normals_list.append(cur_normal)
+                    tris_list.append(cur_verts)
+                cur_verts = []
+        if tris_list:
+            return np.array(tris_list, dtype=np.float64), np.array(normals_list, dtype=np.float64)
+        return np.zeros((0, 3, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+
+
+def create_bvh_from_stl(filepath: str):
+    """Constructs a BVHTree directly from an STL file."""
+    try:
+        from mathutils.bvhtree import BVHTree
+        import mathutils
+    except Exception:
+        return None
+
+    if not os.path.exists(filepath):
+        return None
+
+    try:
+        tris, normals = load_stl_facets(filepath)
+    except Exception:
+        return None
+
+    if tris.shape[0] == 0:
+        return None
+
+    num_tris = tris.shape[0]
+    verts = [
+        mathutils.Vector((float(tris[i, k, 0]), float(tris[i, k, 1]), float(tris[i, k, 2])))
+        for i in range(num_tris)
+        for k in range(3)
+    ]
+    polys = [(3 * i, 3 * i + 1, 3 * i + 2) for i in range(num_tris)]
+    try:
+        return BVHTree.FromPolygons(verts, polys)
+    except Exception:
+        return None
+
+
+class SCIENCE_BLOCKS_OT_export_container_stl(bpy.types.Operator):
+    """Convert and export the 3D container mesh into a standard binary STL file for DEM simulation."""
+    bl_idname = "science_blocks.export_container_stl"
+    bl_label = "Convert to STL"
+    bl_description = "Export the exact 3D container mesh to an STL file in local container coordinates for DEM simulation"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        tree = get_effective_node_tree(context, props)
+        solver_cfg = extract_solver_settings_from_tree(tree)
+        active_node = solver_cfg.get("solver_node")
+
+        jar_obj, _ = resolve_simulation_objects(context, props, solver_node=active_node)
+        if not jar_obj or jar_obj.type != "MESH":
+            self.report({"ERROR"}, "No valid 3D mesh chamber found. Connect a mesh object to 'Jar Chamber' socket.")
+            return {"CANCELLED"}
+
+        try:
+            stl_path = export_object_to_stl(jar_obj, context=context)
+            if props:
+                props.dem_container_stl_path = stl_path
+            self.report({"INFO"}, f"Converted '{jar_obj.name}' to STL: {os.path.basename(stl_path)}")
+            return {"FINISHED"}
+        except Exception as ex:
+            self.report({"ERROR"}, f"Failed to export STL: {ex}")
+            return {"CANCELLED"}
+
+
+def analyze_container_geometry(jar_obj, context=None, shape_override="AUTO", stl_filepath=None):
+    """Analyzes 3D container mesh and returns shape type (BOX, CYLINDER, MESH), half-extents, centered BVH, and exported STL."""
+    if not jar_obj or jar_obj.type != "MESH":
+        return {
+            "shape": "BOX",
+            "half_extents": (0.5, 0.5, 0.5),
+            "r_jar": 0.5,
+            "h_jar": 1.0,
+            "bvh_tree": None,
+            "stl_filepath": "",
+        }
+
+    # Automatically export/convert container to STL
+    stl_path = stl_filepath
+    if not stl_path:
+        try:
+            stl_path = export_object_to_stl(jar_obj, context=context)
+        except Exception:
+            stl_path = ""
+
+    # Extract evaluated mesh (to include unapplied modifiers, booleans, ridges, geometry nodes)
+    eval_obj = None
+    mesh = None
+    if context and hasattr(context, "evaluated_depsgraph_get"):
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+            eval_obj = jar_obj.evaluated_get(depsgraph)
+            mesh = eval_obj.to_mesh()
+        except Exception:
+            mesh = None
+    if not mesh:
+        mesh = jar_obj.data
+
+    n_verts = len(mesh.vertices)
+    n_polys = len(mesh.polygons)
+    name = jar_obj.name.lower()
+
+    if hasattr(jar_obj, "bound_box") and jar_obj.bound_box:
+        bb = jar_obj.bound_box
+        cx = (min(v[0] for v in bb) + max(v[0] for v in bb)) / 2.0
+        cy = (min(v[1] for v in bb) + max(v[1] for v in bb)) / 2.0
+        cz = (min(v[2] for v in bb) + max(v[2] for v in bb)) / 2.0
+        dx = (max(v[0] for v in bb) - min(v[0] for v in bb)) * abs(jar_obj.scale.x)
+        dy = (max(v[1] for v in bb) - min(v[1] for v in bb)) * abs(jar_obj.scale.y)
+        dz = (max(v[2] for v in bb) - min(v[2] for v in bb)) * abs(jar_obj.scale.z)
+    else:
+        dims = jar_obj.dimensions
+        dx = dims.x
+        dy = dims.y
+        dz = dims.z
+        cx = jar_obj.location.x
+        cy = jar_obj.location.y
+        cz = jar_obj.location.z
+
+    hx = max(0.05, float(dx / 2.0))
+    hy = max(0.05, float(dy / 2.0))
+    hz = max(0.05, float(dz / 2.0))
+
+    mode = (shape_override or "AUTO").upper()
+
+    # Determine if mesh has modeled ridges, lifters, or non-primitive geometry
+    detected_shape = "BOX"
+    has_modeled_ridge = False
+
+    if mode == "BOX":
+        detected_shape = "BOX"
+    elif mode == "CYLINDER":
+        detected_shape = "CYLINDER"
+    elif mode == "MESH":
+        detected_shape = "MESH"
+        has_modeled_ridge = True
+    else:  # AUTO
+        if "suzanne" in name or "monkey" in name:
+            detected_shape = "MESH"
+            has_modeled_ridge = True
+        elif n_polys > 0:
+            # Orthogonality test: on any box/cuboid (regardless of subdivisions, thickness, or name),
+            # virtually all face normals are aligned with principal axes (ortho_ratio >= 0.82).
+            # On curved surfaces like cylinders or spheres, ortho_ratio is typically < 0.25.
+            axis_aligned_count = 0
+            for p in mesh.polygons:
+                if hasattr(p, "normal") and p.normal is not None:
+                    fn = p.normal
+                    fn_vec = (float(fn[0]), float(fn[1]), float(fn[2]))
+                elif len(p.vertices) >= 3:
+                    v0 = mesh.vertices[p.vertices[0]].co
+                    v1 = mesh.vertices[p.vertices[1]].co
+                    v2 = mesh.vertices[p.vertices[2]].co
+                    e1 = np.array([v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]], dtype=np.float64)
+                    e2 = np.array([v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]], dtype=np.float64)
+                    cp = np.cross(e1, e2)
+                    cp_len = np.linalg.norm(cp)
+                    fn_vec = cp / cp_len if cp_len > 1e-9 else (0.0, 0.0, 1.0)
+                else:
+                    fn_vec = (0.0, 0.0, 1.0)
+
+                if max(abs(fn_vec[0]), abs(fn_vec[1]), abs(fn_vec[2])) > 0.90:
+                    axis_aligned_count += 1
+
+            ortho_ratio = axis_aligned_count / max(1, n_polys)
+
+            if ortho_ratio >= 0.82:
+                # Flat planar orthogonal walls -> Box Container (even if object is named Jar_Chamber)
+                detected_shape = "BOX"
+            else:
+                # Non-orthogonal geometry: differentiate smooth cylinder from modeled ridges / lifters / CAD
+                coords = np.array([
+                    [(v.co.x - cx) * jar_obj.scale.x, (v.co.y - cy) * jar_obj.scale.y, (v.co.z - cz) * jar_obj.scale.z]
+                    for v in mesh.vertices
+                ], dtype=np.float64)
+
+                r_xy = np.sqrt(coords[:, 0]**2 + coords[:, 1]**2)
+                r_xz = np.sqrt(coords[:, 0]**2 + coords[:, 2]**2)
+                r_yz = np.sqrt(coords[:, 1]**2 + coords[:, 2]**2)
+
+                def compute_radial_spread(r_arr):
+                    r_max = np.max(r_arr)
+                    if r_max < 1e-4:
+                        return 0.0, 0.0
+                    outer_pts = r_arr[r_arr > (0.35 * r_max)]
+                    if len(outer_pts) < 6:
+                        return 0.0, float(r_max)
+                    spread = float(np.max(outer_pts) - np.min(outer_pts))
+                    return spread, float(r_max)
+
+                spread_xy, max_xy = compute_radial_spread(r_xy)
+                spread_xz, max_xz = compute_radial_spread(r_xz)
+                spread_yz, max_yz = compute_radial_spread(r_yz)
+
+                candidates = [(spread_xy, max_xy), (spread_xz, max_xz), (spread_yz, max_yz)]
+                candidates.sort(key=lambda item: item[0])
+                min_spread, nominal_r = candidates[0]
+
+                if "ridge" in name or "lifter" in name or "baffle" in name:
+                    has_modeled_ridge = True
+                    detected_shape = "MESH"
+                elif nominal_r > 0.02 and min_spread > (0.02 * nominal_r):
+                    has_modeled_ridge = True
+                    detected_shape = "MESH"
+                elif n_polys > 66:  # Detailed drum with lifter bars or CAD
+                    has_modeled_ridge = True
+                    detected_shape = "MESH"
+                else:
+                    detected_shape = "CYLINDER"
+        else:
+            detected_shape = "BOX"
+
+    # Build BVHTree centered at (cx, cy, cz) so BVH aligns with DEM simulation coordinates
+    bvh = None
+    if detected_shape == "MESH" or has_modeled_ridge:
+        try:
+            from mathutils.bvhtree import BVHTree
+            import mathutils
+            verts = [
+                mathutils.Vector((
+                    (v.co.x - cx) * jar_obj.scale.x,
+                    (v.co.y - cy) * jar_obj.scale.y,
+                    (v.co.z - cz) * jar_obj.scale.z
+                ))
+                for v in mesh.vertices
+            ]
+            polys = [p.vertices for p in mesh.polygons]
+            bvh = BVHTree.FromPolygons(verts, polys)
+        except Exception:
+            bvh = None
+
+    if bvh is None and stl_path:
+        bvh = create_bvh_from_stl(stl_path)
+
+    if eval_obj and hasattr(eval_obj, "to_mesh_clear"):
+        try:
+            eval_obj.to_mesh_clear()
+        except Exception:
+            pass
+
+    r_jar = float((hx + hy) / 2.0)
+    h_jar = float(hz * 2.0)
+
+    envelope = "BOX" if (detected_shape == "BOX" or (mode == "AUTO" and ortho_ratio >= 0.82)) else "CYLINDER"
+
+    return {
+        "shape": detected_shape,
+        "envelope": envelope,
+        "half_extents": (hx, hy, hz),
+        "r_jar": r_jar,
+        "h_jar": h_jar,
+        "bvh_tree": bvh,
+        "stl_filepath": stl_path,
+    }
+
+
 def detect_mill_orientation(sun_obj, mode_setting="AUTO") -> str:
     """Detects whether the mill operates in Vertical or Horizontal orientation based on 3D model tilt."""
-    if mode_setting != "AUTO":
+    if mode_setting in ("VERTICAL", "HORIZONTAL"):
         return mode_setting
 
+    props = getattr(bpy.context.scene, "science_blocks_props", None) if hasattr(bpy, "context") and getattr(bpy, "context", None) else None
+    if props:
+        side_g = getattr(props, "side_jar_gravity_axis", "-Z")
+        if side_g in ("-Y", "+Y", "-X", "+X"):
+            return "HORIZONTAL"
+
     check_obj = sun_obj
-    if not check_obj:
-        props = getattr(bpy.context.scene, "science_blocks_props", None)
-        if props and props.jar_chamber_obj:
-            check_obj = props.jar_chamber_obj
+    if not check_obj and props and props.jar_chamber_obj:
+        check_obj = props.jar_chamber_obj
 
     if not check_obj:
         return "VERTICAL"
@@ -1562,57 +2014,428 @@ def detect_mill_orientation(sun_obj, mode_setting="AUTO") -> str:
         return "VERTICAL"
 
 
+def get_effective_node_tree(context=None, props=None):
+    """Reliably discovers the active Science Blocks node tree across UI spaces, props, and node groups."""
+    if props and getattr(props, "active_node_tree", None):
+        return props.active_node_tree
+
+    if context:
+        space = getattr(context, "space_data", None)
+        if space and getattr(space, "type", None) == "NODE_EDITOR":
+            tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
+            if tree and getattr(tree, "bl_idname", None) == "ScienceBlocksNodeTree":
+                if props:
+                    props.active_node_tree = tree
+                return tree
+
+    for group in bpy.data.node_groups:
+        if getattr(group, "bl_idname", None) == "ScienceBlocksNodeTree":
+            if props:
+                props.active_node_tree = group
+            return group
+
+    return None
+
+
+def find_rotation_axis_for_solver(tree, solver_node=None, jar_obj=None) -> str:
+    """Accurately traces node wires and object bindings to resolve the active rotation axis (X, Y, or Z)."""
+    if not tree:
+        return "Z"
+
+    # 1. If solver node provided, check for explicit override or trace connected wires
+    if solver_node:
+        override = getattr(solver_node, "rotation_axis", "AUTO")
+        if override and override in ("X", "Y", "Z"):
+            return override
+
+        # Trace "Jar Chamber" input wire
+        sock_jar = solver_node.inputs.get("Jar Chamber")
+        if sock_jar and sock_jar.is_linked:
+            fn = sock_jar.links[0].from_node
+            # Directly connected to a Rotation Node
+            if fn.bl_idname == "ScienceBlocksRotationNode":
+                return getattr(fn, "rotation_axis", "Z")
+            # Connected through Orbit Node
+            if fn.bl_idname == "ScienceBlocksOrbitNode":
+                in_sock = fn.inputs.get("Object In")
+                if in_sock and in_sock.is_linked:
+                    up_n = in_sock.links[0].from_node
+                    if up_n.bl_idname == "ScienceBlocksRotationNode":
+                        return getattr(up_n, "rotation_axis", "Z")
+
+        # Trace "Drive RPM" or "Jar RPM" input wires
+        for sock_name in ("Drive RPM", "Jar RPM"):
+            sock_rpm = solver_node.inputs.get(sock_name)
+            if sock_rpm and sock_rpm.is_linked:
+                fn = sock_rpm.links[0].from_node
+                if fn.bl_idname == "ScienceBlocksRotationNode":
+                    return getattr(fn, "rotation_axis", "Z")
+                # Traced through Gear Ratio
+                if fn.bl_idname == "ScienceBlocksGearRatioNode":
+                    rpm_in = fn.inputs.get("RPM In")
+                    if rpm_in and rpm_in.is_linked:
+                        up_n = rpm_in.links[0].from_node
+                        if up_n.bl_idname == "ScienceBlocksRotationNode":
+                            return getattr(up_n, "rotation_axis", "Z")
+
+    # 2. Match rotation node bound to jar_obj
+    if jar_obj:
+        for node in tree.nodes:
+            if node.bl_idname == "ScienceBlocksRotationNode":
+                target = node.get_target_object() if hasattr(node, "get_target_object") else getattr(node, "target_object", None)
+                if target == jar_obj:
+                    return getattr(node, "rotation_axis", "Z")
+
+    # 3. Match rotation node with container/jar keywords in label
+    for node in tree.nodes:
+        if node.bl_idname == "ScienceBlocksRotationNode":
+            lbl = (node.label or node.name).lower()
+            if any(k in lbl for k in ("jar", "chamber", "cube", "drum", "container", "box")):
+                return getattr(node, "rotation_axis", "Z")
+
+    # 4. Fallback: Take the last or only rotation node in tree (skipping Sun if multiple)
+    rot_nodes = [n for n in tree.nodes if n.bl_idname == "ScienceBlocksRotationNode"]
+    if rot_nodes:
+        for rn in rot_nodes:
+            lbl = (rn.label or rn.name).lower()
+            if "sun" not in lbl and "wheel" not in lbl:
+                return getattr(rn, "rotation_axis", "Z")
+        return getattr(rot_nodes[-1], "rotation_axis", "Z")
+
+    return "Z"
+
+
+def extract_solver_settings_from_tree(tree, jar_obj=None):
+    """Extracts solver settings (balls, frames, radius, physics) prioritizing the active/linked node."""
+    if not tree:
+        return {}
+
+    solver_node = None
+
+    # Priority 1: Trace backward from ScienceBlocksOutputNode ("Particle Visualizer")
+    for node in tree.nodes:
+        if node.bl_idname == "ScienceBlocksOutputNode":
+            sock = node.inputs.get("Milling Particles")
+            if sock and sock.is_linked:
+                from_n = sock.links[0].from_node
+                if from_n.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode", "ScienceBlocksLiggghtsNode"):
+                    solver_node = from_n
+                    break
+
+    # Priority 2: ScienceBlocksYadeNode
+    if not solver_node:
+        for node in tree.nodes:
+            if node.bl_idname == "ScienceBlocksYadeNode":
+                solver_node = node
+                break
+
+    # Priority 3: Any other DEM solver node
+    if not solver_node:
+        for node in tree.nodes:
+            if node.bl_idname in ("ScienceBlocksDEMSolverNode", "ScienceBlocksLiggghtsNode"):
+                solver_node = node
+                break
+
+    if not solver_node:
+        return {}
+
+    return {
+        "solver_node": solver_node,
+        "ball_count": getattr(solver_node, "ball_count", 25),
+        "sim_frames": getattr(solver_node, "sim_frames", 150),
+        "ball_radius_mm": getattr(solver_node, "ball_radius_mm", 12.0),
+        "contact_model": getattr(solver_node, "contact_model", "HERTZ_MINDLIN"),
+        "restitution": getattr(solver_node, "restitution", 0.35),
+        "settle_delay": getattr(solver_node, "settle_delay", 1.0),
+        "substeps": getattr(solver_node, "substeps", 40),
+        "charge_distribution": getattr(solver_node, "charge_distribution", "MONODISPERSE"),
+        "integrator": getattr(solver_node, "integrator", "VELOCITY_VERLET"),
+        "rotation_axis": find_rotation_axis_for_solver(tree, solver_node=solver_node, jar_obj=jar_obj),
+        "container_shape": getattr(solver_node, "container_shape", "AUTO"),
+        "is_yade": (solver_node.bl_idname == "ScienceBlocksYadeNode"),
+    }
+
+
+def resolve_object_from_socket(sock):
+    """Recursively traces node wiring backwards from an input socket to find the target 3D Object."""
+    if not sock or not getattr(sock, "is_linked", False) or not sock.links:
+        return None
+    visited = set()
+    curr_node = sock.links[0].from_node
+
+    while curr_node and curr_node not in visited:
+        visited.add(curr_node)
+
+        # 1. Check get_target_object method on node (ScienceBlocksObjectNode, ScienceBlocksRotationNode, etc.)
+        if hasattr(curr_node, "get_target_object"):
+            obj = curr_node.get_target_object()
+            if obj:
+                return obj
+
+        # 2. Check direct target_object pointer on node
+        if hasattr(curr_node, "target_object") and curr_node.target_object:
+            return curr_node.target_object
+
+        # 3. Trace backwards through input sockets to follow chains
+        found_next = False
+        for in_sock_name in ("Object In", "Object", "Chamber", "Jar Chamber", "Input"):
+            in_sock = curr_node.inputs.get(in_sock_name)
+            if in_sock and getattr(in_sock, "is_linked", False) and in_sock.links:
+                curr_node = in_sock.links[0].from_node
+                found_next = True
+                break
+
+        if not found_next:
+            for in_sock in curr_node.inputs:
+                if getattr(in_sock, "is_linked", False) and in_sock.links and in_sock.bl_idname in ("ScienceBlocksObjectSocket", "NodeSocket"):
+                    curr_node = in_sock.links[0].from_node
+                    found_next = True
+                    break
+
+        if not found_next:
+            break
+
+    return None
+
+
+def resolve_simulation_objects(context, props, solver_node=None):
+    """Robustly discovers and resolves the jar container and sun wheel objects prioritizing exact inputs to the solver node."""
+    tree = get_effective_node_tree(context, props)
+    jar_obj = None
+    sun_obj = getattr(props, "sun_wheel_obj", None) if props else None
+
+    # Priority 1: Inspect the target solver node's inputs directly (highest priority: exact object input to solver)
+    if solver_node:
+        sock_jar = solver_node.inputs.get("Jar Chamber")
+        if sock_jar and getattr(sock_jar, "is_linked", False):
+            exact_obj = resolve_object_from_socket(sock_jar)
+            if exact_obj:
+                jar_obj = exact_obj
+        sock_sun = solver_node.inputs.get("Sun Mechanism")
+        if sock_sun and getattr(sock_sun, "is_linked", False):
+            s_obj = resolve_object_from_socket(sock_sun)
+            if s_obj:
+                sun_obj = s_obj
+
+    # Priority 2: Inspect DEM Solver Nodes in active node tree (giving priority to ScienceBlocksYadeNode)
+    if not jar_obj and tree:
+        yade_nodes = [n for n in tree.nodes if n.bl_idname == "ScienceBlocksYadeNode"]
+        other_nodes = [n for n in tree.nodes if n.bl_idname in ("ScienceBlocksDEMSolverNode", "ScienceBlocksLiggghtsNode")]
+        for node in (yade_nodes + other_nodes):
+            sock_jar = node.inputs.get("Jar Chamber")
+            if sock_jar and getattr(sock_jar, "is_linked", False):
+                t_obj = resolve_object_from_socket(sock_jar)
+                if t_obj:
+                    jar_obj = t_obj
+                    break
+            sock_sun = node.inputs.get("Sun Mechanism")
+            if sock_sun and getattr(sock_sun, "is_linked", False) and not sun_obj:
+                s_obj = resolve_object_from_socket(sock_sun)
+                if s_obj:
+                    sun_obj = s_obj
+
+    # Priority 3: Check ScienceBlocksObjectNode explicit roles in tree
+    if not jar_obj and tree:
+        for node in tree.nodes:
+            if node.bl_idname == "ScienceBlocksObjectNode" and getattr(node, "target_object", None):
+                if node.object_role == "JAR":
+                    jar_obj = node.target_object
+                elif node.object_role == "SUN_WHEEL" and not sun_obj:
+                    sun_obj = node.target_object
+
+    # Priority 4: Check active or selected object in 3D viewport (user actively interacting with a container mesh)
+    if not jar_obj and context:
+        act = getattr(context, "active_object", None)
+        if act and act.type == "MESH" and not act.name.startswith(("DEM_Media_", "Reference_", "Spindle_", "Gravity_")):
+            jar_obj = act
+
+    # Priority 5: Check Scene property jar_chamber_obj
+    if not jar_obj and props:
+        jar_obj = getattr(props, "jar_chamber_obj", None)
+
+    # Priority 6: Check Rotation Nodes in node tree
+    if not jar_obj and tree:
+        for node in tree.nodes:
+            if node.bl_idname == "ScienceBlocksRotationNode":
+                t_obj = node.get_target_object()
+                if t_obj:
+                    jar_obj = t_obj
+                    break
+
+    # Priority 7: Check standard object names in scene
+    if not jar_obj:
+        for name in ("Jar_Chamber", "Chamber", "Cube", "Jar", "Drum", "Container"):
+            candidate = bpy.data.objects.get(name) if hasattr(bpy, "data") else None
+            if candidate and candidate.type == "MESH":
+                jar_obj = candidate
+                break
+
+    # Priority 8: Check ANY 3D Object Input node target_object regardless of role
+    if not jar_obj and tree:
+        for node in tree.nodes:
+            if node.bl_idname == "ScienceBlocksObjectNode" and getattr(node, "target_object", None):
+                jar_obj = node.target_object
+                break
+
+    # Priority 9: Check remaining selected objects
+    if not jar_obj and context:
+        selected = getattr(context, "selected_objects", []) or []
+        for obj in selected:
+            if obj and obj.type == "MESH" and not obj.name.startswith(("DEM_Media_", "Reference_", "Spindle_", "Gravity_")):
+                jar_obj = obj
+                break
+
+    # Persist resolved objects back into scene properties
+    if jar_obj and props:
+        props.jar_chamber_obj = jar_obj
+    if sun_obj and props:
+        props.sun_wheel_obj = sun_obj
+
+    return jar_obj, sun_obj
+
+
+def _solve_dem_background_worker(params, props_dict, thread_state):
+    """Background worker thread for non-blocking DEM physics calculation with live progress reporting."""
+    try:
+        def on_prog(pct, msg):
+            thread_state["progress"] = min(99.0, max(1.0, float(pct)))
+            thread_state["status"] = str(msg)
+
+        params["progress_callback"] = on_prog
+
+        env_type = props_dict.get("python_environment_type", "EMBEDDED")
+        colab_connected = props_dict.get("colab_is_connected", False)
+        colab_url = props_dict.get("colab_endpoint_url", "")
+        solver_engine = props_dict.get("dem_solver_engine", "YADE")
+
+        if env_type == "COLAB" and colab_connected and colab_url:
+            thread_state["status"] = "Solving remotely on Google Colab GPU..."
+            sim_url = colab_url.strip().rstrip('/') + "/simulate"
+            req_headers = {
+                "Content-Type": "application/json",
+                "Bypass-Tunnel-Reminder": "true",
+                "User-Agent": "ScienceBlocks-Blender/1.0",
+            }
+            auth_token = props_dict.get("auth_token")
+            if auth_token:
+                req_headers["Authorization"] = f"Bearer {auth_token}"
+
+            clean_params = {k: v for k, v in params.items() if k != "progress_callback" and k != "bvh_tree"}
+            payload_data = json.dumps(clean_params).encode("utf-8")
+            req = urllib.request.Request(sim_url, data=payload_data, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                remote_data = json.loads(resp.read().decode("utf-8"))
+
+            frames = params["frames"]
+            ball_count = params["ball_count"]
+            res = dem_solver.PlanetaryDEMResult(frames, ball_count)
+            res.trajectories = np.array(remote_data.get("trajectories"), dtype=np.float32)
+            res.velocities = np.array(remote_data.get("velocities"), dtype=np.float32)
+            res.forces = np.array(remote_data.get("forces"), dtype=np.float32)
+            res.total_impacts = remote_data.get("total_impacts", 0)
+            res.mean_impact_energy_j = remote_data.get("mean_impact_energy_j", 0.0)
+            res.max_impact_energy_j = remote_data.get("max_impact_energy_j", 0.0)
+            radii = dem_solver.generate_charge_radii(ball_count, params["ball_radius_m"], props_dict.get("dem_charge_distribution", "MONODISPERSE"))
+            res.ball_radii = radii
+            res.ball_masses = (4.0 / 3.0) * math.pi * (radii**3) * props_dict.get("dem_ball_density", 7850.0)
+            dem_solver.last_dem_result = res
+        elif solver_engine == "YADE":
+            thread_state["status"] = "Solving Yade DEM physics..."
+            try:
+                from .tools.yade.yade_tool import YADE_TOOL
+            except (ImportError, ValueError):
+                from tools.yade.yade_tool import YADE_TOOL
+            solve_res = YADE_TOOL.solve_python(params)
+            res = solve_res.get("result_object")
+        else:
+            thread_state["status"] = "Solving DEM physics..."
+            res = dem_solver.solve_planetary_dem(**params)
+
+        thread_state["result"] = res
+        thread_state["progress"] = 100.0
+        thread_state["status"] = "Simulation complete - Instantiating particles in scene..."
+    except Exception as ex:
+        import traceback
+        thread_state["error"] = f"{ex}\n{traceback.format_exc()}"
+    finally:
+        thread_state["done"] = True
+
+
 class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
-    """Execute Discrete Element Method (DEM) particle physics and bake trajectories."""
+    """Execute Discrete Element Method (DEM) particle physics and bake trajectories with live progress and circular rotating spinner."""
     bl_idname = "science_blocks.run_dem_simulation"
     bl_label = "Run DEM Simulation"
     bl_description = "Solve centrifugal and Coriolis collisions for grinding balls and bake motion"
 
-    def execute(self, context):
+    _timer = None
+    _thread = None
+    _thread_state = None
+    _jar_obj = None
+    _sun_obj = None
+    _frames = 150
+    _effective_orientation = "VERTICAL"
+
+    def _cleanup(self, context):
+        """Safely restore mouse cursor, clear status text, remove modal timer, and end progress bar."""
+        if getattr(self, "_timer", None) is not None and context and context.window_manager:
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except Exception:
+                pass
+            self._timer = None
+        if context:
+            try:
+                context.window.cursor_set("DEFAULT")
+            except Exception:
+                pass
+            try:
+                context.workspace.status_text_set(None)
+            except Exception:
+                pass
+            try:
+                context.window_manager.progress_end()
+            except Exception:
+                pass
+
+    def _gather_simulation_params(self, context):
+        """Validate environment, resolve simulation objects from wires/scene, and assemble DEM parameters."""
         props = getattr(context.scene, "science_blocks_props", None)
         if not props:
-            return {"CANCELLED"}
+            return None
 
         # First ensure Python is initialized
         if not props.pkg_numpy_installed:
             bpy.ops.science_blocks.init_environment()
             if not props.pkg_numpy_installed:
                 self.report({"ERROR"}, "NumPy is required to solve DEM physics.")
-                return {"CANCELLED"}
+                return None
 
-        # Resolve objects from props or active node tree
-        jar_obj = props.jar_chamber_obj
-        sun_obj = props.sun_wheel_obj
+        # 1. Resolve active node tree
+        tree = get_effective_node_tree(context, props)
+        if tree and props:
+            props.active_node_tree = tree
 
-        if props.active_node_tree:
-            for node in props.active_node_tree.nodes:
-                if node.bl_idname == "ScienceBlocksObjectNode":
-                    if node.object_role == "JAR" and node.target_object:
-                        jar_obj = node.target_object
-                        props.jar_chamber_obj = node.target_object
-                    elif node.object_role == "SUN_WHEEL" and node.target_object:
-                        sun_obj = node.target_object
-                        props.sun_wheel_obj = node.target_object
+        # 2. Extract solver settings from tree to identify the running solver node (e.g. Yade node)
+        solver_cfg = extract_solver_settings_from_tree(tree, jar_obj=None)
+        active_node = solver_cfg.get("solver_node")
+
+        # 3. Resolve objects prioritizing the exact object input to the solver node
+        jar_obj, sun_obj = resolve_simulation_objects(context, props, solver_node=active_node)
 
         if not jar_obj:
-            jar_obj = bpy.data.objects.get("Jar_Chamber")
-            if jar_obj:
-                props.jar_chamber_obj = jar_obj
+            self.report({"ERROR"}, "No Jar Chamber object selected or found. Connect your 3D object to 'Jar Chamber' or select an object in the scene.")
+            return None
 
-        if not jar_obj:
-            self.report({"ERROR"}, "No Jar Chamber object selected or found. Select it in Step 2 or via 3D Object Input node.")
-            return {"CANCELLED"}
-
-        # Read RPM from node tree if available
+        # 4. Read RPM from node tree if available
         sun_rpm = 0.0 if not sun_obj else 200.0
         jar_rpm = 300.0
-        if props.active_node_tree:
-            has_gear_node = any(n.bl_idname == "ScienceBlocksGearRatioNode" for n in props.active_node_tree.nodes)
+        if tree:
+            has_gear_node = any(n.bl_idname == "ScienceBlocksGearRatioNode" for n in tree.nodes)
             if not has_gear_node or not sun_obj:
                 # Standalone Rotating Container Mode (e.g. single rotating Cube or drum):
                 sun_rpm = 0.0
                 jar_rpm_found = False
-                for node in props.active_node_tree.nodes:
+                for node in tree.nodes:
                     if node.bl_idname == "ScienceBlocksRotationNode":
                         target = node.get_target_object()
                         if target == jar_obj or not jar_obj or not jar_rpm_found:
@@ -1624,7 +2447,7 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
                     elif node.bl_idname == "ScienceBlocksRPMValueNode" and not jar_rpm_found:
                         jar_rpm = node.rpm_constant
             else:
-                for node in props.active_node_tree.nodes:
+                for node in tree.nodes:
                     if node.bl_idname == "ScienceBlocksRPMValueNode":
                         sun_rpm = node.rpm_constant
                     elif node.bl_idname == "ScienceBlocksGearRatioNode":
@@ -1633,38 +2456,39 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
                             ratio = -ratio
                         jar_rpm = sun_rpm * ratio
 
-        ball_count = props.dem_ball_count
-        ball_radius_m = props.dem_ball_radius_mm / 1000.0
-        ball_density = props.dem_ball_density
-        youngs_modulus_gpa = props.dem_youngs_modulus_gpa
-        poissons_ratio = props.dem_poissons_ratio
-        restitution = props.dem_restitution
-        static_friction = props.dem_static_friction
-        rolling_friction = props.dem_rolling_friction
-        contact_model = props.dem_contact_model
-        charge_distribution = props.dem_charge_distribution
-        integrator = props.dem_integrator
-        substeps_per_frame = 40
-        frames = props.dem_sim_frames
-        colormap_mode = props.dem_viewport_colormap
+        # Re-resolve rotation axis with the resolved jar_obj
+        solver_cfg["rotation_axis"] = solver_cfg.get("rotation_axis") or find_rotation_axis_for_solver(tree, solver_node=active_node, jar_obj=jar_obj)
 
-        # Read DEM solver & physics settings directly from Node Tree if nodes are present
-        if props.active_node_tree:
-            for node in props.active_node_tree.nodes:
-                if node.bl_idname == "ScienceBlocksDEMSolverNode":
-                    ball_count = node.ball_count
-                    substeps_per_frame = node.substeps
-                    contact_model = node.contact_model
-                    charge_distribution = node.charge_distribution
-                    integrator = node.integrator
-                    if hasattr(node, "sim_frames") and node.sim_frames > 0:
-                        frames = node.sim_frames
-                        props.dem_sim_frames = frames
-                    props.dem_ball_count = ball_count
-                    props.dem_contact_model = contact_model
-                    props.dem_charge_distribution = charge_distribution
-                    props.dem_integrator = integrator
-                elif node.bl_idname == "ScienceBlocksPhysicsNode":
+        ball_count = solver_cfg.get("ball_count", getattr(props, "dem_ball_count", 25))
+        props.dem_ball_count = ball_count
+
+        frames = solver_cfg.get("sim_frames", getattr(props, "dem_sim_frames", 150))
+        props.dem_sim_frames = frames
+
+        ball_radius_m = solver_cfg.get("ball_radius_mm", getattr(props, "dem_ball_radius_mm", 12.0)) / 1000.0
+        contact_model = solver_cfg.get("contact_model", getattr(props, "dem_contact_model", "HERTZ_MINDLIN"))
+        restitution = solver_cfg.get("restitution", getattr(props, "dem_restitution", 0.35))
+        settle_delay_s = solver_cfg.get("settle_delay", getattr(props, "dem_settle_delay_s", 1.0))
+        substeps_per_frame = solver_cfg.get("substeps", 40)
+        charge_distribution = solver_cfg.get("charge_distribution", getattr(props, "dem_charge_distribution", "MONODISPERSE"))
+        integrator = solver_cfg.get("integrator", getattr(props, "dem_integrator", "VELOCITY_VERLET"))
+        if solver_cfg.get("is_yade", False):
+            props.dem_solver_engine = "YADE"
+
+        props.dem_restitution = restitution
+        props.dem_settle_delay_s = settle_delay_s
+
+        ball_density = getattr(props, "dem_ball_density", 7850.0)
+        youngs_modulus_gpa = getattr(props, "dem_youngs_modulus_gpa", 210.0)
+        poissons_ratio = getattr(props, "dem_poissons_ratio", 0.30)
+        static_friction = getattr(props, "dem_static_friction", 0.35)
+        rolling_friction = getattr(props, "dem_rolling_friction", 0.08)
+        colormap_mode = getattr(props, "dem_viewport_colormap", "VELOCITY")
+
+        # 5. Check node tree wires for physics overrides, Drive RPM, and Particle Visualizer
+        if tree:
+            for node in tree.nodes:
+                if node.bl_idname == "ScienceBlocksPhysicsNode":
                     ball_radius_m = node.ball_radius_mm / 1000.0
                     ball_density = node.density
                     youngs_modulus_gpa = node.youngs_modulus_gpa
@@ -1672,21 +2496,61 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
                     restitution = node.restitution
                     static_friction = node.friction
                     rolling_friction = node.rolling_friction
-                    props.dem_ball_radius_mm = node.ball_radius_mm
-                    props.dem_ball_density = node.density
-                    props.dem_youngs_modulus_gpa = node.youngs_modulus_gpa
-                    props.dem_poissons_ratio = node.poissons_ratio
-                    props.dem_restitution = node.restitution
-                    props.dem_static_friction = node.friction
-                    props.dem_rolling_friction = node.rolling_friction
                 elif node.bl_idname == "ScienceBlocksOutputNode":
-                    colormap_mode = node.colormap_mode
+                    colormap_mode = getattr(node, "colormap_mode", colormap_mode)
                     props.dem_viewport_colormap = colormap_mode
+
+            if active_node:
+                sock_phys = active_node.inputs.get("Media Physics")
+                if sock_phys and sock_phys.is_linked:
+                    pn = sock_phys.links[0].from_node
+                    if hasattr(pn, "ball_radius_mm"):
+                        ball_radius_m = pn.ball_radius_mm / 1000.0
+                        ball_density = pn.density
+                        youngs_modulus_gpa = pn.youngs_modulus_gpa
+                        poissons_ratio = pn.poissons_ratio
+                        restitution = pn.restitution
+                        static_friction = pn.friction
+                        rolling_friction = pn.rolling_friction
+
+                sock_rpm = active_node.inputs.get("Drive RPM")
+                if sock_rpm and sock_rpm.is_linked:
+                    fn = sock_rpm.links[0].from_node
+                    if hasattr(fn, "rpm_constant"):
+                        jar_rpm = fn.rpm_constant
+                    elif hasattr(fn, "direction"):
+                        from .nodes import get_input_rpm
+                        val = get_input_rpm(fn, "RPM", 0.0)
+                        dir_m = -1.0 if fn.direction == "CW" else 1.0
+                        jar_rpm = abs(val) * dir_m
 
         fps = context.scene.render.fps / max(1, context.scene.render.fps_base)
 
-        # Dynamic CAD Dimensions & Mill Specifications
-        r_sun, r_jar, h_jar = compute_effective_mill_geometry(sun_obj, jar_obj, props)
+        # Active rotation axis (resolved from solver node wire, container binding, or rotation node)
+        rotation_axis = solver_cfg.get("rotation_axis") or find_rotation_axis_for_solver(tree, solver_node=active_node, jar_obj=jar_obj)
+
+        # Dynamic CAD Dimensions & Shape Detection (Box, Cylinder, Mesh)
+        node_shape = solver_cfg.get("container_shape", "AUTO")
+        scene_shape = getattr(props, "dem_container_shape", "AUTO") if props else "AUTO"
+        if node_shape and node_shape != "AUTO":
+            shape_pref = node_shape
+        elif scene_shape and scene_shape != "AUTO":
+            shape_pref = scene_shape
+        else:
+            shape_pref = "AUTO"
+        geom = analyze_container_geometry(jar_obj, context, shape_override=shape_pref)
+        r_sun, _, _ = compute_effective_mill_geometry(sun_obj, jar_obj, props)
+        r_jar = geom["r_jar"]
+        h_jar = geom["h_jar"]
+        half_extents = geom["half_extents"]
+        container_shape = geom["shape"]
+        bvh_tree = geom.get("bvh_tree")
+        stl_filepath = geom.get("stl_filepath", "")
+        if props and stl_filepath:
+            props.dem_container_stl_path = stl_filepath
+        settle_delay_s = getattr(props, "dem_settle_delay_s", 1.0)
+        restitution = getattr(props, "dem_restitution", 0.35)
+        static_friction = getattr(props, "dem_static_friction", 0.35)
 
         # Detect effective mill orientation (Auto-detect from sun wheel normal vector if AUTO)
         effective_orientation = detect_mill_orientation(sun_obj, props.mill_orientation)
@@ -1717,10 +2581,20 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             "slurry_drag": (props.dem_environment == "WET_SLURRY"),
             "slurry_viscosity": props.dem_slurry_viscosity,
             "slurry_density": props.dem_slurry_density,
+            "container_shape": container_shape,
+            "envelope_shape": geom.get("envelope", "CYLINDER" if container_shape == "CYLINDER" else "BOX"),
+            "half_extents": half_extents,
+            "rotation_axis": rotation_axis,
+            "settle_delay_s": settle_delay_s,
+            "bvh_tree": bvh_tree,
+            "stl_filepath": stl_filepath,
         }
 
         # Export native Yade simulation script (yade_simulation.py) into project / blend directory
-        from .tools.yade.yade_tool import YADE_TOOL
+        try:
+            from .tools.yade.yade_tool import YADE_TOOL
+        except (ImportError, ValueError):
+            from tools.yade.yade_tool import YADE_TOOL
         is_saved = is_blend_file_saved()
         folder = get_blend_file_directory() if is_saved else get_effective_config_dir()
         try:
@@ -1728,42 +2602,13 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         except Exception:
             pass
 
-        # Solve DEM Physics via Google Colab GPU / Yade engine formulation / local engine
-        if props.python_environment_type == "COLAB" and props.colab_is_connected and props.colab_endpoint_url:
-            self.report({"INFO"}, f"Solving DEM physics remotely on Google Colab GPU ({props.colab_endpoint_url})...")
-            auth = getattr(context.scene, "google_auth_data", None)
-            sim_url = props.colab_endpoint_url.strip().rstrip('/') + "/simulate"
-            req_headers = {
-                "Content-Type": "application/json",
-                "Bypass-Tunnel-Reminder": "true",
-                "User-Agent": "ScienceBlocks-Blender/1.0",
-            }
-            if auth and auth.id_token:
-                req_headers["Authorization"] = f"Bearer {auth.id_token}"
+        return params, jar_obj, sun_obj, frames, ball_count, effective_orientation
 
-            payload_data = json.dumps(params).encode("utf-8")
-            req = urllib.request.Request(sim_url, data=payload_data, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                remote_data = json.loads(resp.read().decode("utf-8"))
-
-            res = dem_solver.PlanetaryDEMResult(frames, ball_count)
-            res.trajectories = np.array(remote_data.get("trajectories"), dtype=np.float32)
-            res.velocities = np.array(remote_data.get("velocities"), dtype=np.float32)
-            res.forces = np.array(remote_data.get("forces"), dtype=np.float32)
-            res.total_impacts = remote_data.get("total_impacts", 0)
-            res.mean_impact_energy_j = remote_data.get("mean_impact_energy_j", 0.0)
-            res.max_impact_energy_j = remote_data.get("max_impact_energy_j", 0.0)
-            radii = dem_solver.generate_charge_radii(ball_count, ball_radius_m, props.dem_charge_distribution)
-            res.ball_radii = radii
-            res.ball_masses = (4.0 / 3.0) * math.pi * (radii**3) * ball_density
-            dem_solver.last_dem_result = res
-        elif props.dem_solver_engine == "YADE":
-            self.report({"INFO"}, f"Solving Yade DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
-            solve_res = YADE_TOOL.solve_python(params)
-            res = solve_res.get("result_object")
-        else:
-            self.report({"INFO"}, f"Solving DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
-            res = dem_solver.solve_planetary_dem(**params)
+    def _complete_simulation_bake(self, context, res, jar_obj, sun_obj, frames, effective_orientation):
+        """Instantiate particle keyframes, update telemetry, and play preview animation on main thread."""
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return
 
         # Instantiate particles in Blender with PSD scaling & dynamic colormap (Speed / Force / Energy)
         dem_solver.instantiate_dem_particles_in_blender(
@@ -1785,6 +2630,26 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             apply_scientific_paper_style(context)
         except Exception:
             pass
+
+        # Update surface collision wear heatmap if Chamber Heatmap node is active
+        if getattr(props, "active_node_tree", None):
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksChamberHeatmapNode":
+                    try:
+                        compute_and_apply_surface_impact_heatmap(
+                            context,
+                            target_obj=jar_obj,
+                            dem_result=res,
+                            metric_mode=getattr(node, "metric_mode", "HITS"),
+                            palette=getattr(node, "palette", "TURBO"),
+                            blur_radius_m=getattr(node, "blur_radius_mm", 15.0) * 0.001,
+                            contrast=getattr(node, "contrast", 1.0),
+                            apply_to_side_jar=getattr(node, "apply_to_side_jar", True),
+                            emission_glow=getattr(node, "emission_glow", 0.40),
+                        )
+                    except Exception:
+                        pass
+                    break
 
         # Update telemetry & planetary analytical diagnostics
         props.dem_total_impacts = res.total_impacts
@@ -1817,6 +2682,202 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
 
         engine_label = "Yade DEM" if props.dem_solver_engine == "YADE" else "DEM"
         self.report({"INFO"}, f"{engine_label} Complete: {res.total_impacts} impacts, Mean Energy: {res.mean_impact_energy_j:.4f} J, Power: {res.estimated_power_watts:.1f} W")
+
+    def invoke(self, context, event):
+        """Interactive entry point: launches modal timer with live rotating circular progress spinner."""
+        prep = self._gather_simulation_params(context)
+        if not prep:
+            return {"CANCELLED"}
+
+        params, jar_obj, sun_obj, frames, ball_count, effective_orientation = prep
+        props = getattr(context.scene, "science_blocks_props", None)
+        if not props:
+            return {"CANCELLED"}
+
+        self._jar_obj = jar_obj
+        self._sun_obj = sun_obj
+        self._frames = frames
+        self._effective_orientation = effective_orientation
+
+        self._thread_state = {
+            "done": False,
+            "progress": 0.0,
+            "status": "Starting DEM physics simulation...",
+            "result": None,
+            "error": None,
+        }
+
+        props.dem_is_baking = True
+        props.dem_bake_progress = 0.0
+        props.dem_bake_status = "Starting DEM simulation..."
+        props.dem_bake_spinner = 0
+
+        try:
+            context.window.cursor_set("WAIT")
+            context.window_manager.progress_begin(0, 100)
+        except Exception:
+            pass
+
+        props_dict = {
+            "python_environment_type": props.python_environment_type,
+            "colab_is_connected": props.colab_is_connected,
+            "colab_endpoint_url": props.colab_endpoint_url,
+            "dem_solver_engine": props.dem_solver_engine,
+            "dem_contact_model": props.dem_contact_model,
+            "dem_charge_distribution": props.dem_charge_distribution,
+            "dem_ball_density": getattr(props, "dem_ball_density", 7850.0),
+        }
+        auth = getattr(context.scene, "google_auth_data", None)
+        if auth and getattr(auth, "id_token", None):
+            props_dict["auth_token"] = auth.id_token
+
+        self._thread = threading.Thread(
+            target=_solve_dem_background_worker,
+            args=(params, props_dict, self._thread_state),
+            daemon=True,
+        )
+        self._thread.start()
+
+        self._timer = context.window_manager.event_timer_add(0.03, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        """Timer event handler: smoothly rotates the circular progress indicator and updates progress bar."""
+        props = getattr(context.scene, "science_blocks_props", None)
+
+        if event.type == "ESC":
+            self._cleanup(context)
+            if props:
+                props.dem_is_baking = False
+            self.report({"WARNING"}, "DEM simulation bake cancelled by user (ESC).")
+            return {"CANCELLED"}
+
+        if event.type == "TIMER":
+            if props:
+                props.dem_bake_spinner = (props.dem_bake_spinner + 1) % 1000
+                pct = float(self._thread_state.get("progress", 0.0))
+                status = str(self._thread_state.get("status", "Simulating..."))
+                props.dem_bake_progress = pct
+                props.dem_bake_status = status
+
+                char, icon = get_spinner_glyph(props.dem_bake_spinner)
+                try:
+                    context.workspace.status_text_set(f"⏳ Baking DEM Physics [{char}] {int(pct)}% - {status}")
+                    context.window_manager.progress_update(int(pct))
+                except Exception:
+                    pass
+
+                # Animate the circular spinner and progress bar across relevant Blender editors
+                try:
+                    for window in context.window_manager.windows:
+                        for area in window.screen.areas:
+                            if area.type in ("NODE_EDITOR", "VIEW_3D", "PROPERTIES"):
+                                area.tag_redraw()
+                except Exception:
+                    pass
+
+            if self._thread_state.get("done", False):
+                self._cleanup(context)
+                if props:
+                    props.dem_is_baking = False
+
+                err = self._thread_state.get("error")
+                if err:
+                    self.report({"ERROR"}, f"Simulation error: {err}")
+                    return {"CANCELLED"}
+
+                res = self._thread_state.get("result")
+                if not res:
+                    self.report({"ERROR"}, "Simulation produced no result data.")
+                    return {"CANCELLED"}
+
+                self._complete_simulation_bake(
+                    context,
+                    res,
+                    self._jar_obj,
+                    self._sun_obj,
+                    self._frames,
+                    self._effective_orientation,
+                )
+                return {"FINISHED"}
+
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        """Synchronous headless / test execution fallback."""
+        prep = self._gather_simulation_params(context)
+        if not prep:
+            return {"CANCELLED"}
+
+        params, jar_obj, sun_obj, frames, ball_count, effective_orientation = prep
+        props = getattr(context.scene, "science_blocks_props", None)
+
+        try:
+            context.window.cursor_set("WAIT")
+            context.window_manager.progress_begin(0, 100)
+        except Exception:
+            pass
+
+        def on_prog(pct, msg):
+            if props:
+                props.dem_bake_progress = pct
+                props.dem_bake_status = msg
+            try:
+                context.window_manager.progress_update(int(pct))
+            except Exception:
+                pass
+
+        params["progress_callback"] = on_prog
+
+        try:
+            if props.python_environment_type == "COLAB" and props.colab_is_connected and props.colab_endpoint_url:
+                self.report({"INFO"}, f"Solving DEM physics remotely on Google Colab GPU ({props.colab_endpoint_url})...")
+                auth = getattr(context.scene, "google_auth_data", None)
+                sim_url = props.colab_endpoint_url.strip().rstrip('/') + "/simulate"
+                req_headers = {
+                    "Content-Type": "application/json",
+                    "Bypass-Tunnel-Reminder": "true",
+                    "User-Agent": "ScienceBlocks-Blender/1.0",
+                }
+                if auth and auth.id_token:
+                    req_headers["Authorization"] = f"Bearer {auth.id_token}"
+
+                clean_params = {k: v for k, v in params.items() if k != "progress_callback" and k != "bvh_tree"}
+                payload_data = json.dumps(clean_params).encode("utf-8")
+                req = urllib.request.Request(sim_url, data=payload_data, headers=req_headers)
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    remote_data = json.loads(resp.read().decode("utf-8"))
+
+                res = dem_solver.PlanetaryDEMResult(frames, ball_count)
+                res.trajectories = np.array(remote_data.get("trajectories"), dtype=np.float32)
+                res.velocities = np.array(remote_data.get("velocities"), dtype=np.float32)
+                res.forces = np.array(remote_data.get("forces"), dtype=np.float32)
+                res.total_impacts = remote_data.get("total_impacts", 0)
+                res.mean_impact_energy_j = remote_data.get("mean_impact_energy_j", 0.0)
+                res.max_impact_energy_j = remote_data.get("max_impact_energy_j", 0.0)
+                radii = dem_solver.generate_charge_radii(ball_count, params["ball_radius_m"], props.dem_charge_distribution)
+                res.ball_radii = radii
+                res.ball_masses = (4.0 / 3.0) * math.pi * (radii**3) * getattr(props, "dem_ball_density", 7850.0)
+                dem_solver.last_dem_result = res
+            elif props.dem_solver_engine == "YADE":
+                self.report({"INFO"}, f"Solving Yade DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
+                try:
+                    from .tools.yade.yade_tool import YADE_TOOL
+                except (ImportError, ValueError):
+                    from tools.yade.yade_tool import YADE_TOOL
+                solve_res = YADE_TOOL.solve_python(params)
+                res = solve_res.get("result_object")
+            else:
+                self.report({"INFO"}, f"Solving DEM physics ({props.dem_contact_model}, {effective_orientation}) for {ball_count} balls over {frames} frames...")
+                res = dem_solver.solve_planetary_dem(**params)
+
+            self._complete_simulation_bake(context, res, jar_obj, sun_obj, frames, effective_orientation)
+        finally:
+            self._cleanup(context)
+            if props:
+                props.dem_is_baking = False
+
         return {"FINISHED"}
 
 
@@ -1889,7 +2950,6 @@ class SCIENCE_BLOCKS_OT_generate_scientific_report(bpy.types.Operator):
         if not props:
             return {"CANCELLED"}
 
-        from . import dem_solver
         from . import report_generator
 
         res = dem_solver.last_dem_result
@@ -2388,15 +3448,31 @@ def create_or_update_side_jar_view(context) -> bool:
     if not side_jar:
         side_jar = jar_obj.copy()
         side_jar.name = "Jar_Chamber_SideView"
-        side_jar.data = jar_obj.data
+        if getattr(jar_obj, "data", None):
+            side_jar.data = jar_obj.data.copy()
+            side_jar.data.name = "Jar_Chamber_SideView_Mesh"
         coll.objects.link(side_jar)
+    else:
+        # Re-link or refresh mesh geometry from jar_obj
+        if getattr(jar_obj, "data", None):
+            old_data = side_jar.data
+            side_jar.data = jar_obj.data.copy()
+            side_jar.data.name = "Jar_Chamber_SideView_Mesh"
+            if old_data and old_data != jar_obj.data and getattr(old_data, "name", "").startswith("Jar_Chamber_SideView_Mesh"):
+                try:
+                    bpy.data.meshes.remove(old_data, do_unlink=True)
+                except Exception:
+                    pass
 
-    # Ensure side jar is stationary in space (NO sun wheel parent)
+    # Ensure side jar is stationary in space (NO sun wheel parent) with matching scale
     side_jar.parent = None
     side_jar.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+    if hasattr(jar_obj, "scale") and hasattr(side_jar, "scale"):
+        side_jar.scale = jar_obj.scale.copy()
+
     offset_x = props.side_jar_offset_x
     jar_z = jar_obj.matrix_world.translation.z if jar_obj.parent else (jar_obj.location.z or 0.65)
-    side_jar.location = (offset_x, 0.0, jar_z)
+    side_jar.location = mathutils.Vector((offset_x, 0.0, jar_z))
     side_jar.rotation_mode = "XYZ"
     if jar_obj.parent:
         side_jar.rotation_euler.x = jar_obj.parent.rotation_euler.x
@@ -2404,7 +3480,10 @@ def create_or_update_side_jar_view(context) -> bool:
     else:
         side_jar.rotation_euler.x = 0.0
         side_jar.rotation_euler.y = 0.0
-    side_jar.rotation_euler.z = jar_obj.rotation_euler.z
+    if getattr(props, "side_jar_spin", False):
+        side_jar.rotation_euler.z = jar_obj.rotation_euler.z
+    else:
+        side_jar.rotation_euler.z = 0.0
 
     # Configure visual display mode
     if props.side_jar_display_mode == "WIRE":
@@ -2432,7 +3511,9 @@ def create_or_update_side_jar_view(context) -> bool:
             coll.objects.link(side_pointer)
         side_pointer.parent = side_jar
         side_pointer.matrix_parent_inverse = mathutils.Matrix.Identity(4)
-        side_pointer.location = mathutils.Vector((0.3, 0.0, 0.55))
+        r_jar = max(0.08, max(side_jar.dimensions.x, side_jar.dimensions.y) / 2.0)
+        h_half = side_jar.dimensions.z / 2.0 if side_jar.dimensions.z > 0.01 else 0.55
+        side_pointer.location = mathutils.Vector((r_jar * 0.75, 0.0, h_half))
         side_pointer.rotation_euler = mathutils.Euler((0.0, 0.0, 0.0))
         side_pointer.scale = orig_pointer.scale
 
@@ -2452,12 +3533,15 @@ def create_or_update_side_jar_view(context) -> bool:
         else:
             arrow.data.materials[0] = arrow_mat
 
-        # Position arrow floating next to the chamber
-        r_jar = 0.45
+        # Position arrow floating next to the chamber dynamically based on actual scale/dimensions
+        r_jar = max(0.08, max(side_jar.dimensions.x, side_jar.dimensions.y) / 2.0)
         arrow.parent = None  # Crucial: NOT parented to rotating jar!
-        arrow.location = (side_jar.location.x - (r_jar + 0.35), side_jar.location.y, side_jar.location.z)
+        arrow.location = mathutils.Vector((side_jar.location[0] - (r_jar + 0.35), side_jar.location[1], side_jar.location[2]))
         arrow.rotation_mode = "XYZ"
-        from . import nodes
+        try:
+            from . import nodes
+        except (ImportError, ValueError):
+            import nodes
         fps = context.scene.render.fps / max(1, context.scene.render.fps_base)
         frame_start = getattr(context.scene, "frame_start", 1)
         t = max(0.0, (context.scene.frame_current - frame_start) / fps) * props.motion_time_scale
@@ -2492,14 +3576,138 @@ def create_or_update_side_jar_view(context) -> bool:
     return True
 
 
+def sync_side_jar_view(context_or_scene=None) -> bool:
+    """Synchronizes side inspection chamber scale, mesh data, and arrow location with the main chamber in real-time."""
+    if not hasattr(bpy, "data"):
+        return False
+
+    scene = getattr(context_or_scene, "scene", None) if context_or_scene else None
+    if not scene and hasattr(bpy, "context") and getattr(bpy, "context", None):
+        scene = getattr(bpy.context, "scene", None)
+    if not scene and getattr(bpy.data, "scenes", None) and len(bpy.data.scenes) > 0:
+        scene = bpy.data.scenes[0]
+    if not scene:
+        return False
+
+    props = getattr(scene, "science_blocks_props", None)
+    if not props or not getattr(props, "show_side_jar_view", False):
+        return False
+
+    side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+    if not side_jar:
+        return False
+
+    jar_obj = getattr(props, "jar_chamber_obj", None)
+    if not jar_obj:
+        jar_obj = bpy.data.objects.get("Jar_Chamber")
+        if jar_obj:
+            props.jar_chamber_obj = jar_obj
+
+    if not jar_obj:
+        return False
+
+    updated = False
+
+    # 1. Synchronize Object Scale
+    if hasattr(jar_obj, "scale") and hasattr(side_jar, "scale"):
+        s_diff = max(abs(side_jar.scale[i] - jar_obj.scale[i]) for i in range(3))
+        if s_diff > 1e-4:
+            side_jar.scale = jar_obj.scale.copy()
+            updated = True
+
+    # 2. Synchronize Mesh Data (Geometry & Vertices after Apply Scale or edit)
+    if hasattr(jar_obj, "data") and jar_obj.data and hasattr(jar_obj.data, "vertices"):
+        orig_mesh = jar_obj.data
+        curr_mesh = getattr(side_jar, "data", None)
+        need_mesh_copy = False
+        if not curr_mesh or curr_mesh == orig_mesh:
+            need_mesh_copy = True
+        elif len(curr_mesh.vertices) != len(orig_mesh.vertices) or len(curr_mesh.polygons) != len(orig_mesh.polygons):
+            need_mesh_copy = True
+        else:
+            # Check vertex coordinates (e.g. when scale was applied into vertices)
+            n_v = len(orig_mesh.vertices)
+            if n_v > 0:
+                for vi in (0, n_v // 2, n_v - 1):
+                    if (curr_mesh.vertices[vi].co - orig_mesh.vertices[vi].co).length > 1e-4:
+                        need_mesh_copy = True
+                        break
+
+        if need_mesh_copy:
+            old_data = side_jar.data
+            new_mesh = orig_mesh.copy()
+            new_mesh.name = "Jar_Chamber_SideView_Mesh"
+            side_jar.data = new_mesh
+            if old_data and old_data != orig_mesh and getattr(old_data, "name", "").startswith("Jar_Chamber_SideView_Mesh"):
+                try:
+                    bpy.data.meshes.remove(old_data, do_unlink=True)
+                except Exception:
+                    pass
+            # Re-apply material
+            if props.side_jar_display_mode == "TRANSPARENT":
+                glass_mat = get_or_create_chamber_glass_material(props.side_jar_transparency)
+                if not side_jar.data.materials:
+                    side_jar.data.materials.append(glass_mat)
+                else:
+                    side_jar.data.materials[0] = glass_mat
+            updated = True
+
+    # 3. Synchronize Location Z
+    jar_z = jar_obj.matrix_world.translation.z if jar_obj.parent else (jar_obj.location.z or 0.65)
+    offset_x = getattr(props, "side_jar_offset_x", 3.8)
+    if abs(side_jar.location[0] - offset_x) > 1e-3 or abs(side_jar.location[2] - jar_z) > 1e-3:
+        side_jar.location = mathutils.Vector((offset_x, 0.0, jar_z))
+        updated = True
+
+    # 4. Synchronize Gravity Force Arrow floating next to the chamber
+    arrow = bpy.data.objects.get("Gravity_Force_Arrow")
+    if arrow and props.side_jar_show_arrow:
+        r_jar = max(0.08, max(side_jar.dimensions.x, side_jar.dimensions.y) / 2.0)
+        target_arrow_loc = mathutils.Vector((side_jar.location[0] - (r_jar + 0.35), side_jar.location[1], side_jar.location[2]))
+        if (mathutils.Vector(arrow.location) - target_arrow_loc).length > 1e-3:
+            arrow.location = target_arrow_loc
+            updated = True
+
+    # 5. Synchronize Side Direction Pointer
+    side_pointer = bpy.data.objects.get("Jar_Side_Direction_Pointer")
+    orig_pointer = bpy.data.objects.get("Jar_Direction_Pointer")
+    if orig_pointer and side_pointer:
+        r_jar = max(0.08, max(side_jar.dimensions.x, side_jar.dimensions.y) / 2.0)
+        h_half = side_jar.dimensions.z / 2.0 if side_jar.dimensions.z > 0.01 else 0.55
+        target_p_loc = mathutils.Vector((r_jar * 0.75, 0.0, h_half))
+        if (side_pointer.location - target_p_loc).length > 1e-3:
+            side_pointer.location = target_p_loc
+            updated = True
+        if hasattr(orig_pointer, "scale") and (side_pointer.scale - orig_pointer.scale).length > 1e-4:
+            side_pointer.scale = orig_pointer.scale
+            updated = True
+
+    # 6. Stationary side jar stabilization when side_jar_spin is false
+    if not getattr(props, "side_jar_spin", False):
+        if abs(side_jar.rotation_euler.z) > 1e-4:
+            side_jar.rotation_euler.z = 0.0
+            updated = True
+
+    return updated
+
+
 def remove_side_jar_view():
     """Remove all objects and collection for the side inspection view."""
     coll_name = "Science_Blocks_Side_Inspection"
     coll = bpy.data.collections.get(coll_name)
     if coll:
         for obj in list(coll.objects):
+            m = getattr(obj, "data", None)
             bpy.data.objects.remove(obj, do_unlink=True)
-        bpy.data.collections.remove(coll)
+            if m and getattr(m, "name", "").startswith("Jar_Chamber_SideView_Mesh"):
+                try:
+                    bpy.data.meshes.remove(m, do_unlink=True)
+                except Exception:
+                    pass
+        try:
+            bpy.data.collections.remove(coll)
+        except Exception:
+            pass
 
 
 class SCIENCE_BLOCKS_OT_toggle_side_jar_view(bpy.types.Operator):
@@ -3117,6 +4325,38 @@ class SCIENCE_BLOCKS_OT_update_particle_colors(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SCIENCE_BLOCKS_OT_apply_particle_colormap(bpy.types.Operator):
+    """Post-processes and applies colormap (Velocity, Force, Energy, Solid) to already-baked particles."""
+    bl_idname = "science_blocks.apply_particle_colormap"
+    bl_label = "Apply Colormap"
+    bl_description = "Recolors already-baked particles in post-processing based on Velocity, Contact Force, or Energy"
+
+    colormap: bpy.props.StringProperty(name="Colormap Mode", default="")
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        mode = self.colormap.strip() if self.colormap else ""
+
+        if not mode and props and props.active_node_tree:
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksOutputNode":
+                    mode = getattr(node, "colormap_mode", "VELOCITY")
+                    break
+
+        if not mode and props:
+            mode = getattr(props, "dem_viewport_colormap", "VELOCITY")
+        if not mode:
+            mode = "VELOCITY"
+
+        count = dem_solver.apply_particle_colormap_postprocess(context, colormap_mode=mode)
+        if count == 0:
+            self.report({"WARNING"}, "No baked simulation data found. Please bake DEM physics first!")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Science Blocks: Applied '{mode}' colormap post-processing to {count} particles.")
+        return {"FINISHED"}
+
+
 class SCIENCE_BLOCKS_OT_enhance_publication_viewport(bpy.types.Operator):
     """Activate Cavity Ridge/Valley and Ambient Occlusion in 3D viewport for razor-sharp technical figures."""
     bl_idname = "science_blocks.enhance_publication_viewport"
@@ -3129,6 +4369,417 @@ class SCIENCE_BLOCKS_OT_enhance_publication_viewport(bpy.types.Operator):
             props.sci_viewport_cavity = True
         apply_scientific_paper_style(context)
         self.report({"INFO"}, "Science Blocks: Publication viewport shading (Cavity + AO) enabled.")
+        return {"FINISHED"}
+
+
+def get_or_create_chamber_heatmap_material(emission_glow: float = 0.40) -> bpy.types.Material:
+    """Creates or updates a publication-grade shader displaying the chamber surface impact heatmap."""
+    mat_name = "SB_Chamber_Heatmap_Material"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    n_out = nodes.new("ShaderNodeOutputMaterial")
+    n_out.location = (450, 0)
+
+    n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    n_bsdf.location = (150, 0)
+    links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+
+    # Geometry Attribute node reading the surface impact heatmap
+    n_attr = nodes.new("ShaderNodeAttribute")
+    n_attr.location = (-150, 0)
+    n_attr.attribute_name = "SB_Surface_Impact"
+    if hasattr(n_attr, "attribute_type"):
+        n_attr.attribute_type = 'GEOMETRY'
+
+    # Wire Attribute Color to Base Color
+    links.new(n_attr.outputs["Color"], n_bsdf.inputs["Base Color"])
+
+    # Wire to Emission Color for vivid visualizer readout
+    if "Emission Color" in n_bsdf.inputs:
+        links.new(n_attr.outputs["Color"], n_bsdf.inputs["Emission Color"])
+    elif "Emission" in n_bsdf.inputs:
+        links.new(n_attr.outputs["Color"], n_bsdf.inputs["Emission"])
+
+    if "Emission Strength" in n_bsdf.inputs:
+        n_bsdf.inputs["Emission Strength"].default_value = float(emission_glow)
+
+    if "Roughness" in n_bsdf.inputs:
+        n_bsdf.inputs["Roughness"].default_value = 0.35
+    if "Metallic" in n_bsdf.inputs:
+        n_bsdf.inputs["Metallic"].default_value = 0.05
+    if "Alpha" in n_bsdf.inputs:
+        n_bsdf.inputs["Alpha"].default_value = 1.0
+
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "OPAQUE"
+    return mat
+
+
+def _apply_colors_to_mesh(mesh, colors):
+    """Applies per-vertex RGBA colors to mesh color attributes or legacy vertex colors."""
+    attr_name = "SB_Surface_Impact"
+    num_verts = len(mesh.vertices)
+
+    # Blender 3.2+ color_attributes API
+    if hasattr(mesh, "color_attributes"):
+        ca = mesh.color_attributes.get(attr_name)
+        if ca is None:
+            try:
+                ca = mesh.color_attributes.new(name=attr_name, type='FLOAT_COLOR', domain='POINT')
+            except Exception:
+                try:
+                    ca = mesh.color_attributes.new(name=attr_name, type='FLOAT_COLOR', domain='CORNER')
+                except Exception:
+                    ca = None
+        if ca is not None:
+            if getattr(ca, "domain", "") == 'POINT':
+                for i in range(min(num_verts, len(ca.data))):
+                    ca.data[i].color = colors[i]
+            else:
+                for loop in mesh.loops:
+                    ca.data[loop.index].color = colors[loop.vertex_index]
+            if hasattr(mesh.color_attributes, "active_color"):
+                mesh.color_attributes.active_color = ca
+            elif hasattr(mesh.color_attributes, "active"):
+                mesh.color_attributes.active = ca
+
+    # Blender legacy vertex_colors fallback
+    if hasattr(mesh, "vertex_colors"):
+        try:
+            vc = mesh.vertex_colors.get(attr_name) or mesh.vertex_colors.new(name=attr_name)
+            if vc:
+                for loop in mesh.loops:
+                    vc.data[loop.index].color = colors[loop.vertex_index]
+                if hasattr(mesh.vertex_colors, "active"):
+                    mesh.vertex_colors.active = vc
+        except Exception:
+            pass
+
+
+def _enable_viewport_color_attribute(context, attr_name="SB_Surface_Impact"):
+    """Configures 3D viewports so color attributes or vertex colors are immediately visible in Solid mode."""
+    try:
+        if context and hasattr(context, "screen") and context.screen:
+            for area in context.screen.areas:
+                if area.type == "VIEW_3D":
+                    for space in area.spaces:
+                        if space.type == "VIEW_3D":
+                            if hasattr(space.shading, "color_type"):
+                                if hasattr(space.shading, "color_attribute_name"):
+                                    space.shading.color_type = "ATTRIBUTE"
+                                    space.shading.color_attribute_name = attr_name
+                                else:
+                                    space.shading.color_type = "VERTEX"
+    except Exception:
+        pass
+
+
+def compute_and_apply_surface_impact_heatmap(
+    context,
+    target_obj=None,
+    dem_result=None,
+    metric_mode: str = "HITS",
+    palette: str = "TURBO",
+    blur_radius_m: float = 0.015,
+    contrast: float = 1.0,
+    apply_to_side_jar: bool = True,
+    emission_glow: float = 0.40,
+) -> dict:
+    """Computes Gaussian-smoothed surface impact wear/load across chamber mesh vertices and assigns materials."""
+    if target_obj is None:
+        props = getattr(context.scene, "science_blocks_props", None) if context and hasattr(context, "scene") else None
+        target_obj = getattr(props, "jar_chamber_obj", None) if props else None
+        if not target_obj and bpy is not None:
+            target_obj = bpy.data.objects.get("Jar_Chamber")
+
+    if target_obj is None or not hasattr(target_obj, "data") or target_obj.data is None:
+        return {"status": "ERROR", "message": "Target chamber mesh object not found."}
+
+    res = dem_result
+    if res is None:
+        try:
+            from . import dem_solver
+        except (ImportError, ValueError):
+            import dem_solver
+        res = getattr(dem_solver, "last_dem_result", None)
+
+    if res is None:
+        return {"status": "ERROR", "message": "No DEM simulation result in memory. Bake simulation first."}
+
+    impact_locs = getattr(res, "wall_impact_locations", [])
+    if not impact_locs:
+        return {"status": "WARNING", "message": "No wall impacts were recorded in the simulation."}
+
+    mesh = target_obj.data
+    num_verts = len(mesh.vertices)
+    if num_verts == 0:
+        return {"status": "ERROR", "message": "Chamber mesh has no vertices."}
+
+    num_impacts = len(impact_locs)
+    mode = (metric_mode or "HITS").upper()
+
+    # Determine metric weight per impact
+    if mode == "FREQUENCY":
+        fps = getattr(res, "fps", 30.0) or 30.0
+        frames = getattr(res, "frames", 1) or 1
+        dur_s = max(0.01, float(frames) / max(1.0, float(fps)))
+        weights = np.full(num_impacts, 1.0 / dur_s, dtype=np.float64)
+    elif mode == "FORCE":
+        forces = getattr(res, "wall_impact_forces", [])
+        if len(forces) == num_impacts:
+            weights = np.array(forces, dtype=np.float64)
+        else:
+            weights = np.ones(num_impacts, dtype=np.float64)
+    elif mode == "INERTIA":
+        impulses = getattr(res, "wall_impact_impulses", [])
+        if len(impulses) == num_impacts:
+            weights = np.array(impulses, dtype=np.float64)
+        else:
+            weights = np.ones(num_impacts, dtype=np.float64)
+    else:  # HITS
+        weights = np.ones(num_impacts, dtype=np.float64)
+
+    # Spatial kernel smoothing using KD-Tree
+    sigma = max(0.002, float(blur_radius_m) * 0.5)
+    r_max = 3.0 * sigma
+    accum = np.zeros(num_verts, dtype=np.float64)
+
+    if mathutils is not None and hasattr(mathutils, "kdtree"):
+        kd = mathutils.kdtree.KDTree(num_verts)
+        for i, v in enumerate(mesh.vertices):
+            kd.insert(v.co, i)
+        kd.balance()
+
+        for j in range(num_impacts):
+            pt = mathutils.Vector(impact_locs[j])
+            w_val = weights[j]
+            hits = kd.find_range(pt, r_max)
+            if hits:
+                for co, idx, dist in hits:
+                    g_weight = math.exp(-0.5 * ((dist / sigma) ** 2))
+                    accum[idx] += w_val * g_weight
+            else:
+                co, idx, dist = kd.find_nearest(pt)
+                if idx is not None:
+                    accum[idx] += w_val
+    else:
+        # NumPy vectorized fallback
+        vert_cos = np.array([v.co for v in mesh.vertices], dtype=np.float64)
+        imp_cos = np.array(impact_locs, dtype=np.float64)
+        for j in range(num_impacts):
+            dists = np.linalg.norm(vert_cos - imp_cos[j], axis=1)
+            in_range = dists <= r_max
+            if np.any(in_range):
+                g_w = np.exp(-0.5 * ((dists[in_range] / sigma) ** 2))
+                accum[in_range] += weights[j] * g_w
+            else:
+                near_idx = int(np.argmin(dists))
+                accum[near_idx] += weights[j]
+
+    # Normalization with 98th percentile for optimal visual contrast
+    pos_mask = accum > 0
+    if np.any(pos_mask):
+        pos_vals = accum[pos_mask]
+        p98 = float(np.percentile(pos_vals, 98)) if len(pos_vals) > 10 else float(np.max(pos_vals))
+        ref_max = max(1e-6, p98)
+    else:
+        ref_max = 1.0
+
+    pwr = max(0.1, min(5.0, float(contrast)))
+    norm_vals = np.clip((accum / ref_max) ** pwr, 0.0, 1.0)
+
+    # Evaluate RGB colors
+    try:
+        from .colormaps import evaluate_scientific_colormap
+    except (ImportError, ValueError):
+        try:
+            from colormaps import evaluate_scientific_colormap
+        except ImportError:
+            import colormaps
+            evaluate_scientific_colormap = colormaps.evaluate_scientific_colormap
+    colors = [evaluate_scientific_colormap(palette, norm_vals[i], v_max=1.0) for i in range(num_verts)]
+
+    # Apply to target_obj mesh
+    _apply_colors_to_mesh(mesh, colors)
+
+    # Assign heatmap material
+    mat = get_or_create_chamber_heatmap_material(emission_glow=emission_glow)
+    if mat.name not in target_obj.data.materials:
+        target_obj.data.materials.append(mat)
+    for slot_idx, slot in enumerate(target_obj.material_slots):
+        if slot.material == mat:
+            target_obj.active_material_index = slot_idx
+            break
+
+    # Mirror to side jar if requested
+    if apply_to_side_jar and bpy is not None:
+        side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+        if side_jar and hasattr(side_jar, "data") and side_jar.data:
+            side_mesh = side_jar.data
+            # If side_mesh has same vertex count, copy colors directly
+            if len(side_mesh.vertices) == num_verts:
+                _apply_colors_to_mesh(side_mesh, colors)
+            elif mathutils is not None and hasattr(mathutils, "kdtree"):
+                # Project onto side_mesh vertices
+                side_kd = mathutils.kdtree.KDTree(len(side_mesh.vertices))
+                for si, sv in enumerate(side_mesh.vertices):
+                    side_kd.insert(sv.co, si)
+                side_kd.balance()
+                side_accum = np.zeros(len(side_mesh.vertices), dtype=np.float64)
+                for j in range(num_impacts):
+                    pt = mathutils.Vector(impact_locs[j])
+                    hits = side_kd.find_range(pt, r_max)
+                    if hits:
+                        for sco, sidx, sdist in hits:
+                            side_accum[sidx] += weights[j] * math.exp(-0.5 * ((sdist / sigma) ** 2))
+                    else:
+                        sco, sidx, sdist = side_kd.find_nearest(pt)
+                        if sidx is not None:
+                            side_accum[sidx] += weights[j]
+                side_norm = np.clip((side_accum / ref_max) ** pwr, 0.0, 1.0)
+                side_colors = [evaluate_scientific_colormap(palette, side_norm[k], v_max=1.0) for k in range(len(side_mesh.vertices))]
+                _apply_colors_to_mesh(side_mesh, side_colors)
+
+            if mat.name not in side_jar.data.materials:
+                side_jar.data.materials.append(mat)
+            for slot_idx, slot in enumerate(side_jar.material_slots):
+                if slot.material == mat:
+                    side_jar.active_material_index = slot_idx
+                    break
+
+    # Configure 3D viewport shading for instant visibility
+    _enable_viewport_color_attribute(context, "SB_Surface_Impact")
+
+    return {
+        "status": "SUCCESS",
+        "impacts": num_impacts,
+        "max_val": ref_max,
+        "metric": mode,
+        "palette": palette,
+    }
+
+
+def clear_surface_impact_heatmap(context, target_obj=None):
+    """Clears the surface impact heatmap color attributes and restores default chamber material."""
+    if target_obj is None:
+        props = getattr(context.scene, "science_blocks_props", None) if context and hasattr(context, "scene") else None
+        target_obj = getattr(props, "jar_chamber_obj", None) if props else None
+        if not target_obj and bpy is not None:
+            target_obj = bpy.data.objects.get("Jar_Chamber")
+
+    attr_name = "SB_Surface_Impact"
+    props = getattr(context.scene, "science_blocks_props", None) if context and hasattr(context, "scene") else None
+    orig_mat = get_or_create_sci_jar_material(props) if props else None
+
+    objs_to_clear = [target_obj] if target_obj else []
+    side_jar = bpy.data.objects.get("Jar_Chamber_SideView") if bpy is not None else None
+    if side_jar:
+        objs_to_clear.append(side_jar)
+
+    for obj in objs_to_clear:
+        if not obj or not hasattr(obj, "data") or not obj.data:
+            continue
+        mesh = obj.data
+        if hasattr(mesh, "color_attributes"):
+            ca = mesh.color_attributes.get(attr_name)
+            if ca:
+                mesh.color_attributes.remove(ca)
+        if hasattr(mesh, "vertex_colors"):
+            vc = mesh.vertex_colors.get(attr_name)
+            if vc:
+                mesh.vertex_colors.remove(vc)
+        if orig_mat:
+            if orig_mat.name not in obj.data.materials:
+                obj.data.materials.append(orig_mat)
+            for slot_idx, slot in enumerate(obj.material_slots):
+                if slot.material == orig_mat:
+                    obj.active_material_index = slot_idx
+                    break
+
+    try:
+        if context and hasattr(context, "screen") and context.screen:
+            for area in context.screen.areas:
+                if area.type == "VIEW_3D":
+                    for space in area.spaces:
+                        if space.type == "VIEW_3D":
+                            if hasattr(space.shading, "color_type"):
+                                space.shading.color_type = "OBJECT"
+    except Exception:
+        pass
+
+
+class SCIENCE_BLOCKS_OT_bake_surface_impact_map(bpy.types.Operator):
+    """Computes and displays the particle collision wear and contact heatmap on the jar chamber."""
+    bl_idname = "science_blocks.bake_surface_impact_map"
+    bl_label = "Bake Surface Impact Map"
+    bl_description = "Generates a surface heat map on the jar wall visualizing particle collision frequency, hit density, force, and inertia transfer"
+
+    metric: bpy.props.StringProperty(name="Metric", default="HITS")
+    palette: bpy.props.StringProperty(name="Palette", default="TURBO")
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        metric = self.metric.strip().upper() if self.metric else "HITS"
+        pal = self.palette.strip().upper() if self.palette else "TURBO"
+        blur = 0.015
+        contrast = 1.0
+        apply_side = True
+        glow = 0.40
+        target = None
+
+        if props and props.active_node_tree:
+            for node in props.active_node_tree.nodes:
+                if node.bl_idname == "ScienceBlocksChamberHeatmapNode":
+                    metric = getattr(node, "metric_mode", metric)
+                    pal = getattr(node, "palette", pal)
+                    blur = getattr(node, "blur_radius_mm", 15.0) * 0.001
+                    contrast = getattr(node, "contrast", 1.0)
+                    apply_side = getattr(node, "apply_to_side_jar", True)
+                    glow = getattr(node, "emission_glow", 0.40)
+                    if "Chamber Mesh" in node.inputs and node.inputs["Chamber Mesh"].is_linked:
+                        from_node = node.inputs["Chamber Mesh"].links[0].from_node
+                        if hasattr(from_node, "target_object") and from_node.target_object:
+                            target = from_node.target_object
+                    break
+
+        res = compute_and_apply_surface_impact_heatmap(
+            context,
+            target_obj=target,
+            metric_mode=metric,
+            palette=pal,
+            blur_radius_m=blur,
+            contrast=contrast,
+            apply_to_side_jar=apply_side,
+            emission_glow=glow,
+        )
+
+        if res["status"] == "SUCCESS":
+            self.report({"INFO"}, f"Science Blocks: Chamber surface impact map ({res['metric']}, {res['impacts']} hits) applied.")
+            return {"FINISHED"}
+        elif res["status"] == "WARNING":
+            self.report({"WARNING"}, res["message"])
+            return {"FINISHED"}
+        else:
+            self.report({"ERROR"}, res["message"])
+            return {"CANCELLED"}
+
+
+class SCIENCE_BLOCKS_OT_clear_surface_impact_map(bpy.types.Operator):
+    """Clears the surface impact heatmap from the jar chamber and restores default finish."""
+    bl_idname = "science_blocks.clear_surface_impact_map"
+    bl_label = "Clear Surface Impact Map"
+    bl_description = "Clears the collision wear heatmap and restores the chamber material"
+
+    def execute(self, context):
+        clear_surface_impact_heatmap(context)
+        self.report({"INFO"}, "Science Blocks: Chamber surface heatmap cleared.")
         return {"FINISHED"}
 
 

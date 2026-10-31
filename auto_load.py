@@ -117,18 +117,20 @@ def iter_my_deps_from_annotations(cls, my_classes):
 
 
 def get_dependency_from_annotation(value):
-    if blender_version >= (2, 93):
-        if isinstance(value, bpy.props._PropertyDeferred):
-            return value.keywords.get("type")
-    else:
-        if isinstance(value, tuple) and len(value) == 2:
-            if value[0] in (bpy.props.PointerProperty, bpy.props.CollectionProperty):
-                return value[1]["type"]
+    deferred_cls = getattr(bpy.props, "_PropertyDeferred", None)
+    if deferred_cls and isinstance(deferred_cls, type) and isinstance(value, deferred_cls):
+        return getattr(value, "keywords", {}).get("type")
+    if hasattr(value, "keywords") and isinstance(value.keywords, dict):
+        return value.keywords.get("type")
+    if isinstance(value, tuple) and len(value) == 2:
+        if hasattr(bpy.props, "PointerProperty") and value[0] in (bpy.props.PointerProperty, getattr(bpy.props, "CollectionProperty", None)):
+            return value[1].get("type") if isinstance(value[1], dict) else None
     return None
 
 
 def iter_my_deps_from_parent_id(cls, my_classes_by_idname):
-    if issubclass(cls, bpy.types.Panel):
+    panel_cls = getattr(bpy.types, "Panel", None)
+    if panel_cls and isinstance(panel_cls, type) and issubclass(cls, panel_cls):
         parent_idname = getattr(cls, "bl_parent_id", None)
         if parent_idname is not None:
             parent_cls = my_classes_by_idname.get(parent_idname)
@@ -176,6 +178,7 @@ def get_register_base_types():
             "Gizmo",
             "GizmoGroup",
         ]
+        if hasattr(bpy.types, name) and isinstance(getattr(bpy.types, name), type)
     )
 
 

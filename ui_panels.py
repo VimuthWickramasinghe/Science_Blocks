@@ -2,6 +2,14 @@ import bpy
 import os
 import math
 
+CIRCULAR_SPINNERS = ["◐", "◓", "◑", "◒"]
+SPINNER_ICONS = ["TIME", "FILE_REFRESH", "COLOR", "RADIOBUT_ON"]
+
+def get_spinner_glyph(tick: int):
+    char = CIRCULAR_SPINNERS[tick % len(CIRCULAR_SPINNERS)]
+    icon = SPINNER_ICONS[tick % len(SPINNER_ICONS)]
+    return char, icon
+
 
 def draw_step_1_python_env(layout, context, props):
     """Step 1: Python Environment Setup and Verification & Blend Config Location."""
@@ -198,267 +206,61 @@ def draw_step_2_kinematics(layout, context, props):
     row_top.scale_y = 1.25
     row_top.operator("science_blocks.open_node_editor", text="Open Science Blocks Node Editor", icon="NODETREE")
 
-    col.separator(factor=0.4)
-
-    # Ready-to-Run Simulation Demos Showcase
-    b_demo = col.box()
-    row_dh = b_demo.row(align=True)
-    row_dh.label(text="Ready-to-Run Simulation Demos:", icon="COMMUNITY")
-
-    # Dropdown to choose demo
-    b_demo.prop(props, "demo_scenario", text="")
-
-    # Load selected demo button
-    row_load = b_demo.row(align=True)
-    row_load.scale_y = 1.25
-    op = row_load.operator("science_blocks.load_demo", text="Load Selected Simulation Demo", icon="PLAY")
-    op.demo_type = props.demo_scenario
-
-    # Quick 1-click Preset Pills
-    b_demo.label(text="1-Click Demo Scenarios:", icon="PRESET")
-    grid_demo = b_demo.grid_flow(columns=2, align=True)
-
-    op1 = grid_demo.operator("science_blocks.load_demo", text="High-Energy Mill", icon="FORCE_CHARGE")
-    op1.demo_type = "HIGH_ENERGY_BALL_MILL"
-
-    op2 = grid_demo.operator("science_blocks.load_demo", text="Wet Slurry Mill", icon="FORCE_FLUIDFLOW")
-    op2.demo_type = "WET_SLURRY_MILL"
-
-    op3 = grid_demo.operator("science_blocks.load_demo", text="Horizontal 90° Mill", icon="ORIENTATION_GIMBAL")
-    op3.demo_type = "HORIZONTAL_MILL"
-
-    op4 = grid_demo.operator("science_blocks.load_demo", text="Zero-G Space Mill", icon="WORLD")
-    op4.demo_type = "SPACE_ZERO_G_MILL"
-
-    row_multi = b_demo.row(align=True)
-    row_multi.scale_y = 1.15
-    op5 = row_multi.operator("science_blocks.load_demo", text="Multiphysics Solvers Suite (CFD/DEM/FEM)", icon="PHYSICS")
-    op5.demo_type = "MULTIPHYSICS_SOLVERS"
-
-    col.separator(factor=0.4)
-
-    # Studio Lighting & Material Library
-    b_theme = col.box()
-    b_theme.label(text="Studio Theme & Material Library:", icon="MATERIAL")
-    c_th = b_theme.column(align=True)
-    row_th = c_th.row(align=True)
-    row_th.prop(props, "viewport_theme_mode", text="")
-    row_th.operator("science_blocks.apply_light_theme", text="Apply Theme", icon="LIGHT_SUN")
-
-    c_th.separator(factor=0.2)
-    c_th.label(text="Standard PBR Materials:", icon="SHADING_RENDERED")
-    c_th.prop(props, "selected_studio_material", text="")
-    row_m_act = c_th.row(align=True)
-    row_m_act.operator("science_blocks.assign_studio_material", text="Assign to Selected", icon="RESTRICT_SELECT_OFF")
-    row_m_act.operator("science_blocks.duplicate_studio_material", text="Duplicate", icon="DUPLICATE")
-
     col.separator(factor=0.3)
 
-    # 3D Model Scene Assignments
-    b_models = col.box()
-    b_models.label(text="3D Simulation Models:", icon="OBJECT_DATA")
-    c_mod = b_models.column(align=True)
-    c_mod.prop(props, "jar_chamber_obj", text="Chamber / Jar")
-    c_mod.prop(props, "sun_wheel_obj", text="Carrier / Plate (Optional)")
+    # Live Bake Progress Bar & Rotating Circular Spinner
+    is_baking = getattr(props, "dem_is_baking", False) if props else False
+    if is_baking:
+        tick = getattr(props, "dem_bake_spinner", 0) if props else 0
+        char, icon = get_spinner_glyph(tick)
+        pct = getattr(props, "dem_bake_progress", 0.0) if props else 0.0
+        st = getattr(props, "dem_bake_status", "Simulating...")
 
-    row_sci_c = col.row(align=True)
-    row_sci_c.scale_y = 1.2
-    row_sci_c.operator(
-        "science_blocks.apply_scientific_paper_colors",
-        text="Assign Scientific Paper Colors",
-        icon="SHADING_RENDERED",
-    )
-
-    col.separator(factor=0.3)
-
-    # Isolated Side Chamber Inspection View (Fixed Gravity Vector)
-    b_side = col.box()
-    side_active = bool(getattr(props, "show_side_jar_view", False) and bpy.data.objects.get("Jar_Chamber_SideView"))
-    row_side_hdr = b_side.row(align=True)
-    row_side_hdr.label(text="Side Chamber View (Fixed Gravity):", icon="VIEW3D")
-    row_side_hdr.operator(
-        "science_blocks.toggle_side_jar_view",
-        text="Active" if side_active else "Off",
-        icon="CHECKBOX_HLT" if side_active else "CHECKBOX_DEHLT",
-    )
-
-    c_s = b_side.column(align=True)
-    row_side_btn = c_s.row(align=True)
-    row_side_btn.scale_y = 1.2
-    if side_active:
-        row_side_btn.operator("science_blocks.update_side_jar_view", text="Refresh Side Chamber", icon="FILE_TICK")
-        row_side_btn.operator("science_blocks.toggle_side_jar_view", text="Close View", icon="X")
+        box_p = col.box()
+        r_sp = box_p.row(align=True)
+        r_sp.label(text=f"Baking DEM Simulation {char} {int(pct)}%", icon=icon)
+        r_bar = box_p.row(align=True)
+        r_bar.prop(props, "dem_bake_progress", slider=True, text="")
+        if st:
+            r_st = box_p.row(align=True)
+            r_st.scale_y = 0.8
+            r_st.label(text=st, icon="INFO")
+    elif getattr(props, "dem_is_simulated", False):
+        box_done = col.box()
+        box_done.label(text=f"Simulation Baked ({getattr(props, 'dem_total_impacts', 0)} impacts)", icon="CHECKMARK")
+        r_rebake = box_done.row(align=True)
+        r_rebake.scale_y = 1.15
+        r_rebake.operator("science_blocks.run_dem_simulation", text="Re-Bake DEM Simulation", icon="PHYSICS")
     else:
-        row_side_btn.operator("science_blocks.toggle_side_jar_view", text="Show Side Chamber & Gravity Arrow", icon="VIEW3D")
+        row_bake = col.row(align=True)
+        row_bake.scale_y = 1.2
+        row_bake.operator("science_blocks.run_dem_simulation", text="Bake DEM Simulation", icon="PHYSICS")
 
-    row_opt = c_s.row(align=True)
-    row_opt.prop(props, "side_jar_show_arrow", text="Gravity Vector Arrow", icon="CHECKBOX_HLT" if getattr(props, "side_jar_show_arrow", True) else "CHECKBOX_DEHLT")
-    row_opt.prop(props, "side_jar_invert_arrow", text="Invert Arrow", icon="ARROW_LEFTRIGHT")
-    row_opt.prop(props, "side_jar_offset_x", text="Offset")
-
-    col.separator(factor=0.4)
-
-    # Viewport Kinematics & Live Motion Transport
-    b_kin = col.box()
-    b_kin.label(text="Motion & Viewport Test:", icon="PLAY")
-    c_kin = b_kin.column(align=True)
-
-    is_playing = bool(getattr(context.screen, "is_animation_playing", False))
-    row_play = c_kin.row(align=True)
-    row_play.scale_y = 1.25
-    row_play.operator("science_blocks.reset_animation", icon="REW", text="")
-    btn_icon = "PAUSE" if is_playing else "PLAY"
-    btn_text = "Pause Motion" if is_playing else "Play Motion"
-    row_play.operator("science_blocks.toggle_animation", icon=btn_icon, text=btn_text)
-
-    row_scrub = c_kin.row(align=True)
-    row_scrub.prop(context.scene, "frame_current", text="Frame")
-    row_scrub.prop(props, "live_motion_preview", text="Live Preview", icon="CHECKBOX_HLT" if getattr(props, "live_motion_preview", True) else "CHECKBOX_DEHLT")
-
+    col.prop(props, "dem_container_shape", text="Chamber Collision Shape")
+    row_stl = col.row(align=True)
+    row_stl.operator("science_blocks.export_container_stl", text="Convert Chamber to STL", icon="EXPORT")
+    if getattr(props, "dem_container_stl_path", ""):
+        row_stl.label(text="STL Ready", icon="CHECKMARK")
     col.separator(factor=0.3)
 
-    # Chamber Inspection & Professional Framing
-    b_focus = col.box()
-    b_focus.label(text="Chamber Inspection & Focus:", icon="VIEWZOOM")
-    c_foc = b_focus.column(align=True)
-    row_f1 = c_foc.row(align=True)
-    row_f1.operator("science_blocks.focus_jar_view", text="Focus View on Jar", icon="VIEW_CAMERA")
-    show_cutaway = getattr(props, "show_chamber_cutaway", False)
-    row_f1.operator(
-        "science_blocks.toggle_chamber_cutaway",
-        text="Solid Chamber" if show_cutaway else "Chamber Cutaway (Inside View)",
-        icon="MOD_BOOLEAN",
-    )
-    is_tracking = getattr(props, "camera_follow_jar", False)
-    c_foc.operator(
-        "science_blocks.toggle_camera_tracking",
-        text="Stop Tracking Jar" if is_tracking else "Track Jar With Camera",
-        icon="CAMERA_DATA",
-    )
-
-
-def draw_step_3_simulation(layout, context, props):
-    """Step 3: Simple & Clean DEM Particle Physics, Simulation & Telemetry."""
-    col = layout.column(align=True)
-
-    # 1. Grinding Media / Particles Setup
-    b_charge = col.box()
-    b_charge.label(text="Particles & Media Setup:", icon="SNAP_VOLUME")
-    c_c = b_charge.column(align=True)
-    row_mat = c_c.row(align=True)
-    row_mat.prop(props, "dem_material_preset", text="Material")
-    row_mat.operator("science_blocks.apply_material_preset", text="Apply", icon="CHECKMARK")
-
-    row_ch = c_c.row(align=True)
-    row_ch.prop(props, "dem_ball_count", text="Balls")
-    row_ch.prop(props, "dem_ball_radius_mm", text="Radius (mm)")
-    c_c.prop(props, "dem_ball_density", text="Density (kg/m³)")
-
-    col.separator(factor=0.3)
-
-    # 2. Simulation Environment Settings
-    b_sim = col.box()
-    b_sim.label(text="Simulation Settings & Engine:", icon="PHYSICS")
-    c_s = b_sim.column(align=True)
-    c_s.prop(props, "dem_solver_engine", text="DEM Engine")
-    row_s1 = c_s.row(align=True)
-    row_s1.prop(props, "dem_sim_frames", text="Frames")
-    row_s1.prop(props, "mill_gravity_value", text="Gravity (m/s²)")
-    c_s.prop(props, "dem_viewport_colormap", text="Colormap")
-
-    col.separator(factor=0.4)
-
-    # 3. Main Action Buttons
-    row_run = col.row(align=True)
-    row_run.scale_y = 1.4
-    row_run.operator(
-        "science_blocks.run_dem_simulation",
-        text="Run DEM Simulation (Bake Physics)",
-        icon="PARTICLES",
-    )
-
-    # Post-Bake Jar Inspection Controls
-    row_insp = col.row(align=True)
-    row_insp.scale_y = 1.15
-    row_insp.operator("science_blocks.focus_jar_view", text="Focus Jar", icon="VIEW_CAMERA")
-    show_cutaway = getattr(props, "show_chamber_cutaway", False)
-    row_insp.operator(
-        "science_blocks.toggle_chamber_cutaway",
-        text="Cutaway View" if not show_cutaway else "Solid Jar",
-        icon="MOD_BOOLEAN",
-    )
+    # Side Chamber Inspection Station
+    box_side = col.box()
     side_active = bool(getattr(props, "show_side_jar_view", False) and bpy.data.objects.get("Jar_Chamber_SideView"))
-    row_insp.operator(
+    icon_side = "RESTRICT_VIEW_OFF" if side_active else "RESTRICT_VIEW_ON"
+    r_side = box_side.row(align=True)
+    r_side.operator(
         "science_blocks.toggle_side_jar_view",
-        text="Side View" if not side_active else "Hide Side",
-        icon="VIEW3D",
+        text="Side Inspection View (Active)" if side_active else "Side Inspection View",
+        icon=icon_side,
     )
-    row_insp.operator("science_blocks.apply_scientific_paper_colors", text="Colors", icon="SHADING_RENDERED")
-
-    # 4. Results & Reporting
-
-    if getattr(props, "dem_is_simulated", False):
-        col.separator(factor=0.4)
-        b_res = col.box()
-        b_res.label(text="Simulation Telemetry & Results:", icon="VIEWZOOM")
-        c_res = b_res.column(align=True)
-
-        total_impacts = getattr(props, "dem_total_impacts", 0)
-        coll_freq = getattr(props, "dem_collision_freq_hz", 0.0)
-        row_im = c_res.row(align=True)
-        row_im.label(text=f"Impacts: {total_impacts:,}", icon="DOT")
-        row_im.label(text=f"Freq: {coll_freq:.1f} Hz", icon="TIME")
-
-        mean_energy = getattr(props, "dem_mean_impact_energy_j", 0.0)
-        power_w = getattr(props, "dem_power_watts", 0.0)
-        row_e = c_res.row(align=True)
-        row_e.label(text=f"Mean Energy: {mean_energy:.4f} J", icon="DRIVER")
-        row_e.label(text=f"Power: {power_w:.1f} W", icon="TOOL_SETTINGS")
-
-    #     c_res.separator(factor=0.3)
-    #     row_rep = c_res.row(align=True)
-    #     row_rep.scale_y = 1.3
-    #     row_rep.operator(
-    #         "science_blocks.generate_scientific_report",
-    #         text="Generate Scientific Report & Figures",
-    #         icon="TEXT",
-    #     )
-
-    #     row_links = c_res.row(align=True)
-    #     row_links.scale_y = 1.15
-    #     row_links.operator("science_blocks.open_html_report", text="View HTML Report", icon="URL")
-    #     row_links.operator("science_blocks.export_telemetry", text="Export CSV / JSON", icon="FILE_TICK")
-
-    # col.separator(factor=0.4)
-        c_res.separator(factor=0.3)
-        row_rep = c_res.row(align=True)
-        row_rep.scale_y = 1.3
-        row_rep.operator(
-            "science_blocks.generate_scientific_report",
-            text="Generate Scientific Report & Figures",
-            icon="TEXT",
-        )
-
-        row_links = c_res.row(align=True)
-        row_links.scale_y = 1.15
-        row_links.operator("science_blocks.open_html_report", text="View HTML Report", icon="URL")
-        row_links.operator("science_blocks.export_telemetry", text="Export CSV / JSON", icon="FILE_TICK")
+    if side_active:
+        c_s = box_side.column(align=True)
+        c_s.prop(props, "side_jar_spin", text="Spin Side Chamber")
+        c_s.prop(props, "side_jar_display_mode", text="Display")
+        c_s.prop(props, "side_jar_show_arrow", text="Show Gravity Arrow")
 
     col.separator(factor=0.4)
 
-    # 5. Open-Source Multiphysics Tools (Node-Based)
-    b_tools = col.box()
-    b_tools.label(text="Open-Source Scientific Solvers:", icon="NODETREE")
-    c_t = b_tools.column(align=True)
-    c_t.label(text="Accessible via Node Editor (Shift+A):", icon="INFO")
-    c_t.label(text="• DEM: LIGGGHTS, Yade")
-    c_t.label(text="• CFD: OpenFOAM, FluidX3D (LBM)")
-    c_t.label(text="• Coupling: CFDEM (Ergun/Wen-Yu)")
-    c_t.label(text="• Multiphysics: CalculiX, Elmer, OpenRadioss")
-    c_t.separator(factor=0.2)
-    row_nd = c_t.row(align=True)
-    row_nd.scale_y = 1.15
-    row_nd.operator("science_blocks.open_node_editor", text="Open Node Tree to Connect Solvers", icon="NODETREE")
 
 
 def draw_scientific_styling_panel(layout, context, props):
@@ -652,23 +454,13 @@ def draw_guided_workflow_ui(layout, context):
     if s2 is not None:
         draw_step_2_kinematics(s2, context, props)
 
-    # Step 3- Physics & Telemetry
-    s3 = draw_collapsible_box(
-        layout,
-        props,
-        "ui_step_3_dem",
-        "3- Simulation & Results",
-        "PARTICLES",
-    )
-    if s3 is not None:
-        draw_step_3_simulation(s3, context, props)
 
-    # Step 4- Styling Visuals & Colors
+    # Step 3- Styling Visuals & Colors
     s4 = draw_collapsible_box(
         layout,
         props,
         "ui_scientific_styling",
-        "4- Styling & Colors",
+        "3- Styling & Colors",
         "COLOR",
     )
     if s4 is not None:

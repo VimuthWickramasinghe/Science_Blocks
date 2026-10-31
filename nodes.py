@@ -13,6 +13,14 @@ from bpy.props import (
 import nodeitems_utils
 from nodeitems_utils import NodeCategory, NodeItem
 
+CIRCULAR_SPINNERS = ["◐", "◓", "◑", "◒"]
+SPINNER_ICONS = ["TIME", "FILE_REFRESH", "COLOR", "RADIOBUT_ON"]
+
+def get_spinner_glyph(tick: int):
+    char = CIRCULAR_SPINNERS[tick % len(CIRCULAR_SPINNERS)]
+    icon = SPINNER_ICONS[tick % len(SPINNER_ICONS)]
+    return char, icon
+
 
 # ===========================================================================
 # 1. Custom Node Tree Definition
@@ -143,6 +151,10 @@ class ScienceBlocksObjectNode(bpy.types.Node):
         ],
         default="OBJECT",
     )
+
+    def get_target_object(self):
+        """Returns the assigned 3D scene object."""
+        return self.target_object
 
     def init(self, context):
         self.outputs.new("ScienceBlocksObjectSocket", "Object")
@@ -320,6 +332,39 @@ class ScienceBlocksOffsetNode(bpy.types.Node):
         return in_val + self.offset_value
 
 
+def on_rotation_axis_update(self, context):
+    """When rotation axis (X, Y, Z) or direction (CW, CCW) is changed, update connected downstream nodes, live kinematics, and trigger redraw."""
+    obj = self.get_target_object() if hasattr(self, "get_target_object") else None
+    if obj and hasattr(obj, "rotation_euler"):
+        axis_map = {"X": 0, "Y": 1, "Z": 2}
+        active_axis = getattr(self, "rotation_axis", "Z")
+        obj.rotation_mode = "XYZ"
+        for ax_name, ax_idx in axis_map.items():
+            if ax_name != active_axis:
+                base_val = getattr(self, f"base_rot_{ax_name.lower()}", 0.0)
+                obj.rotation_euler[ax_idx] = math.radians(base_val)
+        self.last_axis = active_axis
+
+    scene = getattr(context, "scene", None) or (bpy.context.scene if hasattr(bpy, "context") else None)
+    if scene:
+        try:
+            evaluate_kinematics_frame(scene)
+            props = getattr(scene, "science_blocks_props", None)
+            fps = scene.render.fps / max(1, scene.render.fps_base)
+            frame_start = getattr(scene, "frame_start", 1)
+            time_scale = getattr(props, "motion_time_scale", 1.0) if props else 1.0
+            t = max(0.0, (scene.frame_current - frame_start) / fps) * time_scale
+            update_gravity_arrow_transform(scene, t)
+        except Exception:
+            pass
+
+    if context and hasattr(context, "window_manager") and context.window_manager:
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type in ("NODE_EDITOR", "VIEW_3D", "PROPERTIES"):
+                    area.tag_redraw()
+
+
 class ScienceBlocksRotationNode(bpy.types.Node):
     """Generalized Object Rotation Node with Rest Pose Preservation and Dynamic Offset."""
     bl_idname = "ScienceBlocksRotationNode"
@@ -339,6 +384,7 @@ class ScienceBlocksRotationNode(bpy.types.Node):
             ("X", "Local X Axis", "Spin around the model's local X axis"),
         ],
         default="Z",
+        update=on_rotation_axis_update,
     )
     direction: EnumProperty(
         name="Direction",
@@ -347,26 +393,26 @@ class ScienceBlocksRotationNode(bpy.types.Node):
             ("CCW", "Counter-Clockwise (CCW)", "Counter-Clockwise rotation direction"),
         ],
         default="CW",
+        update=on_rotation_axis_update,
     )
 
-    # # Base Rest Pose (Degrees) - Prevents axis switching & rewind corruption
-    # base_rot_x: FloatProperty(name="Base X (°)", default=0.0, description="Rest pose rotation on X axis in degrees")
-    # base_rot_y: FloatProperty(name="Base Y (°)", default=0.0, description="Rest pose rotation on Y axis in degrees")
-    # base_rot_z: FloatProperty(name="Base Z (°)", default=0.0, description="Rest pose rotation on Z axis in degrees")
-    # has_captured_base: BoolProperty(default=False)
-    # last_axis: StringProperty(name="Last Active Axis", default="")
+    # Base Rest Pose (Degrees) - Prevents axis switching & rewind corruption
+    base_rot_x: FloatProperty(name="Base X (°)", default=0.0, description="Rest pose rotation on X axis in degrees")
+    base_rot_y: FloatProperty(name="Base Y (°)", default=0.0, description="Rest pose rotation on Y axis in degrees")
+    base_rot_z: FloatProperty(name="Base Z (°)", default=0.0, description="Rest pose rotation on Z axis in degrees")
+    has_captured_base: BoolProperty(default=False)
+    last_axis: StringProperty(name="Last Active Axis", default="")
 
-    # # Phase / Angle Offset (Degrees)
-    # angle_offset: FloatProperty(
-    #     name="Offset (°)",
-    #     default=0.0,
-    #     description="Static angle or phase offset in degrees",
-    # )
+    # Phase / Angle Offset (Degrees)
+    angle_offset: FloatProperty(
+        name="Offset (°)",
+        default=0.0,
+        description="Static angle or phase offset in degrees",
+    )
 
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Object In")
         self.inputs.new("ScienceBlocksRPMSocket", "RPM")
-        self.inputs.new("ScienceBlocksFloatSocket", "Offset (°)")
         self.outputs.new("ScienceBlocksObjectSocket", "Object Out")
         self.outputs.new("ScienceBlocksRPMSocket", "Effective RPM")
         self.outputs.new("ScienceBlocksFloatSocket", "Angle (°)")
@@ -392,19 +438,11 @@ class ScienceBlocksRotationNode(bpy.types.Node):
         row_ax.prop(self, "rotation_axis", text="Axis")
         col.prop(self, "direction", expand=True)
 
-        col.separator(factor=0.2)
-        b_pose = col.box()
-        b_pose.label(text="Rest Pose & Offset:", icon="ORIENTATION_GIMBAL")
-        c_p = b_pose.column(align=True)
-        c_p.prop(self, "angle_offset", text="Angle Offset (°)")
-
-        r_base = c_p.row(align=True)
-        r_base.prop(self, "base_rot_x", text="X")
-        r_base.prop(self, "base_rot_y", text="Y")
-        r_base.prop(self, "base_rot_z", text="Z")
-
-        op = c_p.operator("science_blocks.capture_base_rotation", text="Capture Rest Pose", icon="ORIENTATION_GIMBAL")
-        op.node_name = self.name
+        scene = getattr(context, "scene", None)
+        props = getattr(scene, "science_blocks_props", None) if scene else None
+        if props and getattr(props, "show_side_jar_view", False):
+            col.separator(factor=0.2)
+            col.prop(props, "side_jar_spin", text="Spin Side Chamber")
 
 
 class ScienceBlocksOrbitNode(bpy.types.Node):
@@ -426,11 +464,12 @@ class ScienceBlocksOrbitNode(bpy.types.Node):
     orbit_plane: EnumProperty(
         name="Orbit Plane",
         items=[
-            ("XY", "Horizontal (XY Plane)", "Orbit horizontally in XY around Z axis"),
-            ("XZ", "Vertical (XZ Plane)", "Orbit in XZ around Y axis"),
-            ("YZ", "Vertical (YZ Plane)", "Orbit in YZ around X axis"),
+            ("AUTO", "Auto (From Input Axis)", "Align plane automatically with connected Rotation Node"),
+            ("XY", "Horizontal (XY Plane - Z Axis)", "Orbit horizontally in XY around Z axis"),
+            ("XZ", "Vertical (XZ Plane - Y Axis)", "Orbit in XZ around Y axis"),
+            ("YZ", "Vertical (YZ Plane - X Axis)", "Orbit in YZ around X axis"),
         ],
-        default="XY",
+        default="AUTO",
     )
     radius: FloatProperty(name="Radius (m)", default=1.3, min=0.0, description="Orbit radius in meters")
     phase_offset: FloatProperty(name="Phase Offset (°)", default=0.0, description="Initial angular phase offset")
@@ -482,7 +521,20 @@ class ScienceBlocksOrbitNode(bpy.types.Node):
         if "Center In" not in self.inputs or not self.inputs["Center In"].is_linked:
             col.prop(self, "center_object", text="Pivot Center")
 
-        col.prop(self, "orbit_plane", text="Plane")
+        if getattr(self, "orbit_plane", "AUTO") == "AUTO":
+            up_axis = "Z"
+            in_obj = self.inputs.get("Object In")
+            if in_obj and in_obj.is_linked:
+                up_node = in_obj.links[0].from_node
+                if hasattr(up_node, "rotation_axis"):
+                    up_axis = getattr(up_node, "rotation_axis", "Z")
+            plane_map = {"Z": "XY", "Y": "XZ", "X": "YZ"}
+            det_plane = plane_map.get(up_axis, "XY")
+            row_pl = col.row(align=True)
+            row_pl.label(text=f"Plane: {det_plane} (Auto from {up_axis})", icon="MOD_WARP")
+            row_pl.prop(self, "orbit_plane", text="", icon="DOWNARROW_HLT")
+        else:
+            col.prop(self, "orbit_plane", text="Plane")
         col.prop(self, "radius")
         col.prop(self, "phase_offset")
         col.prop(self, "direction", expand=True)
@@ -532,6 +584,7 @@ class ScienceBlocksPhysicsNode(bpy.types.Node):
         row_f = col.row(align=True)
         row_f.prop(self, "restitution", text="e")
         row_f.prop(self, "friction", text="μs")
+        row_f.prop(self, "rolling_friction", text="μr")
 
 
 class ScienceBlocksDEMSolverNode(bpy.types.Node):
@@ -568,6 +621,28 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
         ],
         default="VELOCITY_VERLET",
     )
+    rotation_axis: EnumProperty(
+        name="Rotation Axis",
+        items=[
+            ("AUTO", "Auto (From Wire)", "Inherit rotation axis from linked Rotation Node"),
+            ("Z", "Z Axis (Spin)", "Spin around container's Z axis"),
+            ("Y", "Y Axis (Tumble)", "Tumble horizontally around Y axis"),
+            ("X", "X Axis (Tumble)", "Tumble horizontally around X axis"),
+        ],
+        default="AUTO",
+        description="Active rotation axis for physics simulation",
+    )
+    container_shape: EnumProperty(
+        name="Chamber Collision Shape",
+        items=[
+            ("AUTO", "Auto (Detect Ridges/Mesh)", "Auto detect: uses 3D Mesh with BVH for modeled ridges, lifters, or CAD"),
+            ("MESH", "3D Mesh (Ridges/Lifters)", "Use exact 3D polygon mesh surface with BVH tree for ridges and lifter bars"),
+            ("CYLINDER", "Analytical Cylinder", "Ideal smooth cylinder (faster, ignores custom ridges)"),
+            ("BOX", "Analytical Box", "Ideal rectangular box container"),
+        ],
+        default="AUTO",
+        description="Collision surface representation for the grinding chamber",
+    )
 
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Sun Mechanism")
@@ -582,14 +657,74 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
         col = layout.column(align=True)
         col.prop(self, "contact_model", text="")
         col.prop(self, "charge_distribution", text="")
+
+        try:
+            from .operators import find_rotation_axis_for_solver
+            detected_axis = find_rotation_axis_for_solver(self.id_data, solver_node=self)
+        except Exception:
+            detected_axis = "Z"
+
+        row_ax = col.row(align=True)
+        if getattr(self, "rotation_axis", "AUTO") == "AUTO":
+            row_ax.label(text=f"Axis: {detected_axis} (Linked)", icon="ORIENTATION_GIMBAL")
+            row_ax.prop(self, "rotation_axis", text="", icon="DOWNARROW_HLT")
+        else:
+            row_ax.prop(self, "rotation_axis", text="Axis")
         row_cnt = col.row(align=True)
         row_cnt.prop(self, "ball_count", text="Balls")
         row_cnt.prop(self, "sim_frames", text="Frames")
         col.prop(self, "substeps", text="Substeps")
+
+        sock_jar = self.inputs.get("Jar Chamber")
+        if sock_jar and sock_jar.is_linked:
+            from_obj = None
+            try:
+                from .operators import resolve_object_from_socket
+                from_obj = resolve_object_from_socket(sock_jar)
+            except Exception:
+                try:
+                    from operators import resolve_object_from_socket
+                    from_obj = resolve_object_from_socket(sock_jar)
+                except Exception:
+                    pass
+            if from_obj:
+                row_ch = col.row(align=True)
+                row_ch.label(text=f"Object: {from_obj.name}", icon="SNAP_VOLUME")
+                props_ui = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+                stl_p = getattr(props_ui, "dem_container_stl_path", "") if props_ui else ""
+                row_stl = col.row(align=True)
+                row_stl.operator("science_blocks.export_container_stl", text="Convert to STL", icon="EXPORT")
+                if stl_p and os.path.exists(stl_p):
+                    row_stl.label(text="STL Ready", icon="CHECKMARK")
         col.separator(factor=0.3)
-        row_b = col.row(align=True)
-        row_b.scale_y = 1.3
-        row_b.operator("science_blocks.run_dem_simulation", text="Bake DEM Simulation", icon="PHYSICS")
+        props = getattr(context.scene, "science_blocks_props", None)
+        is_baking = getattr(props, "dem_is_baking", False) if props else False
+        tick = getattr(props, "dem_bake_spinner", 0) if props else 0
+        char, icon = get_spinner_glyph(tick)
+        pct = getattr(props, "dem_bake_progress", 0.0) if props else 0.0
+        st = getattr(props, "dem_bake_status", "") if props else ""
+
+        if is_baking:
+            box_p = col.box()
+            r_sp = box_p.row(align=True)
+            r_sp.label(text=f"Baking DEM {char} {int(pct)}%", icon=icon)
+            r_bar = box_p.row(align=True)
+            r_bar.prop(props, "dem_bake_progress", slider=True, text="")
+            if st:
+                r_st = box_p.row(align=True)
+                r_st.scale_y = 0.8
+                r_st.label(text=st, icon="INFO")
+
+            row_b = col.row(align=True)
+            row_b.scale_y = 1.3
+            row_b.enabled = False
+            row_b.operator("science_blocks.run_dem_simulation", text=f"Baking... {char} {int(pct)}%", icon=icon)
+        else:
+            row_b = col.row(align=True)
+            row_b.scale_y = 1.3
+            btn_text = "Re-Bake DEM Simulation" if getattr(props, "dem_is_simulated", False) else "Bake DEM Simulation"
+            btn_icon = "CHECKMARK" if getattr(props, "dem_is_simulated", False) else "PHYSICS"
+            row_b.operator("science_blocks.run_dem_simulation", text=btn_text, icon=btn_icon)
 
 
 class ScienceBlocksSensorNode(bpy.types.Node):
@@ -618,7 +753,7 @@ class ScienceBlocksSensorNode(bpy.types.Node):
 class ScienceBlocksOutputNode(bpy.types.Node):
     """Viewport Particle Visualizer & Render Output."""
     bl_idname = "ScienceBlocksOutputNode"
-    bl_label = "Particle Visualizer Output"
+    bl_label = "Particle Visualizer"
     bl_icon = "RESTRICT_RENDER_OFF"
 
     display_mode: EnumProperty(
@@ -629,14 +764,25 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         ],
         default="SPHERES",
     )
+    def _on_colormap_update(self, context):
+        try:
+            from . import dem_solver
+            if getattr(dem_solver, "last_dem_result", None) is not None:
+                dem_solver.apply_particle_colormap_postprocess(context, colormap_mode=self.colormap_mode)
+        except Exception:
+            pass
+
     colormap_mode: EnumProperty(
         name="Colormap",
         items=[
             ("VELOCITY", "Velocity Magnitude (Heatmap)", "Rainbow color spectrum from pinned to cataracting"),
-            ("ENERGY", "Impact Energy", "Highlight high shock particles"),
+            ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
+            ("ENERGY", "Impact Kinetic Energy", "Highlight high shock particles"),
+            ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s)"),
             ("SOLID", "Solid Realistic Material", "Metallic/ceramic rendering"),
         ],
         default="VELOCITY",
+        update=_on_colormap_update,
     )
 
     def init(self, context):
@@ -646,10 +792,184 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         col = layout.column(align=True)
         col.prop(self, "display_mode", text="")
         col.prop(self, "colormap_mode", text="")
+
+        # Dynamic connection feedback
+        is_conn = "Milling Particles" in self.inputs and self.inputs["Milling Particles"].is_linked
+        if is_conn:
+            from_n = self.inputs["Milling Particles"].links[0].from_node
+            col.label(text=f"Linked: {from_n.bl_label}", icon="CHECKMARK")
+        else:
+            col.label(text="Connect from Yade Solver", icon="INFO")
+
         col.separator(factor=0.3)
         row_b = col.row(align=True)
         row_b.scale_y = 1.25
-        row_b.operator("science_blocks.run_dem_simulation", text="Bake Simulation", icon="RESTRICT_RENDER_OFF")
+        row_b.operator("science_blocks.apply_particle_colormap", text="Apply Colormap (Post-Process)", icon="COLOR")
+
+        props = getattr(context.scene, "science_blocks_props", None)
+        is_baking = getattr(props, "dem_is_baking", False) if props else False
+        tick = getattr(props, "dem_bake_spinner", 0) if props else 0
+        char, icon = get_spinner_glyph(tick)
+        pct = getattr(props, "dem_bake_progress", 0.0) if props else 0.0
+
+        if is_baking:
+            box_p = col.box()
+            r_sp = box_p.row(align=True)
+            r_sp.label(text=f"Baking {char} {int(pct)}%", icon=icon)
+            r_bar = box_p.row(align=True)
+            r_bar.prop(props, "dem_bake_progress", slider=True, text="")
+
+            row_b2 = col.row(align=True)
+            row_b2.scale_y = 1.15
+            row_b2.enabled = False
+            row_b2.operator("science_blocks.run_dem_simulation", text=f"Baking... {char} {int(pct)}%", icon=icon)
+        else:
+            row_b2 = col.row(align=True)
+            row_b2.scale_y = 1.15
+            btn_text = "Re-Bake Physics & Trajectory" if getattr(props, "dem_is_simulated", False) else "Bake Physics & Trajectory"
+            btn_icon = "CHECKMARK" if getattr(props, "dem_is_simulated", False) else "PHYSICS"
+            row_b2.operator("science_blocks.run_dem_simulation", text=btn_text, icon=btn_icon)
+
+
+# ===========================================================================
+# 6b. Chamber Surface Wear & Collision Heatmap Node
+# ===========================================================================
+
+class ScienceBlocksChamberHeatmapNode(bpy.types.Node):
+    """Visualizes particle collision wear, contact impact forces, and momentum transfer on the jar surface."""
+    bl_idname = "ScienceBlocksChamberHeatmapNode"
+    bl_label = "Chamber Surface Impact Map"
+    bl_icon = "COLOR"
+
+    def _on_heatmap_update(self, context):
+        try:
+            try:
+                from .operators import compute_and_apply_surface_impact_heatmap
+            except (ImportError, ValueError):
+                from operators import compute_and_apply_surface_impact_heatmap
+            target = None
+            if "Chamber Mesh" in self.inputs and self.inputs["Chamber Mesh"].is_linked:
+                from_node = self.inputs["Chamber Mesh"].links[0].from_node
+                if hasattr(from_node, "target_object") and from_node.target_object:
+                    target = from_node.target_object
+            compute_and_apply_surface_impact_heatmap(
+                context,
+                target_obj=target,
+                metric_mode=self.metric_mode,
+                palette=self.palette,
+                blur_radius_m=self.blur_radius_mm * 0.001,
+                contrast=self.contrast,
+                apply_to_side_jar=self.apply_to_side_jar,
+                emission_glow=self.emission_glow,
+            )
+        except Exception:
+            pass
+
+    metric_mode: EnumProperty(
+        name="Impact Metric",
+        description="Physical quantity mapped across the grinding jar wall surface",
+        items=[
+            ("HITS", "Total Hit Count (Density)", "Cumulative particle impacts over the milling duration"),
+            ("FREQUENCY", "Collision Frequency (Hz)", "Impact rate per second per unit surface area"),
+            ("FORCE", "Contact Force / Impact Load (N)", "Normal collision and shear contact force exerted on jar wall"),
+            ("INERTIA", "Momentum Transfer (N·s)", "Inertia change and impulse (Delta p = m * Delta v) on jar wall"),
+        ],
+        default="HITS",
+        update=_on_heatmap_update,
+    )
+
+    palette: EnumProperty(
+        name="Colormap Palette",
+        description="Scientific colormap palette for the surface impact heat map",
+        items=[
+            ("TURBO", "Turbo (Perceptual Rainbow)", "Google AI perceptual rainbow with high readability"),
+            ("HEAT_FLAME", "Heat Flame (Thermal)", "Thermal infrared spectrum: black to orange, yellow, and white"),
+            ("VIRIDIS", "Viridis (Journal Standard)", "Perceptually uniform, colorblind-safe publication standard"),
+            ("PLASMA", "Plasma (High Contrast)", "High-contrast energetic purple to pink, orange, and yellow"),
+            ("HOT_COLD", "Hot-Cold (Diverging)", "Diverging blue (zero) to light neutral to blazing crimson (peak)"),
+        ],
+        default="TURBO",
+        update=_on_heatmap_update,
+    )
+
+    blur_radius_mm: FloatProperty(
+        name="Kernel Radius (mm)",
+        description="Spatial Gaussian smoothing radius across the mesh surface (mm)",
+        default=15.0,
+        min=1.0,
+        max=100.0,
+        update=_on_heatmap_update,
+    )
+
+    contrast: FloatProperty(
+        name="Contrast Power",
+        description="Non-linear contrast expansion power curve (gamma)",
+        default=1.0,
+        min=0.2,
+        max=5.0,
+        update=_on_heatmap_update,
+    )
+
+    apply_to_side_jar: BoolProperty(
+        name="Mirror to Side View",
+        description="Mirror surface heatmap to the isolated Jar_Chamber_SideView inspection display",
+        default=True,
+        update=_on_heatmap_update,
+    )
+
+    emission_glow: FloatProperty(
+        name="Shader Glow",
+        description="Shader emission intensity for high-contrast viewing even in shadows",
+        default=0.35,
+        min=0.0,
+        max=2.0,
+        update=_on_heatmap_update,
+    )
+
+    def init(self, context):
+        self.inputs.new("ScienceBlocksObjectSocket", "Chamber Mesh")
+        self.inputs.new("ScienceBlocksSimSocket", "DEM Simulation")
+        self.outputs.new("ScienceBlocksObjectSocket", "Chamber Mesh")
+        self.outputs.new("ScienceBlocksDataSocket", "Surface Telemetry")
+
+    def draw_buttons(self, context, layout):
+        col = layout.column(align=True)
+        col.prop(self, "metric_mode", text="")
+        col.prop(self, "palette", text="")
+
+        row_k = col.row(align=True)
+        row_k.prop(self, "blur_radius_mm", text="Radius")
+        row_k.prop(self, "contrast", text="Contrast")
+
+        col.prop(self, "emission_glow", text="Shader Glow", slider=True)
+        col.prop(self, "apply_to_side_jar", text="Mirror to Side View", icon="DUPLICATE")
+
+        # Telemetry readouts from last simulation
+        try:
+            try:
+                from . import dem_solver
+            except (ImportError, ValueError):
+                import dem_solver
+            res = getattr(dem_solver, "last_dem_result", None)
+            if res and hasattr(res, "wall_impact_locations") and res.wall_impact_locations:
+                box = col.box()
+                b_col = box.column(align=True)
+                n_hits = len(res.wall_impact_locations)
+                b_col.label(text=f"Wall Impacts: {n_hits}", icon="CHECKMARK")
+                max_f = max(res.wall_impact_forces) if getattr(res, "wall_impact_forces", None) else 0.0
+                tot_j = sum(res.wall_impact_impulses) if getattr(res, "wall_impact_impulses", None) else 0.0
+                b_col.label(text=f"Peak Force: {max_f:.1f} N")
+                b_col.label(text=f"Total Momentum: {tot_j:.2f} N·s")
+            else:
+                col.label(text="Bake DEM to view surface hits", icon="INFO")
+        except Exception:
+            pass
+
+        col.separator(factor=0.3)
+        row_b = col.row(align=True)
+        row_b.scale_y = 1.25
+        row_b.operator("science_blocks.bake_surface_impact_map", text="Generate Heatmap", icon="COLOR")
+        row_b.operator("science_blocks.clear_surface_impact_map", text="Clear", icon="TRASH")
 
 
 # ===========================================================================
@@ -742,7 +1062,7 @@ def get_parent_wheel_rotation_angle(scene, t: float) -> float:
                     rpm = get_input_rpm(node, "RPM", t)
                     dir_sign = -1.0 if node.direction == "CW" else 1.0
                     rad_per_sec = (rpm * 2.0 * math.pi / 60.0) * dir_sign
-                    offset_deg = node.angle_offset
+                    offset_deg = getattr(node, "angle_offset", 0.0)
                     if "Offset (°)" in node.inputs and node.inputs["Offset (°)"].is_linked:
                         offset_deg += get_input_float(node, "Offset (°)", t)
                     return rad_per_sec * t + math.radians(offset_deg)
@@ -759,8 +1079,72 @@ def get_parent_wheel_rotation_angle(scene, t: float) -> float:
     return 0.0
 
 
+def get_chamber_rotation_state(scene, t: float) -> dict:
+    """Extracts continuous rotation angle, active axis (X, Y, Z), direction (CW, CCW),
+    and RPM for the container / jar (supporting any mesh: Jar, Cube, Suzanne, Cylinder)."""
+    props = getattr(scene, "science_blocks_props", None)
+    jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+    sun_obj = (
+        getattr(props, "sun_wheel_obj", None)
+        or (jar_obj.parent if jar_obj else None)
+        or bpy.data.objects.get("Sun_Wheel_Plate")
+        or bpy.data.objects.get("Sun_Wheel")
+    )
+
+    jar_node = None
+    for group in bpy.data.node_groups:
+        if group.bl_idname != "ScienceBlocksNodeTree":
+            continue
+        all_rot = [n for n in group.nodes if isinstance(n, ScienceBlocksRotationNode)]
+        for node in all_rot:
+            tgt = node.get_target_object()
+            lbl = (node.label or node.name).lower()
+            is_sun = bool(tgt and (tgt == sun_obj or "sun" in tgt.name.lower() or (jar_obj and tgt == jar_obj.parent)) or "sun" in lbl)
+            if not is_sun:
+                jar_node = node
+                break
+        if not jar_node and all_rot and not sun_obj:
+            jar_node = all_rot[0]
+        if jar_node:
+            break
+
+    if jar_node:
+        axis = getattr(jar_node, "rotation_axis", "Z")
+        direction = getattr(jar_node, "direction", "CW")
+        rpm = get_input_rpm(jar_node, "RPM", t)
+        offset_deg = getattr(jar_node, "angle_offset", 0.0)
+        if "Offset (°)" in jar_node.inputs and jar_node.inputs["Offset (°)"].is_linked:
+            offset_deg += get_input_float(jar_node, "Offset (°)", t)
+
+        dir_sign = -1.0 if direction == "CW" else 1.0
+        rad_per_sec = (abs(rpm) * 2.0 * math.pi / 60.0) * dir_sign
+        settle_delay = getattr(props, "dem_settle_delay_s", 1.0) if props else 1.0
+        t_rot = max(0.0, t - settle_delay)
+        angle = rad_per_sec * t_rot + math.radians(offset_deg)
+        return {
+            "node": jar_node,
+            "axis": axis,
+            "direction": direction,
+            "rpm": rpm,
+            "angle": angle,
+            "target": jar_node.get_target_object() or jar_obj,
+        }
+
+    # Fallback to properties if available
+    axis = getattr(props, "kinematics_jar_axis", "Z") if props else "Z"
+    angle = getattr(props, "kinematics_jar_rot_rad", 0.0) if props else 0.0
+    return {
+        "node": None,
+        "axis": axis,
+        "direction": "CW",
+        "rpm": 0.0,
+        "angle": angle,
+        "target": jar_obj,
+    }
+
+
 def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
-    """Computes the exact apparent gravity vector in the side inspection chamber.
+    """Computes the exact apparent gravity vector in the rotating reference frame of the chamber / carrier.
 
     Mathematical Formulation:
       1. World Gravity Vector g_world:
@@ -768,10 +1152,13 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
          If props.side_jar_gravity_axis is "-Y" or "-X", g_world is aligned accordingly.
          If microgravity is active (Zero-G space demo, or props.dem_gravity_z == 0), returns (0, 0, 0).
 
-      2. Carrier (Sun Wheel) Spin Axis u_spin:
-         Extracted from the Sun Wheel 3D world orientation:
+      2. Reference Spin Axis u_spin:
+         - Planetary Mill Mode (active Sun Wheel carrier):
            u_spin = (sun_obj.matrix_world.to_3x3() @ Vector((0, 0, 1))).normalized()
-         If sun_obj is absent, defaults to vertical (0, 0, 1).
+           rotation_angle = get_parent_wheel_rotation_angle(scene, t)
+         - Standalone Container Mode (Jar, Cube, Suzanne, Cylinder, Drum, etc.):
+           u_spin = unit vector corresponding to container rotation_axis ('X', 'Y', 'Z')
+           rotation_angle = chamber continuous angle (incorporating CW/CCW direction and RPM)
 
       3. Rodrigues' Vector Decomposition:
          Decompose g_world into parallel and perpendicular components relative to u_spin:
@@ -779,9 +1166,9 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
            g_perp = g_world - g_par
 
       4. Rotating Reference Frame Transformation:
-         As the carrier revolves at angular position theta(t), the transverse component
+         As the container/carrier rotates at angular position theta(t), the transverse component
          g_perp rotates in the cross-sectional plane orthogonal to u_spin:
-           theta_eff = parent_rot if props.side_jar_invert_arrow else -parent_rot
+           theta_eff = rotation_angle if props.side_jar_invert_arrow else -rotation_angle
            g_apparent = g_par + g_perp * cos(theta_eff) + (u_spin x g_perp) * sin(theta_eff)
 
       5. Physical Invariants:
@@ -792,8 +1179,8 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
          - 90° Horizontal Mill (tilt = 90°):
            g_par = 0, g_perp = (0, 0, -1).
            g_apparent rotates continuously in the transverse plane with exact unit norm.
-         - Arbitrary Tilt Angle:
-           Preserves axial gravity component while rotating transverse component.
+         - Single Drum / Container Rotation:
+           Dynamically rotates according to container rotation axis and direction (CW / CCW).
     """
     props = getattr(scene, "science_blocks_props", None)
 
@@ -813,7 +1200,7 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
     else:
         g_world = mathutils.Vector((0.0, 0.0, -1.0))
 
-    # Carrier (Sun Wheel) Spin Axis in World Space
+    # Discover carrier and container objects
     jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
     sun_obj = (
         getattr(props, "sun_wheel_obj", None)
@@ -822,14 +1209,45 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
         or bpy.data.objects.get("Sun_Wheel")
     )
 
-    if sun_obj and hasattr(sun_obj, "matrix_world") and sun_obj.matrix_world:
-        rot_mat = sun_obj.matrix_world.to_3x3()
-        u_spin = (rot_mat @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
-    elif sun_obj and hasattr(sun_obj, "rotation_euler"):
-        rot_mat = sun_obj.rotation_euler.to_matrix()
-        u_spin = (rot_mat @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
+    # Check if carrier (Sun Wheel) is actively spinning
+    sun_rot = get_parent_wheel_rotation_angle(scene, t)
+    has_sun_spin = abs(sun_rot) > 1e-6 or (sun_obj and hasattr(sun_obj, "rotation_euler") and abs(sun_obj.rotation_euler.z) > 1e-4)
+
+    if has_sun_spin and sun_obj:
+        # Carrier (Sun Wheel) Spin Axis in World Space
+        if hasattr(sun_obj, "matrix_world") and sun_obj.matrix_world:
+            rot_mat = sun_obj.matrix_world.to_3x3()
+            u_spin = (rot_mat @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
+        elif hasattr(sun_obj, "rotation_euler"):
+            rot_mat = sun_obj.rotation_euler.to_matrix()
+            u_spin = (rot_mat @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
+        else:
+            u_spin = mathutils.Vector((0.0, 0.0, 1.0))
+        rotation_angle = sun_rot
     else:
-        u_spin = mathutils.Vector((0.0, 0.0, 1.0))
+        # Standalone Container / Jar Rotation Mode
+        chamber_state = get_chamber_rotation_state(scene, t)
+        rotation_angle = chamber_state["angle"]
+        c_axis = chamber_state["axis"]
+        axis_map = {
+            "X": mathutils.Vector((1.0, 0.0, 0.0)),
+            "Y": mathutils.Vector((0.0, 1.0, 0.0)),
+            "Z": mathutils.Vector((0.0, 0.0, 1.0)),
+        }
+        local_axis = axis_map.get(c_axis, mathutils.Vector((0.0, 0.0, 1.0)))
+        tgt = chamber_state.get("target") or jar_obj
+        if tgt and tgt.parent and hasattr(tgt.parent, "matrix_world") and tgt.parent.matrix_world:
+            u_spin = (tgt.parent.matrix_world.to_3x3() @ local_axis).normalized()
+        elif tgt and hasattr(tgt, "matrix_world") and tgt.matrix_world and chamber_state.get("node"):
+            rn = chamber_state["node"]
+            base_mat = mathutils.Euler((
+                math.radians(getattr(rn, "base_rot_x", 0.0)),
+                math.radians(getattr(rn, "base_rot_y", 0.0)),
+                math.radians(getattr(rn, "base_rot_z", 0.0)),
+            )).to_matrix()
+            u_spin = (base_mat @ local_axis).normalized()
+        else:
+            u_spin = local_axis
 
     # Rodrigues Decomposition
     g_dot_u = g_world.dot(u_spin)
@@ -840,10 +1258,9 @@ def compute_apparent_gravity_vector(scene, t: float = 0.0) -> mathutils.Vector:
     if g_perp.length < 1e-6:
         return g_par
 
-    # Transverse rotation in rotating carrier frame
-    parent_rot = get_parent_wheel_rotation_angle(scene, t)
+    # Transverse rotation in rotating carrier / container frame
     invert = getattr(props, "side_jar_invert_arrow", False) if props else False
-    theta_eff = parent_rot if invert else -parent_rot
+    theta_eff = rotation_angle if invert else -rotation_angle
 
     cross_term = u_spin.cross(g_perp)
     g_apparent = g_par + g_perp * math.cos(theta_eff) + cross_term * math.sin(theta_eff)
@@ -901,24 +1318,18 @@ def evaluate_kinematics_frame(scene):
                     continue
 
                 axis_map = {"X": 0, "Y": 1, "Z": 2}
-                active_axis = node.rotation_axis
+                active_axis = getattr(node, "rotation_axis", "Z")
 
-                # 1. If active axis switched since last evaluation, reset the previously rotated axis to its base
-                if node.last_axis and node.last_axis != active_axis and node.last_axis in axis_map:
-                    prev_idx = axis_map[node.last_axis]
-                    prev_base = getattr(node, f"base_rot_{node.last_axis.lower()}", 0.0)
-                    obj.rotation_euler[prev_idx] = math.radians(prev_base)
+                # 1. Capture base rest pose once if not yet captured
+                if not getattr(node, "has_captured_base", False):
+                    node.base_rot_x = math.degrees(obj.rotation_euler.x)
+                    node.base_rot_y = math.degrees(obj.rotation_euler.y)
+                    node.base_rot_z = math.degrees(obj.rotation_euler.z)
+                    node.has_captured_base = True
                 node.last_axis = active_axis
 
-                # 2. Update base for inactive axes if modified in viewport
-                if active_axis in axis_map:
-                    for ax in ("X", "Y", "Z"):
-                        if ax != active_axis:
-                            cur_val = math.degrees(getattr(obj.rotation_euler, ax.lower()))
-                            setattr(node, f"base_rot_{ax.lower()}", cur_val)
-
-                # 3. Dynamic angle offset (socket or property)
-                offset_deg = node.angle_offset
+                # 2. Dynamic angle offset (socket or property)
+                offset_deg = getattr(node, "angle_offset", 0.0)
                 if "Offset (°)" in node.inputs and node.inputs["Offset (°)"].is_linked:
                     offset_deg += get_input_float(node, "Offset (°)", t)
 
@@ -943,41 +1354,81 @@ def evaluate_kinematics_frame(scene):
                     direction_sign = -1.0 if node.direction == "CW" else 1.0
                     rad_per_sec = (abs(rpm) * 2.0 * math.pi / 60.0) * direction_sign
 
-                angle = rad_per_sec * t
+                settle_delay = getattr(props, "dem_settle_delay_s", 1.0)
+                t_rot = max(0.0, t - settle_delay)
+                angle = rad_per_sec * t_rot
 
-                # 4. Set rotation on active axis from base + angle + offset
+                # 3. Set rotation on active axis and strictly lock inactive axes to base rest pose
                 if active_axis in axis_map:
                     active_base = getattr(node, f"base_rot_{active_axis.lower()}", 0.0)
                     tot_rad = math.radians(active_base) + angle + math.radians(offset_deg)
                     obj.rotation_mode = "XYZ"
-                    obj.rotation_euler[axis_map[active_axis]] = tot_rad
+                    for ax_name, ax_idx in axis_map.items():
+                        if ax_name == active_axis:
+                            obj.rotation_euler[ax_idx] = tot_rad
+                        else:
+                            base_val = getattr(node, f"base_rot_{ax_name.lower()}", 0.0)
+                            obj.rotation_euler[ax_idx] = math.radians(base_val)
 
                     # Live telemetry readouts
                     deg = math.degrees(tot_rad) % 360.0
-                    if "Sun" in node.label or (obj and "Sun" in obj.name):
+                    sun_ref = getattr(props, "sun_wheel_obj", None)
+                    is_sun = bool(
+                        (obj and (obj == sun_ref or "sun" in obj.name.lower()))
+                        or "sun" in (getattr(node, "label", "") or "").lower()
+                    )
+                    if is_sun:
                         props.kinematics_sun_angle = deg
                         props.kinematics_sun_rot_rad = angle + math.radians(offset_deg)
-                    elif "Jar" in node.label or (obj and "Jar" in obj.name):
+                    else:
                         props.kinematics_jar_angle = deg
-                        # Synchronize isolated side inspection jar rotation
+                        props.kinematics_jar_rot_rad = angle + math.radians(offset_deg)
+                        props.kinematics_jar_axis = active_axis
+                        # Synchronize isolated side inspection jar rotation and scale
                         side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
                         if side_jar:
                             side_jar.rotation_mode = "XYZ"
-                            if obj.parent:
-                                side_jar.rotation_euler.x = obj.parent.rotation_euler.x
-                                side_jar.rotation_euler.y = obj.parent.rotation_euler.y
-                            side_jar.rotation_euler[axis_map[active_axis]] = tot_rad
+                            parent_rot_x = obj.parent.rotation_euler.x if obj.parent else 0.0
+                            parent_rot_y = obj.parent.rotation_euler.y if obj.parent else 0.0
+                            spin_side = getattr(props, "side_jar_spin", False)
+                            if spin_side:
+                                for ax_name, ax_idx in axis_map.items():
+                                    if ax_name == active_axis:
+                                        side_jar.rotation_euler[ax_idx] = tot_rad
+                                    else:
+                                        side_jar.rotation_euler[ax_idx] = (
+                                            parent_rot_x if ax_name == "X" else (parent_rot_y if ax_name == "Y" else 0.0)
+                                        )
+                            else:
+                                # Stationary Co-Rotating Frame for Inspection
+                                side_jar.rotation_euler.x = parent_rot_x
+                                side_jar.rotation_euler.y = parent_rot_y
+                                side_jar.rotation_euler.z = 0.0
+
+                            if hasattr(obj, "scale") and hasattr(side_jar, "scale"):
+                                side_jar.scale = obj.scale.copy()
+
+                            # Always rotate direction pointer to indicate spindle RPM and phase
+                            side_pointer = bpy.data.objects.get("Jar_Side_Direction_Pointer")
+                            if side_pointer:
+                                side_pointer.rotation_mode = "XYZ"
+                                for ax_name, ax_idx in axis_map.items():
+                                    if ax_name == active_axis:
+                                        side_pointer.rotation_euler[ax_idx] = tot_rad
+                                    else:
+                                        side_pointer.rotation_euler[ax_idx] = 0.0
 
             elif isinstance(node, ScienceBlocksOrbitNode):
                 obj = node.get_target_object()
                 if not obj:
                     continue
 
-                if not node.has_captured_base_loc:
-                    node.base_loc_x = obj.location.x
-                    node.base_loc_y = obj.location.y
-                    node.base_loc_z = obj.location.z
-                    node.has_captured_base_loc = True
+                if not getattr(node, "has_captured_base_loc", False):
+                    if hasattr(node, "base_loc_x"):
+                        node.base_loc_x = obj.location.x
+                        node.base_loc_y = obj.location.y
+                        node.base_loc_z = obj.location.z
+                        node.has_captured_base_loc = True
 
                 center_obj = node.get_center_object()
                 cx = center_obj.location.x if center_obj else 0.0
@@ -985,29 +1436,77 @@ def evaluate_kinematics_frame(scene):
                 cz = center_obj.location.z if center_obj else 0.0
 
                 rpm = get_input_rpm(node, "RPM", t)
-                radius = get_input_float(node, "Radius (m)", t, default=node.radius)
-                offset_deg = node.phase_offset
+                radius = get_input_float(node, "Radius (m)", t, default=getattr(node, "radius", 1.3))
+                offset_deg = getattr(node, "phase_offset", 0.0)
                 if "Offset (°)" in node.inputs and node.inputs["Offset (°)"].is_linked:
                     offset_deg += get_input_float(node, "Offset (°)", t)
 
-                dir_sign = -1.0 if node.direction == "CW" else 1.0
+                dir_sign = -1.0 if getattr(node, "direction", "CW") == "CW" else 1.0
                 ang = (rpm * 2.0 * math.pi / 60.0) * dir_sign * t + math.radians(offset_deg)
 
-                if node.orbit_plane == "XY":
+                base_z = getattr(node, "base_loc_z", 0.0)
+                base_y = getattr(node, "base_loc_y", 0.0)
+                base_x = getattr(node, "base_loc_x", 0.0)
+                plane = getattr(node, "orbit_plane", "AUTO")
+                if plane == "AUTO":
+                    up_axis = "Z"
+                    in_obj = node.inputs.get("Object In")
+                    if in_obj and in_obj.is_linked:
+                        up_node = in_obj.links[0].from_node
+                        if hasattr(up_node, "rotation_axis"):
+                            up_axis = getattr(up_node, "rotation_axis", "Z")
+                    plane_map = {"Z": "XY", "Y": "XZ", "X": "YZ"}
+                    plane = plane_map.get(up_axis, "XY")
+
+                if plane == "XY":
                     obj.location.x = cx + radius * math.cos(ang)
                     obj.location.y = cy + radius * math.sin(ang)
-                    obj.location.z = cz + node.base_loc_z
-                elif node.orbit_plane == "XZ":
+                    obj.location.z = cz + base_z
+                elif plane == "XZ":
                     obj.location.x = cx + radius * math.cos(ang)
-                    obj.location.y = cy + node.base_loc_y
+                    obj.location.y = cy + base_y
                     obj.location.z = cz + radius * math.sin(ang)
-                elif node.orbit_plane == "YZ":
-                    obj.location.x = cx + node.base_loc_x
+                elif plane == "YZ":
+                    obj.location.x = cx + base_x
                     obj.location.y = cy + radius * math.cos(ang)
                     obj.location.z = cz + radius * math.sin(ang)
 
     # 5. Synchronize Gravity Force Arrow in side inspection station
     update_gravity_arrow_transform(scene, t)
+
+
+_is_syncing_side_jar = False
+
+
+@bpy.app.handlers.persistent
+def on_depsgraph_update_post(scene, depsgraph):
+    """Reactively updates the isolated side inspection chamber when jar is scaled, edited, or scale applied."""
+    global _is_syncing_side_jar
+    if _is_syncing_side_jar:
+        return
+    try:
+        props = getattr(scene, "science_blocks_props", None)
+        if not props or not getattr(props, "show_side_jar_view", False):
+            return
+        side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+        if not side_jar:
+            return
+        jar_obj = getattr(props, "jar_chamber_obj", None) or bpy.data.objects.get("Jar_Chamber")
+        if not jar_obj:
+            return
+
+        s_diff = max(abs(side_jar.scale[i] - jar_obj.scale[i]) for i in range(3))
+        d_diff = max(abs(side_jar.dimensions[i] - jar_obj.dimensions[i]) for i in range(3))
+        if s_diff > 1e-4 or d_diff > 1e-4:
+            _is_syncing_side_jar = True
+            try:
+                from .operators import sync_side_jar_view
+            except (ImportError, ValueError):
+                from operators import sync_side_jar_view
+            sync_side_jar_view(scene)
+            _is_syncing_side_jar = False
+    except Exception:
+        _is_syncing_side_jar = False
 
 
 @bpy.app.handlers.persistent
@@ -1019,6 +1518,12 @@ def on_frame_change_post(scene):
         frame_start = getattr(scene, "frame_start", 1)
         t = max(0.0, (scene.frame_current - frame_start) / fps) * props.motion_time_scale
         update_gravity_arrow_transform(scene, t)
+    if props and getattr(props, "show_side_jar_view", False):
+        try:
+            from .operators import sync_side_jar_view
+        except (ImportError, ValueError):
+            from operators import sync_side_jar_view
+        sync_side_jar_view(scene)
 
 
 # ===========================================================================
@@ -1070,6 +1575,7 @@ node_categories = [
         "3D Scene Objects",
         items=[
             NodeItem("ScienceBlocksObjectNode"),
+            NodeItem("ScienceBlocksChamberHeatmapNode"),
         ],
     ),
     ScienceBlocksNodeCategory(
@@ -1080,6 +1586,7 @@ node_categories = [
             NodeItem("ScienceBlocksPhysicsNode"),
             NodeItem("ScienceBlocksSensorNode"),
             NodeItem("ScienceBlocksOutputNode"),
+            NodeItem("ScienceBlocksChamberHeatmapNode"),
         ],
     ),
     ScienceBlocksNodeCategory(
@@ -1121,18 +1628,18 @@ _last_jar_selected_state = False
 
 
 def check_jar_selection_timer():
-    """Detects when the user selects the jar chamber to automatically display the isolated side view."""
+    """Detects when the user selects the jar chamber or scales it to synchronize the side view."""
     global _last_jar_selected_state
     try:
         context = bpy.context
         scene = getattr(context, "scene", None)
         if not scene:
-            return 0.4
+            return 0.25
         props = getattr(scene, "science_blocks_props", None)
-        if not props or not props.side_jar_auto_show_on_select:
-            return 0.4
+        if not props:
+            return 0.25
 
-        jar = props.jar_chamber_obj
+        jar = getattr(props, "jar_chamber_obj", None)
         if not jar:
             jar = bpy.data.objects.get("Jar_Chamber")
             if jar:
@@ -1140,18 +1647,31 @@ def check_jar_selection_timer():
 
         if not jar:
             _last_jar_selected_state = False
-            return 0.4
+            return 0.25
 
-        is_selected = bool(context.active_object == jar or jar.select_get())
-        if is_selected and not _last_jar_selected_state:
-            _last_jar_selected_state = True
-            from .operators import create_or_update_side_jar_view
-            create_or_update_side_jar_view(context)
-        elif not is_selected and _last_jar_selected_state:
-            _last_jar_selected_state = False
+        # Auto-show side view when jar is selected
+        if props.side_jar_auto_show_on_select:
+            is_selected = bool(context.active_object == jar or jar.select_get())
+            if is_selected and not _last_jar_selected_state:
+                _last_jar_selected_state = True
+                try:
+                    from .operators import create_or_update_side_jar_view
+                except (ImportError, ValueError):
+                    from operators import create_or_update_side_jar_view
+                create_or_update_side_jar_view(context)
+            elif not is_selected and _last_jar_selected_state:
+                _last_jar_selected_state = False
+
+        # Continuous real-time scale/geometry synchronization whenever side view is active
+        if getattr(props, "show_side_jar_view", False):
+            try:
+                from .operators import sync_side_jar_view
+            except (ImportError, ValueError):
+                from operators import sync_side_jar_view
+            sync_side_jar_view(context)
     except Exception:
         pass
-    return 0.4
+    return 0.25
 
 
 def register():
@@ -1162,6 +1682,10 @@ def register():
 
     if on_frame_change_post not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(on_frame_change_post)
+
+    if hasattr(bpy.app.handlers, "depsgraph_update_post"):
+        if on_depsgraph_update_post not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(on_depsgraph_update_post)
 
     try:
         if not bpy.app.timers.is_registered(check_jar_selection_timer):
@@ -1178,6 +1702,10 @@ def unregister():
 
     if on_frame_change_post in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(on_frame_change_post)
+
+    if hasattr(bpy.app.handlers, "depsgraph_update_post"):
+        if on_depsgraph_update_post in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph_update_post)
 
     try:
         if bpy.app.timers.is_registered(check_jar_selection_timer):

@@ -98,6 +98,36 @@ COOLWARM_LUT = (
     (0.706, 0.016, 0.150),
 )
 
+# Heat Flame: Thermal radiation spectrum (Black -> Dark Red -> Orange -> Yellow -> White)
+HEAT_FLAME_LUT = (
+    (0.000, 0.000, 0.000),
+    (0.180, 0.000, 0.000),
+    (0.380, 0.000, 0.000),
+    (0.600, 0.020, 0.000),
+    (0.800, 0.120, 0.000),
+    (0.920, 0.280, 0.000),
+    (0.980, 0.480, 0.000),
+    (1.000, 0.680, 0.000),
+    (1.000, 0.840, 0.100),
+    (1.000, 0.940, 0.350),
+    (1.000, 0.990, 0.700),
+    (1.000, 1.000, 1.000),
+)
+
+# Hot-Cold: Diverging impact spectrum (Deep Blue -> Cyan -> Gray -> Yellow -> Crimson)
+HOT_COLD_LUT = (
+    (0.050, 0.150, 0.850),
+    (0.120, 0.380, 0.920),
+    (0.200, 0.650, 0.950),
+    (0.500, 0.850, 0.950),
+    (0.880, 0.920, 0.920),
+    (0.950, 0.850, 0.400),
+    (0.980, 0.620, 0.150),
+    (0.950, 0.350, 0.080),
+    (0.850, 0.100, 0.050),
+    (0.650, 0.020, 0.020),
+)
+
 
 def sample_lut(lut: tuple, val: float) -> tuple:
     """Linearly interpolates across a discrete RGB lookup table."""
@@ -133,6 +163,40 @@ def velocity_to_rainbow_rgb(v_mag: float, v_max: float = 6.0) -> tuple:
         return (0.95 + 0.05 * f, 0.95 * (1 - f), 0.05, 1.0)
 
 
+def force_to_colormap_rgb(force_n: float, f_max: float = 250.0) -> tuple:
+    """Maps dynamic contact force to a scientific colormap (Cyan/Green -> Yellow -> Fiery Red)."""
+    norm = min(1.0, max(0.0, float(force_n) / max(1.0, float(f_max))))
+    if norm < 0.20:
+        f = norm / 0.20
+        return (0.1, 0.70 + 0.25 * f, 0.85 * (1.0 - f * 0.4), 1.0)
+    elif norm < 0.50:
+        f = (norm - 0.20) / 0.30
+        return (0.1 + 0.85 * f, 0.95, 0.15 * (1.0 - f), 1.0)
+    elif norm < 0.80:
+        f = (norm - 0.50) / 0.30
+        return (0.95 + 0.05 * f, 0.95 - 0.45 * f, 0.05, 1.0)
+    else:
+        f = (norm - 0.80) / 0.20
+        return (1.0, 0.50 * (1.0 - f), 0.05, 1.0)
+
+
+def spin_to_colormap_rgb(omega_rad_s: float, w_max: float = 120.0) -> tuple:
+    """Maps angular velocity (spin rate in rad/s) to a colormap (Deep Blue -> Magenta -> Fiery Orange)."""
+    norm = min(1.0, max(0.0, float(omega_rad_s) / max(1.0, float(w_max))))
+    if norm < 0.25:
+        f = norm / 0.25
+        return (0.10 + 0.15 * f, 0.15 + 0.10 * f, 0.85, 1.0)
+    elif norm < 0.50:
+        f = (norm - 0.25) / 0.25
+        return (0.25 + 0.50 * f, 0.25 * (1.0 - f), 0.85 * (1.0 - f * 0.3), 1.0)
+    elif norm < 0.75:
+        f = (norm - 0.50) / 0.25
+        return (0.75 + 0.25 * f, 0.45 * f, 0.60 * (1.0 - f), 1.0)
+    else:
+        f = (norm - 0.75) / 0.25
+        return (1.0, 0.45 + 0.50 * f, 0.10 * f, 1.0)
+
+
 def evaluate_scientific_colormap(
     palette: str,
     val: float,
@@ -140,7 +204,7 @@ def evaluate_scientific_colormap(
     e_kin: float = None,
     mean_e: float = None,
 ) -> tuple:
-    """Evaluates RGBA (0..1) for any scientific palette or physical material."""
+    """Evaluates RGBA (0..1) for any scientific palette, physical quantity, or realistic material."""
     pal = (palette or "VIRIDIS").upper()
 
     # 1. Solid Physical Materials
@@ -151,15 +215,19 @@ def evaluate_scientific_colormap(
     elif pal == "TUNGSTEN":
         return (0.24, 0.26, 0.28, 1.0)  # Tungsten Carbide Gunmetal
 
-    # 2. Collision Shock Energy
-    if pal == "ENERGY":
+    # 2. Specific Physical Quantities
+    if pal == "FORCE":
+        return force_to_colormap_rgb(val, f_max=v_max)
+    elif pal == "SPIN":
+        return spin_to_colormap_rgb(val, w_max=v_max)
+    elif pal == "ENERGY":
         if e_kin is not None and mean_e is not None:
             norm = min(1.0, max(0.0, e_kin / max(1e-4, mean_e * 3.0)))
         else:
             norm = min(1.0, max(0.0, val / max(0.1, v_max)))
         return (norm, 0.20, 1.0 - norm, 1.0)
 
-    # 3. Scientific Velocity Colormaps
+    # 3. Scientific Velocity / General Scalar Colormaps
     norm = min(1.0, max(0.0, val / max(0.1, v_max)))
 
     # Try official Matplotlib colormap if available
@@ -181,6 +249,10 @@ def evaluate_scientific_colormap(
         return sample_lut(PLASMA_LUT, norm)
     elif pal == "TURBO":
         return sample_lut(TURBO_LUT, norm)
+    elif pal in ("HEAT_FLAME", "HEAT", "FLAME", "THERMAL"):
+        return sample_lut(HEAT_FLAME_LUT, norm)
+    elif pal in ("HOT_COLD", "HOTCOLD"):
+        return sample_lut(HOT_COLD_LUT, norm)
     elif pal == "COOLWARM":
         return sample_lut(COOLWARM_LUT, norm)
     elif pal in ("RAINBOW", "VELOCITY"):
@@ -258,21 +330,31 @@ def recolor_dem_particles_in_scene(context, palette: str = "VIRIDIS", v_max: flo
     if res is not None and hasattr(res, "velocities") and res.velocities is not None:
         frames, num_balls, _ = res.trajectories.shape
         orig_frame = context.scene.frame_current
+        max_f = float(np.max(res.forces)) if (hasattr(res, "forces") and res.forces is not None and res.forces.size and np.max(res.forces) > 0) else 100.0
+        max_w = float(np.max(np.linalg.norm(res.angular_velocities, axis=2))) if (hasattr(res, "angular_velocities") and res.angular_velocities is not None and res.angular_velocities.size and np.max(res.angular_velocities) > 0) else 100.0
 
         for f in range(frames):
             frame_num = f + 1
             for i, ball in enumerate(target_balls):
                 if i >= num_balls:
                     break
-                v_mag = float(np.linalg.norm(res.velocities[f, i, :])) if "np" in globals() else 2.5
-                e_kin = 0.5 * res.ball_masses[i] * (v_mag**2) if i < len(res.ball_masses) else None
-                rgba = evaluate_scientific_colormap(
-                    pal,
-                    v_mag,
-                    v_max=v_max,
-                    e_kin=e_kin,
-                    mean_e=res.mean_impact_energy_j,
-                )
+                if pal == "FORCE":
+                    f_val = float(res.forces[f, i]) if hasattr(res, "forces") else 0.0
+                    rgba = force_to_colormap_rgb(f_val, f_max=max_f)
+                elif pal == "SPIN":
+                    w_vec = res.angular_velocities[f, i, :] if hasattr(res, "angular_velocities") else [0, 0, 0]
+                    w_mag = float(np.linalg.norm(w_vec))
+                    rgba = spin_to_colormap_rgb(w_mag, w_max=max_w)
+                else:
+                    v_mag = float(np.linalg.norm(res.velocities[f, i, :])) if "np" in globals() else 2.5
+                    e_kin = 0.5 * res.ball_masses[i] * (v_mag**2) if i < len(res.ball_masses) else None
+                    rgba = evaluate_scientific_colormap(
+                        pal,
+                        v_mag,
+                        v_max=v_max,
+                        e_kin=e_kin,
+                        mean_e=res.mean_impact_energy_j,
+                    )
                 ball.color = rgba
                 ball.keyframe_insert(data_path="color", frame=frame_num)
 
