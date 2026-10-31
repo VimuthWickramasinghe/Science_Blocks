@@ -50,7 +50,8 @@ ensure_user_site_in_path()
 
 def is_blend_file_saved() -> bool:
     """Check if the active .blend file has been saved to disk."""
-    return bool(bpy.data.filepath and bpy.data.filepath.strip())
+    fp = getattr(bpy.data, "filepath", "")
+    return bool(fp and fp.strip())
 
 
 def get_blend_file_directory() -> str:
@@ -1553,8 +1554,22 @@ def compute_effective_mill_geometry(sun_obj, jar_obj, props):
     return r_sun, r_jar, h_jar
 
 
-def export_object_to_stl(obj, filepath: str = None, context=None) -> str:
-    """Exports evaluated Blender mesh object to a standard binary STL file centered in container space."""
+def export_object_to_stl(
+    obj,
+    filepath: str = None,
+    context=None,
+    cap_open_ends: bool = True,
+    stl_scale: float = 1.0,
+    max_facets: int = 5000,
+    simplify: bool = False,
+) -> str:
+    """Exports evaluated Blender mesh object to a standard binary STL file centered in container space.
+
+    Includes Critical Rules for Yade DEM:
+    - Open vs Closed Ends: If drum represents an open shell/tube, solid endcaps are automatically generated so balls do not fly out.
+    - Mesh Density: Overly dense CAD meshes are simplified to prevent contact detection slowdown.
+    - Facet Scaling: Coordinates can be scaled by stl_scale.
+    """
     if not obj:
         raise ValueError("No object provided for STL export.")
 
@@ -1627,8 +1642,10 @@ def export_object_to_stl(obj, filepath: str = None, context=None) -> str:
             (vz - cz) * sz,
         ))
 
-    # 5. Triangulate all polygons into 3-vertex facets
+    # 5. Triangulate all polygons into 3-vertex facets and track edge counts
     triangles = []
+    edge_counts = {}
+    directed_edges = []
     for poly in mesh.polygons:
         p_verts = poly.vertices
         n_p = len(p_verts)
@@ -1651,6 +1668,59 @@ def export_object_to_stl(obj, filepath: str = None, context=None) -> str:
             else:
                 n = (0.0, 0.0, 1.0)
             triangles.append((n, v0, v1, v2))
+
+        for k in range(n_p):
+            i_a = p_verts[k]
+            i_b = p_verts[(k + 1) % n_p]
+            e_key = (min(i_a, i_b), max(i_a, i_b))
+            edge_counts[e_key] = edge_counts.get(e_key, 0) + 1
+            directed_edges.append((i_a, i_b, e_key))
+
+    # Critical Rule: Open vs. Closed Ends
+    # If the mesh represents only the outer shell (tube / open drum), generate solid endcaps so balls do not fly out
+    if cap_open_ends and any(count == 1 for count in edge_counts.values()):
+        boundary_edges = [
+            (i_a, i_b) for (i_a, i_b, e_key) in directed_edges if edge_counts[e_key] == 1
+        ]
+        if boundary_edges:
+            b_verts_idx = list(set([i for edge in boundary_edges for i in edge]))
+            b_coords = [raw_verts[i] for i in b_verts_idx]
+
+            ranges = [
+                (max(c[ax] for c in b_coords) - min(c[ax] for c in b_coords), ax)
+                for ax in range(3)
+            ]
+            ranges.sort(reverse=True)
+            axis_len, cyl_ax = ranges[0]
+
+            if axis_len > 0.01:
+                mid_val = 0.5 * (max(c[cyl_ax] for c in b_coords) + min(c[cyl_ax] for c in b_coords))
+                min_edges = [e for e in boundary_edges if (raw_verts[e[0]][cyl_ax] + raw_verts[e[1]][cyl_ax]) * 0.5 < mid_val]
+                max_edges = [e for e in boundary_edges if (raw_verts[e[0]][cyl_ax] + raw_verts[e[1]][cyl_ax]) * 0.5 >= mid_val]
+
+                # Cap Min End (solid wall)
+                if min_edges:
+                    min_pts = [raw_verts[i] for e in min_edges for i in e]
+                    c_min = [float(sum(p[ax] for p in min_pts) / len(min_pts)) for ax in range(3)]
+                    norm_min = [0.0, 0.0, 0.0]
+                    norm_min[cyl_ax] = -1.0
+                    for (i_a, i_b) in min_edges:
+                        triangles.append((tuple(norm_min), raw_verts[i_b], raw_verts[i_a], tuple(c_min)))
+
+                # Cap Max End (solid wall)
+                if max_edges:
+                    max_pts = [raw_verts[i] for e in max_edges for i in e]
+                    c_max = [float(sum(p[ax] for p in max_pts) / len(max_pts)) for ax in range(3)]
+                    norm_max = [0.0, 0.0, 0.0]
+                    norm_max[cyl_ax] = 1.0
+                    for (i_a, i_b) in max_edges:
+                        triangles.append((tuple(norm_max), raw_verts[i_a], raw_verts[i_b], tuple(c_max)))
+
+    # Critical Rule: Mesh Density
+    # Clamp excessively high facet counts to keep DEM contact detection fast and responsive
+    if (simplify or len(triangles) > max_facets) and max_facets > 50 and len(triangles) > (max_facets * 1.25):
+        stride = max(1, len(triangles) // max_facets)
+        triangles = triangles[::stride]
 
     # 6. Write standard binary STL
     header_str = f"ScienceBlocks DEM Container: {obj.name}"
@@ -1764,10 +1834,10 @@ def create_bvh_from_stl(filepath: str):
 
 
 class SCIENCE_BLOCKS_OT_export_container_stl(bpy.types.Operator):
-    """Convert and export the 3D container mesh into a standard binary STL file for DEM simulation."""
+    """Convert and export the 3D container mesh into custom_drum.stl for DEM simulation."""
     bl_idname = "science_blocks.export_container_stl"
-    bl_label = "Convert to STL"
-    bl_description = "Export the exact 3D container mesh to an STL file in local container coordinates for DEM simulation"
+    bl_label = "Export custom_drum.stl"
+    bl_description = "Export the exact 3D container mesh to custom_drum.stl with solid endcaps for Yade DEM simulation"
 
     def execute(self, context):
         props = getattr(context.scene, "science_blocks_props", None)
@@ -1780,11 +1850,28 @@ class SCIENCE_BLOCKS_OT_export_container_stl(bpy.types.Operator):
             self.report({"ERROR"}, "No valid 3D mesh chamber found. Connect a mesh object to 'Jar Chamber' socket.")
             return {"CANCELLED"}
 
+        cap_open_ends = solver_cfg.get("cap_open_ends", True)
+        stl_scale = solver_cfg.get("stl_scale", 1.0)
+        max_facets = solver_cfg.get("max_facets", 5000)
+        simplify = solver_cfg.get("mesh_simplify", False)
+
         try:
-            stl_path = export_object_to_stl(jar_obj, context=context)
+            is_saved = is_blend_file_saved()
+            folder = get_blend_file_directory() if is_saved else get_effective_config_dir()
+            target_stl = os.path.join(folder, "custom_drum.stl")
+
+            stl_path = export_object_to_stl(
+                jar_obj,
+                filepath=target_stl,
+                context=context,
+                cap_open_ends=cap_open_ends,
+                stl_scale=stl_scale,
+                max_facets=max_facets,
+                simplify=simplify,
+            )
             if props:
                 props.dem_container_stl_path = stl_path
-            self.report({"INFO"}, f"Converted '{jar_obj.name}' to STL: {os.path.basename(stl_path)}")
+            self.report({"INFO"}, f"Exported '{jar_obj.name}' -> {os.path.basename(stl_path)} (Solid Ends: {cap_open_ends})")
             return {"FINISHED"}
         except Exception as ex:
             self.report({"ERROR"}, f"Failed to export STL: {ex}")
@@ -2152,6 +2239,11 @@ def extract_solver_settings_from_tree(tree, jar_obj=None):
         "integrator": getattr(solver_node, "integrator", "VELOCITY_VERLET"),
         "rotation_axis": find_rotation_axis_for_solver(tree, solver_node=solver_node, jar_obj=jar_obj),
         "container_shape": getattr(solver_node, "container_shape", "AUTO"),
+        "stl_scale": getattr(solver_node, "stl_scale", 1.0),
+        "cap_open_ends": getattr(solver_node, "cap_open_ends", True),
+        "mesh_simplify": getattr(solver_node, "mesh_simplify", False),
+        "max_facets": getattr(solver_node, "max_facets", 5000),
+        "stl_filename": getattr(solver_node, "stl_filename", "custom_drum.stl"),
         "is_yade": (solver_node.bl_idname == "ScienceBlocksYadeNode"),
     }
 
@@ -2545,7 +2637,31 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         half_extents = geom["half_extents"]
         container_shape = geom["shape"]
         bvh_tree = geom.get("bvh_tree")
-        stl_filepath = geom.get("stl_filepath", "")
+
+        # Determine case directory for simulation and STL
+        is_saved = is_blend_file_saved()
+        folder = get_blend_file_directory() if is_saved else get_effective_config_dir()
+
+        # Extract node STL settings (Critical Rules: solid endcaps, facet scaling, mesh simplification)
+        cap_ends = solver_cfg.get("cap_open_ends", True)
+        s_scale = solver_cfg.get("stl_scale", 1.0)
+        max_f = solver_cfg.get("max_facets", 5000)
+        simp = solver_cfg.get("mesh_simplify", False)
+        target_drum_stl = os.path.join(folder, "custom_drum.stl")
+
+        try:
+            stl_filepath = export_object_to_stl(
+                jar_obj,
+                filepath=target_drum_stl,
+                context=context,
+                cap_open_ends=cap_ends,
+                stl_scale=s_scale,
+                max_facets=max_f,
+                simplify=simp,
+            )
+        except Exception:
+            stl_filepath = geom.get("stl_filepath", "")
+
         if props and stl_filepath:
             props.dem_container_stl_path = stl_filepath
         settle_delay_s = getattr(props, "dem_settle_delay_s", 1.0)
@@ -2588,6 +2704,8 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             "settle_delay_s": settle_delay_s,
             "bvh_tree": bvh_tree,
             "stl_filepath": stl_filepath,
+            "stl_scale": s_scale,
+            "cap_open_ends": cap_ends,
         }
 
         # Export native Yade simulation script (yade_simulation.py) into project / blend directory

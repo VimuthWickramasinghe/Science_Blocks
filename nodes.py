@@ -1,3 +1,4 @@
+import os
 import bpy
 import math
 import mathutils
@@ -643,6 +644,35 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
         default="AUTO",
         description="Collision surface representation for the grinding chamber",
     )
+    stl_filename: StringProperty(
+        name="STL File",
+        default="custom_drum.stl",
+        description="Name of the exported STL file used for DEM simulation",
+    )
+    stl_scale: FloatProperty(
+        name="Facet Scale",
+        default=1.0,
+        min=1e-5,
+        max=1000.0,
+        description="Scale modifier for STL facets (1.0 for meters, 0.001 for millimeters)",
+    )
+    cap_open_ends: BoolProperty(
+        name="Cap Open Ends",
+        default=True,
+        description="Ensure solid walls on both ends so particles do not fly out of open drum shells during rotation",
+    )
+    mesh_simplify: BoolProperty(
+        name="Simplify Mesh",
+        default=False,
+        description="Simplify overly dense CAD meshes to prevent DEM engine slowdown",
+    )
+    max_facets: IntProperty(
+        name="Max Facets",
+        default=5000,
+        min=100,
+        max=50000,
+        description="Target maximum facet count for CAD drum mesh",
+    )
 
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Sun Mechanism")
@@ -693,9 +723,16 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
                 props_ui = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
                 stl_p = getattr(props_ui, "dem_container_stl_path", "") if props_ui else ""
                 row_stl = col.row(align=True)
-                row_stl.operator("science_blocks.export_container_stl", text="Convert to STL", icon="EXPORT")
+                row_stl.operator("science_blocks.export_container_stl", text="Export custom_drum.stl", icon="EXPORT")
                 if stl_p and os.path.exists(stl_p):
-                    row_stl.label(text="STL Ready", icon="CHECKMARK")
+                    row_stl.label(text="custom_drum.stl Ready", icon="CHECKMARK")
+
+                box_stl = col.box()
+                box_stl.prop(self, "cap_open_ends", text="Cap Open Ends (Solid Walls)", icon="STICKY_UVS_LOC")
+                r_scale = box_stl.row(align=True)
+                r_scale.prop(self, "stl_scale", text="Facet Scale")
+                if getattr(self, "stl_scale", 1.0) == 0.001:
+                    r_scale.label(text="mm -> m")
         col.separator(factor=0.3)
         props = getattr(context.scene, "science_blocks_props", None)
         is_baking = getattr(props, "dem_is_baking", False) if props else False
