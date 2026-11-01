@@ -384,12 +384,16 @@ def draw_scientific_styling_panel(layout, context, props):
     c_obj.separator(factor=0.2)
     box_edge = c_obj.box()
     row_edge = box_edge.row(align=True)
-    row_edge.prop(props, "sci_jar_edge_lines", text="Visible Edge Lines", icon="MOD_WIREFRAME")
+    row_edge.prop(props, "sci_jar_edge_lines", text="Visible Edge Lines (< 180°)", icon="MOD_WIREFRAME")
     if getattr(props, "sci_jar_edge_lines", False):
         col_edge = box_edge.column(align=True)
         r_ecol = col_edge.row(align=True)
         r_ecol.prop(props, "sci_jar_edge_color", text="Line Color")
-        r_ecol.prop(props, "sci_jar_edge_width", text="Width (px)")
+        r_ecol.prop(props, "sci_jar_edge_opacity", text="Opacity", slider=True)
+
+        r_ecol2 = col_edge.row(align=True)
+        r_ecol2.prop(props, "sci_jar_edge_width", text="Width (px)")
+        r_ecol2.prop(props, "sci_jar_edge_threshold", text="Max Angle (°)")
 
         r_qedge = col_edge.row(align=True)
         r_qedge.scale_y = 0.95

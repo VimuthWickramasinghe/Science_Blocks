@@ -69,7 +69,7 @@ fix             grav all gravity 9.81 vector 0.0 0.0 -1.0
 # Sun Wheel RPM = {sun_rpm:.1f}, Jar Counter-Rotation RPM = {jar_rpm:.1f}
 
 # Output Particle Positions and Impact Data
-dump            dmp_particles all custom 500 post/dump*.dem id type x y z vx vy vz radius
+dump            dmp_particles all custom 5000 post/dump*.dem id type x y z vx vy vz radius
 run             {int(frames * 40)}
 """
         with open(script_path, "w", encoding="utf-8") as f:

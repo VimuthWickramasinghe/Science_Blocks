@@ -18,7 +18,7 @@ class ScienceBlocksYadeNode(bpy.types.Node):
     bl_label = "Yade DEM Solver"
     bl_icon = "PHYSICS"
 
-    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=500, description="Total number of particles to simulate")
+    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=5000, description="Total number of particles to simulate")
     sim_frames: IntProperty(name="Frames", default=150, min=10, max=2000, description="Total animation frames to compute and bake")
     ball_radius_mm: FloatProperty(name="Radius (mm)", default=12.0, min=1.0, max=100.0, description="Mean radius of grinding media balls in millimeters")
     backend_mode: EnumProperty(
@@ -240,11 +240,15 @@ class ScienceBlocksYadeNode(bpy.types.Node):
 
         row_tap = col.row(align=True)
         tap_in_scene = False
-        if hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
-            if hasattr(bpy.data.objects, "get"):
-                tap_in_scene = bool(bpy.data.objects.get("Particle_Tap_Inlet"))
-            elif isinstance(bpy.data.objects, dict):
-                tap_in_scene = "Particle_Tap_Inlet" in bpy.data.objects
+        scene_objs = getattr(context.scene, "objects", None) if hasattr(context, "scene") else None
+        if scene_objs:
+            if hasattr(scene_objs, "get"):
+                tap_in_scene = bool(scene_objs.get("Particle_Tap_Inlet"))
+            elif hasattr(scene_objs, "__contains__"):
+                tap_in_scene = "Particle_Tap_Inlet" in scene_objs
+        if not tap_in_scene and hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
+            t_cand = bpy.data.objects.get("Particle_Tap_Inlet")
+            tap_in_scene = bool(t_cand and (not hasattr(t_cand, "users_collection") or getattr(t_cand, "users_collection", ())))
 
         if from_tap:
             row_tap.label(text=f"Particles: {from_tap.name}", icon="SNAP_GRID")

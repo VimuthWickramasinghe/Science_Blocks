@@ -44,7 +44,7 @@ class ScienceBlocksNodeTree(bpy.types.NodeTree):
                     sock = (node.inputs.get("Particles Input") or node.inputs.get("Source Tap / Plane")) if hasattr(node, "inputs") else None
                     if sock and getattr(sock, "is_linked", False):
                         from_node = sock.links[0].from_node if getattr(sock, "links", None) else None
-                        if from_node and getattr(from_node, "bl_idname", "") == "ScienceBlocksObjectNode":
+                        if from_node and getattr(from_node, "bl_idname", "") in ("ScienceBlocksObjectNode", "ScienceBlocksParticleSourceNode"):
                             if getattr(from_node, "object_role", "") == "OBJECT":
                                 from_node.object_role = "PARTICLES"
 
@@ -241,18 +241,53 @@ class ScienceBlocksObjectNode(bpy.types.Node):
             else:
                 col.label(text="Assign Inflow 3D Object", icon="INFO")
 
+    def draw_buttons_ext(self, context, layout):
+        self.draw_buttons(context, layout)
 
-class ScienceBlocksParticleSourceNode(ScienceBlocksObjectNode):
+
+class ScienceBlocksParticleSourceNode(bpy.types.Node):
     """Dedicated 3D Object Input Node for particle inflow emission."""
     bl_idname = "ScienceBlocksParticleSourceNode"
     bl_label = "Particles 3D Input"
     bl_icon = "PARTICLES"
 
+    target_object: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        description="Select particle inflow surface or mesh object from 3D Viewport",
+        update=_on_object_node_target_updated,
+    )
+    object_role: EnumProperty(
+        name="Role",
+        items=[
+            ("PARTICLES", "Particles Input (Source / Tap)", "Inflow surface or planar source object that introduces particles into the jar", "SNAP_GRID", 0),
+        ],
+        default="PARTICLES",
+        update=_on_object_node_role_updated,
+    )
+
+    def get_target_object(self):
+        """Returns the assigned 3D scene object."""
+        return self.target_object
+
     def init(self, context):
-        super().init(context)
-        self.object_role = "PARTICLES"
-        if self.outputs and len(self.outputs) > 0:
-            self.outputs[0].name = "Particles Source"
+        self.outputs.new("ScienceBlocksObjectSocket", "Particles Source")
+
+    def draw_buttons(self, context, layout):
+        col = layout.column(align=True)
+        col.prop(self, "target_object", text="")
+        if self.target_object:
+            row = col.row(align=True)
+            row.label(text=f"Inflow: {self.target_object.name}", icon="SNAP_GRID")
+            props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+            if props:
+                arrow_icon = "HIDE_OFF" if getattr(props, "dem_show_inflow_arrow", True) else "HIDE_ON"
+                row.prop(props, "dem_show_inflow_arrow", text="", icon=arrow_icon)
+        else:
+            col.label(text="Assign Inflow 3D Object", icon="INFO")
+
+    def draw_buttons_ext(self, context, layout):
+        self.draw_buttons(context, layout)
 
 
 # ===========================================================================
@@ -750,7 +785,7 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
     bl_label = "Planetary DEM Solver Block"
     bl_icon = "PHYSICS"
 
-    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=500, description="Total number of particles to simulate")
+    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=5000, description="Total number of particles to simulate")
     sim_frames: IntProperty(name="Frames", default=150, min=10, max=2000, description="Total simulation frames to compute and bake")
     substeps: IntProperty(name="Substeps/Frame", default=40, min=10, max=200)
     contact_model: EnumProperty(
@@ -932,11 +967,15 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
 
         row_tap = col.row(align=True)
         tap_in_scene = False
-        if hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
-            if hasattr(bpy.data.objects, "get"):
-                tap_in_scene = bool(bpy.data.objects.get("Particle_Tap_Inlet"))
-            elif isinstance(bpy.data.objects, dict):
-                tap_in_scene = "Particle_Tap_Inlet" in bpy.data.objects
+        scene_objs = getattr(context.scene, "objects", None) if hasattr(context, "scene") else None
+        if scene_objs:
+            if hasattr(scene_objs, "get"):
+                tap_in_scene = bool(scene_objs.get("Particle_Tap_Inlet"))
+            elif hasattr(scene_objs, "__contains__"):
+                tap_in_scene = "Particle_Tap_Inlet" in scene_objs
+        if not tap_in_scene and hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
+            t_cand = bpy.data.objects.get("Particle_Tap_Inlet")
+            tap_in_scene = bool(t_cand and (not hasattr(t_cand, "users_collection") or getattr(t_cand, "users_collection", ())))
 
         if from_tap:
             row_tap.label(text=f"Particles: {from_tap.name}", icon="SNAP_GRID")
@@ -1018,6 +1057,10 @@ class ScienceBlocksOutputNode(bpy.types.Node):
     bl_label = "Particle Visualizer"
     bl_icon = "RESTRICT_RENDER_OFF"
 
+    _is_syncing: bool = False
+    colormap_mode = "VELOCITY"
+    palette = "TURBO"
+
     display_mode: EnumProperty(
         name="Display",
         items=[
@@ -1026,19 +1069,34 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         ],
         default="SPHERES",
     )
+
     def _on_colormap_update(self, context):
+        if getattr(ScienceBlocksOutputNode, "_is_syncing", False):
+            return
         try:
+            ScienceBlocksOutputNode._is_syncing = True
+            c_mode = getattr(self, "colormap_mode", "VELOCITY")
+            c_pal = getattr(self, "palette", "TURBO")
+            props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+            if props and hasattr(props, "dem_viewport_colormap"):
+                props.dem_viewport_colormap = c_mode
             from . import dem_solver
-            if getattr(dem_solver, "last_dem_result", None) is not None:
-                dem_solver.apply_particle_colormap_postprocess(context, colormap_mode=self.colormap_mode)
+            dem_solver.apply_particle_colormap_postprocess(
+                context,
+                colormap_mode=c_mode,
+                palette=c_pal,
+            )
         except Exception:
             pass
+        finally:
+            ScienceBlocksOutputNode._is_syncing = False
 
     colormap_mode: EnumProperty(
         name="Colormap",
         items=[
             ("VELOCITY", "Velocity Magnitude (Heatmap)", "Rainbow color spectrum from pinned to cataracting"),
-            ("FORCE", "Contact Force / Impact Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
+            ("IMPACT_FORCE", "Dynamic Impact Force (Collisions)", "Visualize forces strictly during sphere-sphere and sphere-wall impacts (0 N during free fall)"),
+            ("FORCE", "Contact Force / Normal Load", "Color particles by instantaneous contact impact force (green/yellow to blazing crimson)"),
             ("ACCELERATION", "Acceleration (m/s², g-force)", "Color particles by instantaneous impact acceleration in m/s² and g-force"),
             ("ENERGY", "Impact Kinetic Energy", "Highlight high shock particles"),
             ("SPIN", "Angular Velocity / Spin Rate", "Color particles by rotational speed (rad/s)"),
@@ -1048,6 +1106,39 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         update=_on_colormap_update,
     )
 
+    def _on_palette_update(self, context):
+        if getattr(ScienceBlocksOutputNode, "_is_syncing", False):
+            return
+        try:
+            ScienceBlocksOutputNode._is_syncing = True
+            c_mode = getattr(self, "colormap_mode", "VELOCITY")
+            c_pal = getattr(self, "palette", "TURBO")
+            props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+            if props and hasattr(props, "sci_media_palette"):
+                props.sci_media_palette = c_pal
+            from . import colormaps
+            colormaps.update_dem_shader_palette(c_pal, shader_mode=c_mode, context=context)
+        except Exception:
+            pass
+        finally:
+            ScienceBlocksOutputNode._is_syncing = False
+
+    palette: EnumProperty(
+        name="Palette",
+        items=[
+            ("TURBO", "Turbo (Perceptual Rainbow)", "Smooth Google AI perceptual spectrum"),
+            ("VIRIDIS", "Viridis (Nature / Science Standard)", "Perceptually uniform, colorblind-safe standard for journal papers"),
+            ("PLASMA", "Plasma (High-Energy Heatmap)", "High-contrast energetic colormap (purple to yellow)"),
+            ("HEAT_FLAME", "Heat Flame (Thermal)", "Black-body thermal radiation spectrum"),
+            ("COOLWARM", "Coolwarm (Diverging)", "Balanced diverging colormap (blue to red)"),
+            ("STEEL", "316L Bearing Steel", "Polished laboratory bearing steel"),
+            ("CERAMIC", "Alumina / Zirconia Ceramic", "White technical ceramic"),
+            ("TUNGSTEN", "Tungsten Carbide", "Dense gunmetal tungsten carbide"),
+        ],
+        default="TURBO",
+        update=_on_palette_update,
+    )
+
     def init(self, context):
         self.inputs.new("ScienceBlocksSimSocket", "Milling Particles")
 
@@ -1055,6 +1146,9 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         col = layout.column(align=True)
         col.prop(self, "display_mode", text="")
         col.prop(self, "colormap_mode", text="")
+        c_mode = getattr(self, "colormap_mode", "VELOCITY")
+        if c_mode != "SOLID":
+            col.prop(self, "palette", text="")
 
         # Dynamic connection feedback
         is_conn = "Milling Particles" in self.inputs and self.inputs["Milling Particles"].is_linked
@@ -1067,7 +1161,9 @@ class ScienceBlocksOutputNode(bpy.types.Node):
         col.separator(factor=0.3)
         row_b = col.row(align=True)
         row_b.scale_y = 1.25
-        row_b.operator("science_blocks.apply_particle_colormap", text="Apply Colormap (Post-Process)", icon="COLOR")
+        op = row_b.operator("science_blocks.apply_particle_colormap", text="Apply Colormap (Post-Process)", icon="COLOR")
+        op.colormap = c_mode
+        op.palette = getattr(self, "palette", "TURBO")
 
         # Particle Analytical Data Strip and Shader Editor integration
         try:
@@ -1224,7 +1320,10 @@ class ScienceBlocksChamberHeatmapNode(bpy.types.Node):
                 from . import dem_solver
             except (ImportError, ValueError):
                 import dem_solver
-            res = getattr(dem_solver, "last_dem_result", None)
+            if hasattr(dem_solver, "get_or_restore_dem_result"):
+                res = dem_solver.get_or_restore_dem_result(context)
+            else:
+                res = getattr(dem_solver, "last_dem_result", None)
             if res and hasattr(res, "wall_impact_locations") and res.wall_impact_locations:
                 box = col.box()
                 b_col = box.column(align=True)

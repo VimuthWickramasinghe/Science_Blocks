@@ -10,11 +10,70 @@ from bpy.props import (
 )
 
 
+def _sync_output_nodes_from_panel(context=None, colormap_mode: str = None, palette: str = None):
+    """Synchronizes Sidebar panel colormap/palette settings into any ScienceBlocksOutputNode instances."""
+    if bpy is None:
+        return
+    try:
+        from .nodes import ScienceBlocksOutputNode
+    except Exception:
+        try:
+            from nodes import ScienceBlocksOutputNode
+        except Exception:
+            return
+
+    if getattr(ScienceBlocksOutputNode, "_is_syncing", False):
+        return
+
+    target_nodes = []
+    if hasattr(bpy.data, "node_groups"):
+        for ng in bpy.data.node_groups:
+            if hasattr(ng, "nodes"):
+                for n in ng.nodes:
+                    if getattr(n, "bl_idname", "") == "ScienceBlocksOutputNode" or isinstance(n, ScienceBlocksOutputNode):
+                        if n not in target_nodes:
+                            target_nodes.append(n)
+
+    if context and hasattr(context, "space_data") and getattr(context.space_data, "node_tree", None):
+        tree = context.space_data.node_tree
+        if hasattr(tree, "nodes"):
+            for n in tree.nodes:
+                if getattr(n, "bl_idname", "") == "ScienceBlocksOutputNode" or isinstance(n, ScienceBlocksOutputNode):
+                    if n not in target_nodes:
+                        target_nodes.append(n)
+
+    props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+    if props and getattr(props, "active_node_tree", None):
+        tree = props.active_node_tree
+        if hasattr(tree, "nodes"):
+            for n in tree.nodes:
+                if getattr(n, "bl_idname", "") == "ScienceBlocksOutputNode" or isinstance(n, ScienceBlocksOutputNode):
+                    if n not in target_nodes:
+                        target_nodes.append(n)
+
+    if not target_nodes:
+        return
+
+    ScienceBlocksOutputNode._is_syncing = True
+    try:
+        for node in target_nodes:
+            if colormap_mode and hasattr(node, "colormap_mode"):
+                node.colormap_mode = colormap_mode
+            if palette and hasattr(node, "palette"):
+                node.palette = palette
+    finally:
+        ScienceBlocksOutputNode._is_syncing = False
+
+
 def update_scientific_styling(self, context):
     """Callback triggered whenever a scientific styling property is adjusted."""
     try:
         from . import operators
         operators.apply_scientific_paper_style(context)
+    except Exception:
+        pass
+    try:
+        _sync_output_nodes_from_panel(context, palette=getattr(self, "sci_media_palette", "VIRIDIS"))
     except Exception:
         pass
 
@@ -45,18 +104,25 @@ def update_jar_finish_preset(self, context):
         self.sci_jar_opacity = 0.28
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.12
-        self.sci_jar_edge_color = (0.10, 0.12, 0.16)
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
         self.sci_jar_edge_width = 1.2
     elif finish == "STAINLESS_STEEL":
         self.sci_jar_color = (0.84, 0.86, 0.88)
         self.sci_jar_opacity = 1.0
         self.sci_jar_metallic = 0.92
         self.sci_jar_roughness = 0.18
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
+        self.sci_jar_edge_width = 1.2
     elif finish == "ALUMINA_CERAMIC":
         self.sci_jar_color = (0.95, 0.95, 0.93)
         self.sci_jar_opacity = 1.0
         self.sci_jar_metallic = 0.0
         self.sci_jar_roughness = 0.22
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
+        self.sci_jar_edge_width = 1.2
     update_scientific_styling(self, context)
 
 
@@ -93,7 +159,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.28
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.12
-        self.sci_jar_edge_color = (0.10, 0.12, 0.16)
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
         self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "STEEL"
         self.sci_sphere_color = (0.85, 0.88, 0.92)
@@ -114,7 +181,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.60
         self.sci_jar_metallic = 0.0
         self.sci_jar_roughness = 0.22
-        self.sci_jar_edge_color = (0.25, 0.28, 0.32)
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
         self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "CERAMIC"
         self.sci_sphere_color = (0.95, 0.95, 0.92)
@@ -135,7 +203,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 1.0
         self.sci_jar_metallic = 0.92
         self.sci_jar_roughness = 0.18
-        self.sci_jar_edge_color = (0.05, 0.05, 0.08)
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
         self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "STEEL"
         self.sci_sphere_color = (0.90, 0.92, 0.95)
@@ -177,7 +246,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.25
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.12
-        self.sci_jar_edge_color = (0.10, 0.12, 0.16)
+        self.sci_jar_edge_color = (0.0, 0.0, 0.0)
+        self.sci_jar_edge_opacity = 1.0
         self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "STEEL"
         self.sci_sphere_color = (0.85, 0.88, 0.92)
@@ -337,7 +407,7 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
     )
     sci_jar_edge_lines: BoolProperty(
         name="Visible Edge Lines",
-        description="Display visible edge lines / technical wireframe outlines on the chamber wall",
+        description="Display visible edge lines (< 180° crease angles) and Freestyle-style silhouette outline on chamber",
         default=False,
         update=update_scientific_styling,
     )
@@ -345,18 +415,34 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         name="Edge Line Color",
         subtype="COLOR",
         size=3,
-        default=(0.10, 0.12, 0.16),
+        default=(0.0, 0.0, 0.0),
         min=0.0,
         max=1.0,
-        description="Color of the chamber edge lines / wireframe outlines",
+        description="Color of the chamber edge lines and outermost silhouette outline (black by default)",
+        update=update_scientific_styling,
+    )
+    sci_jar_edge_opacity: FloatProperty(
+        name="Edge Opacity",
+        description="Opacity / transparency of chamber edge lines and outermost silhouette outline (1.0 = fully opaque black)",
+        default=1.0,
+        min=0.0,
+        max=1.0,
         update=update_scientific_styling,
     )
     sci_jar_edge_width: FloatProperty(
         name="Edge Line Width",
-        description="Thickness of the chamber edge lines in pixels",
+        description="Thickness of the chamber edge lines and silhouette in pixels",
         default=1.2,
         min=0.2,
         max=10.0,
+        update=update_scientific_styling,
+    )
+    sci_jar_edge_threshold: FloatProperty(
+        name="Crease Angle Threshold",
+        description="Only display edges with dihedral angle less than this threshold in degrees (160° hides flat and smooth cylinder facets, showing rims and corners)",
+        default=160.0,
+        min=10.0,
+        max=179.9,
         update=update_scientific_styling,
     )
 
@@ -873,6 +959,15 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         try:
             from . import colormaps
             colormaps.assign_dem_shader_to_particles(context, shader_mode=self.dem_viewport_colormap)
+            colormaps.create_or_update_analytical_color_strip(
+                context,
+                mode=self.dem_viewport_colormap,
+                show=getattr(self, "show_analytical_color_strip", True),
+            )
+        except Exception:
+            pass
+        try:
+            _sync_output_nodes_from_panel(context, colormap_mode=self.dem_viewport_colormap)
         except Exception:
             pass
 
@@ -1025,7 +1120,7 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         description="Number of grinding media balls in the charge",
         default=25,
         min=1,
-        max=500,
+        max=5000,
     )
     dem_ball_radius_mm: FloatProperty(
         name="Mean Radius (mm)",

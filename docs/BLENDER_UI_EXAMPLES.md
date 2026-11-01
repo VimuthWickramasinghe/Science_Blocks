@@ -423,7 +423,7 @@ from bpy.props import StringProperty, IntProperty, FloatProperty, BoolProperty, 
 class DemoPanelProperties(bpy.types.PropertyGroup):
     demo_text: StringProperty(name="Experiment Name", default="Planetary Mill 01")
     demo_slider: FloatProperty(name="Intensity", default=0.75, min=0.0, max=1.0)
-    demo_count: IntProperty(name="Ball Count", default=25, min=1, max=500)
+    demo_count: IntProperty(name="Ball Count", default=25, min=1, max=5000)
     demo_toggle: BoolProperty(name="Live Preview", default=False)
     demo_color: bpy.props.FloatVectorProperty(
         name="Particle Color",

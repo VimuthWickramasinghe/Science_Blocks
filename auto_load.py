@@ -106,6 +106,9 @@ def get_register_deps_dict(modules):
 def iter_my_register_deps(cls, my_classes, my_classes_by_idname):
     yield from iter_my_deps_from_annotations(cls, my_classes)
     yield from iter_my_deps_from_parent_id(cls, my_classes_by_idname)
+    for base in getattr(cls, "__bases__", ()):
+        if base in my_classes:
+            yield base
 
 
 def iter_my_deps_from_annotations(cls, my_classes):

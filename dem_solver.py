@@ -20,6 +20,7 @@ Professional Scientific Features:
 """
 
 import math
+import json
 from typing import Any, Optional, Dict, Tuple, List
 import numpy as np
 
@@ -41,6 +42,7 @@ try:
         get_dem_shader_for_mode,
         assign_dem_shader_to_particles,
         create_or_update_analytical_color_strip,
+        update_dem_shader_palette,
     )
 except ImportError:
     try:
@@ -51,6 +53,7 @@ except ImportError:
             get_dem_shader_for_mode,
             assign_dem_shader_to_particles,
             create_or_update_analytical_color_strip,
+            update_dem_shader_palette,
         )
     except ImportError:
         evaluate_scientific_colormap = None
@@ -59,6 +62,7 @@ except ImportError:
         get_dem_shader_for_mode = None
         assign_dem_shader_to_particles = None
         create_or_update_analytical_color_strip = None
+        update_dem_shader_palette = None
 
 
 class PlanetaryDEMResult:
@@ -142,6 +146,364 @@ class PlanetaryDEMResult:
 
 # Module-level cache for last DEM simulation result
 last_dem_result = None
+
+DEM_CACHE_TEXT_DATABLOCK = "SB_DEM_Wall_Impacts.json"
+
+
+def serialize_dem_result_summary(res: PlanetaryDEMResult) -> dict:
+    """Serializes essential DEM collision telemetry and planetary analytics to a compact JSON dictionary."""
+    if res is None:
+        return {}
+
+    def _round_seq(seq, decimals=4):
+        if not seq:
+            return []
+        return [round(float(v), decimals) for v in seq]
+
+    def _round_pts(pts, decimals=5):
+        if not pts:
+            return []
+        return [[round(float(c), decimals) for c in pt] for pt in pts]
+
+    return {
+        "format_version": "1.0",
+        "frames": int(getattr(res, "frames", 1)),
+        "ball_count": int(getattr(res, "ball_count", 0)),
+        "fps": float(getattr(res, "fps", 30.0)),
+        "total_impacts": int(getattr(res, "total_impacts", 0)),
+        "wall_impacts": int(getattr(res, "wall_impacts", 0)),
+        "ball_impacts": int(getattr(res, "ball_impacts", 0)),
+        "mean_impact_energy_j": float(getattr(res, "mean_impact_energy_j", 0.0)),
+        "max_impact_energy_j": float(getattr(res, "max_impact_energy_j", 0.0)),
+        "total_energy_j": float(getattr(res, "total_energy_j", 0.0)),
+        "collision_frequency_hz": float(getattr(res, "collision_frequency_hz", 0.0)),
+        "estimated_power_watts": float(getattr(res, "estimated_power_watts", 0.0)),
+        "critical_speed_rpm": float(getattr(res, "critical_speed_rpm", 0.0)),
+        "critical_speed_ratio": float(getattr(res, "critical_speed_ratio", 0.0)),
+        "froude_number": float(getattr(res, "froude_number", 0.0)),
+        "filling_ratio_pct": float(getattr(res, "filling_ratio_pct", 0.0)),
+        "milling_regime": str(getattr(res, "milling_regime", "Cascading")),
+        "sun_rpm": float(getattr(res, "sun_rpm", 200.0)),
+        "jar_rpm": float(getattr(res, "jar_rpm", -300.0)),
+        "r_sun": float(getattr(res, "r_sun", 1.3)),
+        "r_jar": float(getattr(res, "r_jar", 0.42)),
+        "h_jar": float(getattr(res, "h_jar", 0.42)),
+        "ball_radius_m": float(getattr(res, "ball_radius_m", 0.01)),
+        "ball_density": float(getattr(res, "ball_density", 7850.0)),
+        "mill_orientation": str(getattr(res, "mill_orientation", "HORIZONTAL")),
+        "wall_impact_locations": _round_pts(getattr(res, "wall_impact_locations", []), 5),
+        "wall_impact_normals": _round_pts(getattr(res, "wall_impact_normals", []), 4),
+        "wall_impact_forces": _round_seq(getattr(res, "wall_impact_forces", []), 2),
+        "wall_impact_impulses": _round_seq(getattr(res, "wall_impact_impulses", []), 5),
+        "wall_impact_energies": _round_seq(getattr(res, "wall_impact_energies", []), 6),
+        "wall_impact_times": _round_seq(getattr(res, "wall_impact_times", []), 4),
+        "wall_impact_ball_indices": [int(i) for i in getattr(res, "wall_impact_ball_indices", [])],
+    }
+
+
+def deserialize_dem_result_summary(data: dict) -> PlanetaryDEMResult:
+    """Reconstructs a PlanetaryDEMResult instance from serialized JSON telemetry."""
+    frames = int(data.get("frames", 1))
+    ball_count = int(data.get("ball_count", 1))
+    res = PlanetaryDEMResult(frames=frames, ball_count=ball_count)
+
+    res.fps = float(data.get("fps", 30.0))
+    res.total_impacts = int(data.get("total_impacts", 0))
+    res.wall_impacts = int(data.get("wall_impacts", 0))
+    res.ball_impacts = int(data.get("ball_impacts", 0))
+    res.mean_impact_energy_j = float(data.get("mean_impact_energy_j", 0.0))
+    res.max_impact_energy_j = float(data.get("max_impact_energy_j", 0.0))
+    res.total_energy_j = float(data.get("total_energy_j", 0.0))
+    res.collision_frequency_hz = float(data.get("collision_frequency_hz", 0.0))
+    res.estimated_power_watts = float(data.get("estimated_power_watts", 0.0))
+
+    res.critical_speed_rpm = float(data.get("critical_speed_rpm", 0.0))
+    res.critical_speed_ratio = float(data.get("critical_speed_ratio", 0.0))
+    res.froude_number = float(data.get("froude_number", 0.0))
+    res.filling_ratio_pct = float(data.get("filling_ratio_pct", 0.0))
+    res.milling_regime = str(data.get("milling_regime", "Cascading"))
+
+    res.sun_rpm = float(data.get("sun_rpm", 200.0))
+    res.jar_rpm = float(data.get("jar_rpm", -300.0))
+    res.r_sun = float(data.get("r_sun", 1.3))
+    res.r_jar = float(data.get("r_jar", 0.42))
+    res.h_jar = float(data.get("h_jar", 0.42))
+    res.ball_radius_m = float(data.get("ball_radius_m", 0.01))
+    res.ball_density = float(data.get("ball_density", 7850.0))
+    res.mill_orientation = str(data.get("mill_orientation", "HORIZONTAL"))
+
+    res.wall_impact_locations = [tuple(p) for p in data.get("wall_impact_locations", [])]
+    res.wall_impact_normals = [tuple(n) for n in data.get("wall_impact_normals", [])]
+    res.wall_impact_forces = [float(f) for f in data.get("wall_impact_forces", [])]
+    res.wall_impact_impulses = [float(j) for j in data.get("wall_impact_impulses", [])]
+    res.wall_impact_energies = [float(e) for e in data.get("wall_impact_energies", [])]
+    res.wall_impact_times = [float(t) for t in data.get("wall_impact_times", [])]
+    res.wall_impact_ball_indices = [int(i) for i in data.get("wall_impact_ball_indices", [])]
+
+    return res
+
+
+def save_dem_cache_to_blend(result: Optional[PlanetaryDEMResult] = None, context=None) -> bool:
+    """Persists DEM collision telemetry into a dedicated .blend Text datablock."""
+    global last_dem_result
+    res = result or last_dem_result
+    if res is None or bpy is None:
+        return False
+
+    try:
+        data = serialize_dem_result_summary(res)
+        json_str = json.dumps(data)
+
+        text_block = bpy.data.texts.get(DEM_CACHE_TEXT_DATABLOCK)
+        if not text_block:
+            text_block = bpy.data.texts.new(DEM_CACHE_TEXT_DATABLOCK)
+
+        if hasattr(text_block, "clear"):
+            text_block.clear()
+        if hasattr(text_block, "write"):
+            text_block.write(json_str)
+        elif hasattr(text_block, "from_string"):
+            text_block.from_string(json_str)
+        else:
+            text_block.lines = [json_str]
+
+        if hasattr(text_block, "use_fake_user"):
+            text_block.use_fake_user = True
+
+        return True
+    except Exception:
+        return False
+
+
+def load_dem_cache_from_blend() -> Optional[PlanetaryDEMResult]:
+    """Loads and deserializes DEM collision telemetry from the .blend Text datablock if present."""
+    if bpy is None:
+        return None
+
+    try:
+        text_block = bpy.data.texts.get(DEM_CACHE_TEXT_DATABLOCK)
+        if not text_block:
+            return None
+
+        content = ""
+        if hasattr(text_block, "as_string"):
+            content = text_block.as_string()
+        elif hasattr(text_block, "lines"):
+            content = "\n".join(getattr(l, "body", str(l)) for l in text_block.lines)
+
+        if not content or not content.strip():
+            return None
+
+        data = json.loads(content)
+        if not isinstance(data, dict) or "wall_impact_locations" not in data:
+            return None
+
+        res = deserialize_dem_result_summary(data)
+        global last_dem_result
+        last_dem_result = res
+        return res
+    except Exception:
+        return None
+
+
+def reconstruct_dem_result_from_scene(context=None) -> Optional[PlanetaryDEMResult]:
+    """Self-healing: Reconstructs wall impact contacts and telemetry directly from baked particle fcurves
+    in the active scene if opening an older .blend file that lacks the persistent text datablock."""
+    if bpy is None:
+        return None
+
+    scene = getattr(context, "scene", None) if context else None
+    if not scene and hasattr(bpy, "context") and hasattr(bpy.context, "scene"):
+        scene = bpy.context.scene
+
+    # Locate milling media ball objects
+    coll = bpy.data.collections.get("Science_Blocks_Milling_Media")
+    balls = []
+    if coll and hasattr(coll, "objects"):
+        balls = [o for o in coll.objects if o.name.startswith("DEM_Media_") and not o.name.startswith("Reference_")]
+    if not balls:
+        balls = [o for o in bpy.data.objects if o.name.startswith("DEM_Media_") and not o.name.startswith("Reference_")]
+
+    if not balls:
+        return None
+
+    balls.sort(key=lambda o: o.name)
+    ball_count = len(balls)
+
+    props = getattr(scene, "science_blocks_props", None) if scene else None
+    jar_obj = getattr(props, "jar_chamber_obj", None) if props else None
+    if not jar_obj:
+        jar_obj = bpy.data.objects.get("Jar_Chamber")
+
+    r_jar = 0.042
+    h_jar = 0.042
+    ball_radius_m = 0.010
+    frames = 60
+    fps = 30.0
+
+    if scene:
+        if hasattr(scene, "frame_end") and hasattr(scene, "frame_start"):
+            frames = max(1, scene.frame_end - scene.frame_start + 1)
+        if hasattr(scene, "render") and hasattr(scene.render, "fps"):
+            fps = float(scene.render.fps)
+
+    if props:
+        r_jar = getattr(props, "dem_jar_radius_mm", 42.0) * 0.001
+        h_jar = getattr(props, "dem_jar_height_mm", 42.0) * 0.001
+        ball_radius_m = getattr(props, "dem_ball_radius_mm", 10.0) * 0.001
+        frames = getattr(props, "dem_sim_frames", frames)
+
+    center_offset = (0.0, 0.0, 0.0)
+    parent_scale = (1.0, 1.0, 1.0)
+    if jar_obj:
+        if hasattr(jar_obj, "bound_box") and jar_obj.bound_box:
+            try:
+                bb = jar_obj.bound_box
+                cx = (min(v[0] for v in bb) + max(v[0] for v in bb)) / 2.0
+                cy = (min(v[1] for v in bb) + max(v[1] for v in bb)) / 2.0
+                cz = (min(v[2] for v in bb) + max(v[2] for v in bb)) / 2.0
+                center_offset = (cx, cy, cz)
+            except Exception:
+                pass
+        sx = getattr(jar_obj.scale, "x", jar_obj.scale[0] if hasattr(jar_obj.scale, "__getitem__") else 1.0)
+        sy = getattr(jar_obj.scale, "y", jar_obj.scale[1] if hasattr(jar_obj.scale, "__getitem__") else 1.0)
+        sz = getattr(jar_obj.scale, "z", jar_obj.scale[2] if hasattr(jar_obj.scale, "__getitem__") else 1.0)
+        parent_scale = (
+            max(1e-4, abs(float(sx))),
+            max(1e-4, abs(float(sy))),
+            max(1e-4, abs(float(sz))),
+        )
+
+    res = PlanetaryDEMResult(frames=frames, ball_count=ball_count)
+    res.fps = fps
+    res.r_jar = r_jar
+    res.h_jar = h_jar
+    res.ball_radius_m = ball_radius_m
+
+    dt = 1.0 / max(1.0, fps)
+    max_f_ref = getattr(props, "dem_max_impact_energy_j", 0.05) / max(1e-4, dt) if props else 50.0
+    max_f_ref = max(20.0, float(max_f_ref))
+
+    def _find_fc(action, path, idx):
+        if not action or not hasattr(action, "fcurves"):
+            return None
+        if hasattr(action.fcurves, "find"):
+            try:
+                fc = action.fcurves.find(path, index=idx)
+                if fc is not None:
+                    return fc
+            except Exception:
+                pass
+        for fc in action.fcurves:
+            if getattr(fc, "data_path", "") == path and getattr(fc, "array_index", 0) == idx:
+                return fc
+        return None
+
+    # Scan ball positions across all animation frames
+    for b_idx, ball in enumerate(balls):
+        act = ball.animation_data.action if (hasattr(ball, "animation_data") and ball.animation_data) else None
+        fc_x = _find_fc(act, "location", 0)
+        fc_y = _find_fc(act, "location", 1)
+        fc_z = _find_fc(act, "location", 2)
+        fc_f = _find_fc(act, "color", 1)
+        fc_v = _find_fc(act, "color", 0)
+
+        if hasattr(ball, "scale") and ball.scale is not None:
+            if hasattr(ball.scale, "x"):
+                r_ball = float(ball.scale.x) * parent_scale[0]
+            elif hasattr(ball.scale, "__getitem__"):
+                r_ball = float(ball.scale[0]) * parent_scale[0]
+            else:
+                r_ball = float(ball.scale) * parent_scale[0]
+        else:
+            r_ball = ball_radius_m
+
+        for f in range(1, frames + 1):
+            if fc_x and fc_y and fc_z:
+                raw_x = fc_x.evaluate(f)
+                raw_y = fc_y.evaluate(f)
+                raw_z = fc_z.evaluate(f)
+            else:
+                b_loc = getattr(ball, "location", (0.0, 0.0, 0.0))
+                if hasattr(b_loc, "x"):
+                    raw_x, raw_y, raw_z = float(b_loc.x), float(b_loc.y), float(b_loc.z)
+                elif hasattr(b_loc, "__getitem__") and len(b_loc) >= 3:
+                    raw_x, raw_y, raw_z = float(b_loc[0]), float(b_loc[1]), float(b_loc[2])
+                else:
+                    raw_x, raw_y, raw_z = 0.0, 0.0, 0.0
+
+            lx = (raw_x - center_offset[0]) * parent_scale[0]
+            ly = (raw_y - center_offset[1]) * parent_scale[1]
+            lz = (raw_z - center_offset[2]) * parent_scale[2]
+
+            r_xy = math.sqrt(lx * lx + ly * ly)
+            is_cyl_wall = (r_xy + r_ball >= r_jar * 0.95)
+            is_cap = (abs(lz) + r_ball >= h_jar * 0.95)
+
+            if is_cyl_wall or is_cap:
+                f_norm = max(0.0, float(fc_f.evaluate(f))) if fc_f else 0.5
+                v_norm = max(0.0, float(fc_v.evaluate(f))) if fc_v else 0.5
+                fn_val = max(1.0, f_norm * max_f_ref)
+                jn_val = fn_val * dt
+                e_imp = 0.5 * 0.03 * (v_norm * 4.0) ** 2
+                t_sec = (f - 1) * dt
+
+                if is_cyl_wall:
+                    scale_c = r_jar / max(1e-6, r_xy)
+                    loc = (lx * scale_c, ly * scale_c, lz)
+                    normal = (-lx / max(1e-6, r_xy), -ly / max(1e-6, r_xy), 0.0)
+                else:
+                    sign_z = 1.0 if lz >= 0 else -1.0
+                    loc = (lx, ly, sign_z * h_jar)
+                    normal = (0.0, 0.0, -sign_z)
+
+                res.wall_impact_locations.append(loc)
+                res.wall_impact_normals.append(normal)
+                res.wall_impact_forces.append(fn_val)
+                res.wall_impact_impulses.append(jn_val)
+                res.wall_impact_energies.append(e_imp)
+                res.wall_impact_times.append(t_sec)
+                res.wall_impact_ball_indices.append(b_idx)
+
+    n_hits = len(res.wall_impact_locations)
+    res.wall_impacts = n_hits
+    res.total_impacts = getattr(props, "dem_total_impacts", n_hits) if props else n_hits
+    res.collision_frequency_hz = getattr(props, "dem_collision_freq_hz", n_hits / max(0.01, frames * dt)) if props else n_hits / max(0.01, frames * dt)
+    res.mean_impact_energy_j = getattr(props, "dem_mean_impact_energy_j", float(np.mean(res.wall_impact_energies)) if res.wall_impact_energies else 0.001) if props else 0.001
+    res.max_impact_energy_j = getattr(props, "dem_max_impact_energy_j", float(np.max(res.wall_impact_energies)) if res.wall_impact_energies else 0.005) if props else 0.005
+    res.estimated_power_watts = getattr(props, "dem_power_watts", 15.0) if props else 15.0
+
+    res.froude_number = getattr(props, "analytics_froude_number", 0.0) if props else 0.0
+    res.critical_speed_ratio = getattr(props, "analytics_critical_speed_ratio", 0.0) if props else 0.0
+    res.milling_regime = getattr(props, "analytics_milling_regime", "Cascading") if props else "Cascading"
+    res.filling_ratio_pct = getattr(props, "analytics_filling_ratio_pct", 0.0) if props else 0.0
+
+    save_dem_cache_to_blend(res, context)
+
+    global last_dem_result
+    last_dem_result = res
+    return res
+
+
+def get_or_restore_dem_result(context=None) -> Optional[PlanetaryDEMResult]:
+    """Returns active DEM result, restoring from .blend Text cache or scene particles if RAM was reset on reopen."""
+    global last_dem_result
+    if last_dem_result is not None and getattr(last_dem_result, "wall_impact_locations", None):
+        return last_dem_result
+
+    # 1. Attempt loading from persistent .blend Text datablock
+    res = load_dem_cache_from_blend()
+    if res is not None and getattr(res, "wall_impact_locations", None):
+        last_dem_result = res
+        return res
+
+    # 2. Attempt self-healing reconstruction from baked scene particles
+    res = reconstruct_dem_result_from_scene(context)
+    if res is not None and getattr(res, "wall_impact_locations", None):
+        last_dem_result = res
+        return res
+
+    return last_dem_result
 
 
 def generate_charge_radii(
@@ -1703,10 +2065,13 @@ def instantiate_dem_particles_in_blender(
                 center_offset = (cx, cy, cz)
             except Exception:
                 center_offset = (0.0, 0.0, 0.0)
+        sx = getattr(jar_obj.scale, "x", jar_obj.scale[0] if hasattr(jar_obj.scale, "__getitem__") else 1.0)
+        sy = getattr(jar_obj.scale, "y", jar_obj.scale[1] if hasattr(jar_obj.scale, "__getitem__") else 1.0)
+        sz = getattr(jar_obj.scale, "z", jar_obj.scale[2] if hasattr(jar_obj.scale, "__getitem__") else 1.0)
         parent_scale = (
-            max(1e-4, abs(jar_obj.scale.x)),
-            max(1e-4, abs(jar_obj.scale.y)),
-            max(1e-4, abs(jar_obj.scale.z)),
+            max(1e-4, abs(float(sx))),
+            max(1e-4, abs(float(sy))),
+            max(1e-4, abs(float(sz))),
         )
 
     # Create individual particles parented to rotating jar
@@ -1870,20 +2235,117 @@ def instantiate_dem_particles_in_blender(
     except Exception:
         pass
 
+    # Persist DEM collision telemetry directly inside the .blend file text datablock
+    try:
+        save_dem_cache_to_blend(result, context)
+    except Exception:
+        pass
+
+
+def _restore_physics_color_encoding_if_corrupted(context, ball_objects, result):
+    """Restores multi-variable physical channel keyframes (Red=Vel, Green=Force, Blue=Energy, Alpha=Spin)
+    if they were previously overwritten by static RGB recoloring.
+    """
+    if not ball_objects or result is None or not hasattr(result, "trajectories") or result.trajectories is None or not np.any(result.trajectories):
+        return
+
+    first_ball = ball_objects[0]
+    is_corrupted = False
+    if hasattr(first_ball, "animation_data") and first_ball.animation_data and first_ball.animation_data.action:
+        act = first_ball.animation_data.action
+        color_fcs = [fc for fc in act.fcurves if fc.data_path == "color"]
+        if len(color_fcs) < 4:
+            is_corrupted = True
+        else:
+            w_arr = getattr(result, "angular_velocities", None)
+            if w_arr is not None and np.max(np.abs(w_arr)) > 0.05:
+                pts = color_fcs[3].keyframe_points if len(color_fcs) > 3 else []
+                if pts and all(abs(p.co[1] - 1.0) < 1e-4 for p in pts[:min(5, len(pts))]):
+                    is_corrupted = True
+
+    if not is_corrupted:
+        return
+
+    # Clear corrupted color fcurves on balls before rebuilding
+    for ball in ball_objects:
+        if hasattr(ball, "animation_data") and ball.animation_data and ball.animation_data.action:
+            act = ball.animation_data.action
+            if hasattr(act, "fcurves"):
+                if hasattr(act.fcurves, "remove"):
+                    color_fcs = [fc for fc in act.fcurves if getattr(fc, "data_path", "") == "color"]
+                    for fc in color_fcs:
+                        try:
+                            act.fcurves.remove(fc)
+                        except Exception:
+                            pass
+                else:
+                    act.fcurves = [fc for fc in act.fcurves if getattr(fc, "data_path", "") != "color"]
+
+    frames, num_balls, _ = result.trajectories.shape
+    v_arr = result.velocities if hasattr(result, "velocities") and result.velocities is not None else None
+    max_v = float(np.max(np.linalg.norm(v_arr, axis=2))) if (v_arr is not None and v_arr.size and np.max(np.linalg.norm(v_arr, axis=2)) > 1e-4) else 5.0
+    f_arr = result.impact_forces if (hasattr(result, "impact_forces") and result.impact_forces is not None and result.impact_forces.size) else getattr(result, "forces", None)
+    max_f = float(np.max(f_arr)) if (f_arr is not None and f_arr.size and np.max(f_arr) > 1e-4) else 100.0
+    max_e = 0.5 * 0.05 * (max_v**2)
+    w_arr = result.angular_velocities if hasattr(result, "angular_velocities") and result.angular_velocities is not None else None
+    max_w = float(np.max(np.linalg.norm(w_arr, axis=2))) if (w_arr is not None and w_arr.size and np.max(np.linalg.norm(w_arr, axis=2)) > 1e-4) else 10.0
+
+    orig_f = context.scene.frame_current if (context and hasattr(context, "scene")) else 1
+    for f in range(frames):
+        f_num = f + 1
+        for i, ball in enumerate(ball_objects):
+            if i >= num_balls:
+                break
+            vel_vec = v_arr[f, i, :] if v_arr is not None else [0, 0, 0]
+            v_mag = float(np.linalg.norm(vel_vec))
+            v_norm = min(1.0, max(0.0, v_mag / max(1e-4, max_v)))
+            f_val = float(f_arr[f, i]) if f_arr is not None else 0.0
+            f_norm = min(1.0, max(0.0, f_val / max(1.0, max_f)))
+            e_kin = 0.5 * (result.ball_masses[i] if hasattr(result, "ball_masses") and i < len(result.ball_masses) else 0.01) * (v_mag**2)
+            e_norm = min(1.0, max(0.0, e_kin / max(1e-6, max_e)))
+            w_vec = w_arr[f, i, :] if w_arr is not None else [0, 0, 0]
+            w_mag = float(np.linalg.norm(w_vec))
+            w_norm = min(1.0, max(0.0, w_mag / max(1e-4, max_w)))
+
+            ball.color = (v_norm, f_norm, e_norm, w_norm)
+            ball.keyframe_insert(data_path="color", frame=f_num)
+
+    if context and hasattr(context, "scene"):
+        context.scene.frame_set(orig_f)
+
 
 def apply_particle_colormap_postprocess(
     context,
     colormap_mode: str = "VELOCITY",
     result: PlanetaryDEMResult = None,
+    palette: str = None,
 ) -> int:
-    """Applies dynamic colormapping (Velocity, Force, Energy, Spin, Solid) as a fast post-processing pass."""
+    """Applies dynamic colormapping (Velocity, Impact, Force, Energy, Spin, Solid) as a fast post-processing pass."""
     global last_dem_result
-    res = result or last_dem_result
+    res = result or get_or_restore_dem_result(context)
 
     if bpy is None or context is None:
         return 0
 
     mode_clean = (colormap_mode or "VELOCITY").upper()
+
+    props = getattr(context.scene, "science_blocks_props", None) if context else None
+    if props and hasattr(props, "dem_viewport_colormap"):
+        try:
+            props.dem_viewport_colormap = mode_clean
+        except Exception:
+            pass
+
+    # If palette is supplied, update the shader ColorRamp palette
+    if palette:
+        try:
+            if update_dem_shader_palette:
+                update_dem_shader_palette(palette, shader_mode=mode_clean, context=context)
+            else:
+                from . import colormaps
+                colormaps.update_dem_shader_palette(palette, shader_mode=mode_clean, context=context)
+        except Exception:
+            pass
 
     # 1. Update shader materials on all particle meshes
     if assign_dem_shader_to_particles:
@@ -1891,7 +2353,6 @@ def apply_particle_colormap_postprocess(
 
     # 2. Update 3D Analytical Color & Data Strip
     if create_or_update_analytical_color_strip:
-        props = getattr(context.scene, "science_blocks_props", None) if context else None
         show_s = getattr(props, "show_analytical_color_strip", True) if props else True
         create_or_update_analytical_color_strip(context, result=res, mode=mode_clean, show=show_s)
 
@@ -1905,5 +2366,12 @@ def apply_particle_colormap_postprocess(
     ]
     if not ball_objects:
         return 0
+
+    # 3. Check and restore physics channels on ball.color if corrupted by legacy recoloring
+    if res is not None:
+        try:
+            _restore_physics_color_encoding_if_corrupted(context, ball_objects, res)
+        except Exception:
+            pass
 
     return len(ball_objects)

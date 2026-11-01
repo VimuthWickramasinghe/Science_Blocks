@@ -9,7 +9,7 @@ class ScienceBlocksLiggghtsNode(bpy.types.Node):
     bl_label = "LIGGGHTS DEM Solver"
     bl_icon = "PHYSICS"
 
-    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=500)
+    ball_count: IntProperty(name="Balls Count", default=25, min=1, max=5000)
     substeps: IntProperty(name="Substeps/Frame", default=40, min=10, max=200)
     contact_model: EnumProperty(
         name="Contact Model",

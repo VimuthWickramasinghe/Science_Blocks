@@ -778,6 +778,67 @@ def assign_dem_shader_to_particles(context, shader_mode: str = "VELOCITY") -> in
     return count
 
 
+def update_dem_shader_palette(palette: str, shader_mode: str = None, context=None) -> bool:
+    """Updates the ColorRamp stops in DEM shader materials to match the chosen palette.
+
+    Parameters:
+        palette: Name of the scientific colormap palette (e.g. VIRIDIS, PLASMA, TURBO, HEAT_FLAME, COOLWARM)
+        shader_mode: If given, updates that specific shader (e.g. VELOCITY, IMPACT_FORCE, FORCE, ACCELERATION, ENERGY, SPIN).
+                     If None, updates all variable shaders in DEM_SHADER_NAMES.
+        context: Blender context for updating props and the 3D analytical color strip.
+    """
+    if bpy is None:
+        return False
+
+    pal = (palette or "VIRIDIS").upper()
+    stops = get_palette_stops(pal, num_stops=5)
+
+    # Determine which shader materials to update
+    targets = []
+    if shader_mode:
+        mode_clean = shader_mode.upper()
+        mat = get_dem_shader_for_mode(mode_clean)
+        if mat:
+            targets.append(mat)
+    else:
+        for m_key in ("VELOCITY", "IMPACT_FORCE", "FORCE", "ACCELERATION", "ENERGY", "SPIN"):
+            mat = get_dem_shader_for_mode(m_key)
+            if mat and mat not in targets:
+                targets.append(mat)
+
+    # Also include the strip ribbon material if it exists
+    strip_mat = bpy.data.materials.get("DEM_Analytical_Strip_Material")
+    if strip_mat and strip_mat not in targets:
+        targets.append(strip_mat)
+
+    updated = False
+    for mat in targets:
+        if mat and mat.use_nodes and mat.node_tree:
+            for n in mat.node_tree.nodes:
+                if n.type == "VALTORGB" or (hasattr(n, "color_ramp") and n.color_ramp is not None):
+                    configure_color_ramp(n, stops)
+                    updated = True
+
+    # Synchronize scene props if context is available
+    if context and hasattr(context, "scene"):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props and hasattr(props, "sci_media_palette"):
+            try:
+                props.sci_media_palette = pal
+            except Exception:
+                pass
+
+        # Update analytical color strip
+        try:
+            active_m = shader_mode or (props.dem_viewport_colormap if props else "VELOCITY")
+            show_s = props.show_analytical_color_strip if props else True
+            create_or_update_analytical_color_strip(context, mode=active_m, show=show_s)
+        except Exception:
+            pass
+
+    return updated
+
+
 def extract_simulation_telemetry(result=None) -> dict:
     """Extracts or computes all scientific physical metrics with standard SI units.
 
@@ -1644,6 +1705,7 @@ def draw_analytical_data_strip_ui(layout, context, active_mode: str = "VELOCITY"
     r_btns = box.row(align=True)
     for m_key, m_lbl, m_ico in [
         ("VELOCITY", "Velocity", "RESTRICT_VIEW_OFF"),
+        ("IMPACT_FORCE", "Impact", "COLOR"),
         ("FORCE", "Force", "COLOR"),
         ("ACCELERATION", "Accel", "CON_LOCLIKE"),
         ("SPIN", "Rot. Vel", "FILE_REFRESH"),

@@ -100,7 +100,7 @@ def get_blender_python_executable() -> str:
 
 @persistent
 def on_blend_save_or_load(dummy):
-    """Automatically synchronizes config_save_dir whenever a .blend file is saved or loaded."""
+    """Automatically synchronizes config_save_dir and restores/persists DEM telemetry cache whenever a .blend file is saved or loaded."""
     blend_dir = get_blend_file_directory()
     if blend_dir:
         try:
@@ -108,6 +108,27 @@ def on_blend_save_or_load(dummy):
                 props = getattr(scene, "science_blocks_props", None)
                 if props:
                     props.config_save_dir = blend_dir
+        except Exception:
+            pass
+
+    try:
+        from . import dem_solver
+    except (ImportError, ValueError):
+        try:
+            import dem_solver
+        except Exception:
+            dem_solver = None
+
+    if dem_solver:
+        try:
+            # On save: if in-memory result exists, ensure it is serialized to .blend
+            if getattr(dem_solver, "last_dem_result", None) is not None:
+                if hasattr(dem_solver, "save_dem_cache_to_blend"):
+                    dem_solver.save_dem_cache_to_blend(dem_solver.last_dem_result)
+            # On load: restore result into memory from .blend datablock or scene
+            else:
+                if hasattr(dem_solver, "get_or_restore_dem_result"):
+                    dem_solver.get_or_restore_dem_result()
         except Exception:
             pass
 
@@ -2718,9 +2739,19 @@ def resolve_source_plane_object(context, props=None, solver_node=None, jar_obj=N
                         break
 
     # Priority 4: Object named 'Particle_Tap_Inlet' or 'Source_Tap' in scene
-    if not source_obj and hasattr(bpy, "data"):
+    if not source_obj:
+        scene_objs = getattr(context.scene, "objects", None) if hasattr(context, "scene") else None
         for name in ("Particle_Tap_Inlet", "Source_Tap", "Particle_Inlet", "Tap_Plane", "Source_Plane", "Inflow_Plane", "Inlet_Plane"):
-            candidate = bpy.data.objects.get(name)
+            candidate = None
+            if scene_objs:
+                if hasattr(scene_objs, "get"):
+                    candidate = scene_objs.get(name)
+                elif hasattr(scene_objs, "__contains__") and name in scene_objs:
+                    candidate = bpy.data.objects.get(name) if hasattr(bpy, "data") and hasattr(bpy.data, "objects") else None
+            if not candidate and hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
+                c_data = bpy.data.objects.get(name)
+                if c_data and (not hasattr(c_data, "users_collection") or getattr(c_data, "users_collection", ())):
+                    candidate = c_data
             if candidate:
                 source_obj = candidate
                 break
@@ -3009,6 +3040,15 @@ def create_or_update_inflow_direction_arrow(
     arrow_name = "Particle_Inflow_Direction_Arrow"
     arrow = bpy.data.objects.get(arrow_name) if hasattr(bpy, "data") and hasattr(bpy.data, "objects") else None
 
+    # Clean up truly orphaned datablocks (0 users in Blender) or objects with broken mesh
+    if arrow and ((hasattr(arrow, "users") and arrow.users == 0 and hasattr(arrow, "users_collection") and not arrow.users_collection) or (hasattr(arrow, "data") and not hasattr(arrow.data, "vertices"))):
+        if hasattr(bpy, "data") and hasattr(bpy.data, "objects") and hasattr(bpy.data.objects, "remove"):
+            try:
+                bpy.data.objects.remove(arrow, do_unlink=True)
+            except Exception:
+                pass
+        arrow = None
+
     # If hidden or no source plane exists, hide existing arrow and return
     if (not show) or (source_plane_obj is None):
         if arrow:
@@ -3023,18 +3063,23 @@ def create_or_update_inflow_direction_arrow(
     mesh = get_or_create_inflow_arrow_mesh()
     mat = get_or_create_inflow_arrow_material()
 
-    if not arrow:
-        arrow = bpy.data.objects.new(arrow_name, mesh)
-        coll_name = "Science_Blocks_DEM"
-        coll = bpy.data.collections.get(coll_name) if hasattr(bpy, "data") and hasattr(bpy.data, "collections") else None
-        if not coll and scene and hasattr(scene, "collection"):
-            coll = bpy.data.collections.new(coll_name)
-            if hasattr(scene.collection, "children"):
+    coll_name = "Science_Blocks_DEM"
+    coll = bpy.data.collections.get(coll_name) if hasattr(bpy, "data") and hasattr(bpy.data, "collections") else None
+    if not coll and scene and hasattr(scene, "collection"):
+        coll = bpy.data.collections.new(coll_name)
+    if coll and scene and hasattr(scene, "collection") and hasattr(scene.collection, "children"):
+        if coll.name not in scene.collection.children:
+            try:
                 if hasattr(scene.collection.children, "link"):
                     scene.collection.children.link(coll)
                 elif hasattr(scene.collection.children, "append"):
                     scene.collection.children.append(coll)
-        target_coll = coll if coll else (scene.collection if (scene and hasattr(scene, "collection")) else None)
+            except Exception:
+                pass
+    target_coll = coll if coll else (scene.collection if (scene and hasattr(scene, "collection")) else None)
+
+    if not arrow:
+        arrow = bpy.data.objects.new(arrow_name, mesh)
         if target_coll and hasattr(target_coll, "objects"):
             if hasattr(target_coll.objects, "link"):
                 target_coll.objects.link(arrow)
@@ -3043,6 +3088,15 @@ def create_or_update_inflow_direction_arrow(
     else:
         if arrow.data != mesh:
             arrow.data = mesh
+        if not getattr(arrow, "users_collection", ()):
+            if target_coll and hasattr(target_coll, "objects"):
+                try:
+                    if hasattr(target_coll.objects, "link"):
+                        target_coll.objects.link(arrow)
+                    elif hasattr(target_coll.objects, "append"):
+                        target_coll.objects.append(arrow)
+                except Exception:
+                    pass
 
     # Assign shader material
     if hasattr(arrow, "data") and hasattr(arrow.data, "materials"):
@@ -3253,73 +3307,126 @@ def create_or_update_particle_source_plane(context, jar_obj=None, location=None,
         r_tap = float(radius or max(0.04, min(float(cavity_info["cavity_radius_sim"]) * 0.65, 0.18)))
     else:
         r_tap = float(radius or max(0.06, min(r_jar * 0.60, 0.18)))
-    h_tap = r_tap * 0.40
+    h_disc = 0.015  # Solid, clearly visible planar inlet disc plate thickness (15 mm)
+
+    scene = getattr(context, "scene", None)
+    scene_coll = getattr(scene, "collection", None) if scene else None
 
     coll_name = "Science_Blocks_DEM"
-    coll = bpy.data.collections.get(coll_name)
-    if not coll:
+    coll = bpy.data.collections.get(coll_name) if hasattr(bpy, "data") and hasattr(bpy.data, "collections") else None
+    if not coll and hasattr(bpy, "data") and hasattr(bpy.data, "collections") and hasattr(bpy.data.collections, "new"):
         coll = bpy.data.collections.new(coll_name)
-        if hasattr(context.scene, "collection") and hasattr(context.scene.collection, "children"):
-            if hasattr(context.scene.collection.children, "link"):
-                context.scene.collection.children.link(coll)
-            elif hasattr(context.scene.collection.children, "append"):
-                context.scene.collection.children.append(coll)
+    if coll and scene_coll and hasattr(scene_coll, "children"):
+        if coll.name not in scene_coll.children:
+            try:
+                if hasattr(scene_coll.children, "link"):
+                    scene_coll.children.link(coll)
+                elif hasattr(scene_coll.children, "append"):
+                    scene_coll.children.append(coll)
+            except Exception:
+                pass
+
+    target_coll = coll if coll else (scene_coll if scene_coll else None)
 
     tap_name = "Particle_Tap_Inlet"
-    tap_obj = bpy.data.objects.get(tap_name)
+    tap_obj = bpy.data.objects.get(tap_name) if hasattr(bpy, "data") and hasattr(bpy.data, "objects") else None
+
+    # Check if existing tap_obj was unlinked or deleted from scene
+    scene_objects = getattr(context.scene, "objects", ()) if hasattr(context, "scene") else ()
+    has_valid_mesh = False
+    if tap_obj and hasattr(tap_obj, "data") and tap_obj.data:
+        if hasattr(tap_obj.data, "vertices") and len(tap_obj.data.vertices) >= 3:
+            has_valid_mesh = True
+
+    # Clean up truly orphaned datablocks (0 users in Blender) or objects with broken mesh
+    if tap_obj and ((hasattr(tap_obj, "users") and tap_obj.users == 0 and hasattr(tap_obj, "users_collection") and not tap_obj.users_collection) or (hasattr(tap_obj, "data") and not has_valid_mesh)):
+        if hasattr(bpy, "data") and hasattr(bpy.data, "objects") and hasattr(bpy.data.objects, "remove"):
+            try:
+                bpy.data.objects.remove(tap_obj, do_unlink=True)
+            except Exception:
+                pass
+        tap_obj = None
 
     if not tap_obj:
         mesh = bpy.data.meshes.new(tap_name + "_Mesh")
         n_seg = 16
         verts = []
-        # Top ring
+        # Top planar cap vertices
         for i in range(n_seg):
             th = 2.0 * math.pi * i / n_seg
-            verts.append((r_tap * math.cos(th), r_tap * math.sin(th), h_tap * 0.5))
-        # Bottom nozzle ring
-        r_nozzle = r_tap * 0.65
+            verts.append((r_tap * math.cos(th), r_tap * math.sin(th), h_disc * 0.5))
+        # Bottom nozzle planar ring vertices
+        r_nozzle = r_tap * 0.85
         for i in range(n_seg):
             th = 2.0 * math.pi * i / n_seg
-            verts.append((r_nozzle * math.cos(th), r_nozzle * math.sin(th), -h_tap * 0.5))
+            verts.append((r_nozzle * math.cos(th), r_nozzle * math.sin(th), -h_disc * 0.5))
 
         faces = []
+        # Side bevel / nozzle wall quads
         for i in range(n_seg):
             nxt = (i + 1) % n_seg
             faces.append((i, nxt, n_seg + nxt, n_seg + i))
+
+        # Top disc cap polygon
+        faces.append(tuple(range(n_seg)))
+        # Bottom nozzle emitter cap polygon (downward normal for emission surface)
+        faces.append(tuple(reversed(range(n_seg, 2 * n_seg))))
 
         mesh.from_pydata(verts, [], faces)
         mesh.update()
 
         tap_obj = bpy.data.objects.new(tap_name, mesh)
-        if coll and hasattr(coll, "objects"):
-            if hasattr(coll.objects, "link"):
-                coll.objects.link(tap_obj)
-            elif hasattr(coll.objects, "append"):
-                coll.objects.append(tap_obj)
-        elif hasattr(context.scene, "collection") and hasattr(context.scene.collection, "objects"):
-            if hasattr(context.scene.collection.objects, "link"):
-                context.scene.collection.objects.link(tap_obj)
-            elif hasattr(context.scene.collection.objects, "append"):
-                context.scene.collection.objects.append(tap_obj)
+        if target_coll and hasattr(target_coll, "objects"):
+            try:
+                if hasattr(target_coll.objects, "link"):
+                    target_coll.objects.link(tap_obj)
+                elif hasattr(target_coll.objects, "append"):
+                    target_coll.objects.append(tap_obj)
+            except Exception:
+                pass
+        elif scene_coll and hasattr(scene_coll, "objects"):
+            try:
+                if hasattr(scene_coll.objects, "link"):
+                    scene_coll.objects.link(tap_obj)
+                elif hasattr(scene_coll.objects, "append"):
+                    scene_coll.objects.append(tap_obj)
+            except Exception:
+                pass
 
-    # An object can remain in bpy.data.objects after being unlinked from the scene.
-    # Re-link it so pressing the operator restores the inlet as well as its arrow.
+    # Ensure tap_obj is linked to the scene collection if it became unlinked
     if not getattr(tap_obj, "users_collection", ()):
-        if coll and hasattr(coll, "objects"):
-            if hasattr(coll.objects, "link"):
-                coll.objects.link(tap_obj)
-            elif hasattr(coll.objects, "append"):
-                coll.objects.append(tap_obj)
-        elif hasattr(context.scene, "collection") and hasattr(context.scene.collection, "objects"):
-            if hasattr(context.scene.collection.objects, "link"):
-                context.scene.collection.objects.link(tap_obj)
-            elif hasattr(context.scene.collection.objects, "append"):
-                context.scene.collection.objects.append(tap_obj)
+        if target_coll and hasattr(target_coll, "objects"):
+            try:
+                if hasattr(target_coll.objects, "link"):
+                    target_coll.objects.link(tap_obj)
+                elif hasattr(target_coll.objects, "append"):
+                    target_coll.objects.append(tap_obj)
+            except Exception:
+                pass
+        elif scene_coll and hasattr(scene_coll, "objects"):
+            try:
+                if hasattr(scene_coll.objects, "link"):
+                    scene_coll.objects.link(tap_obj)
+                elif hasattr(scene_coll.objects, "append"):
+                    scene_coll.objects.append(tap_obj)
+            except Exception:
+                pass
 
-    # Material: sleek cyan semi-transparent glass
+    # Viewport & render visibility
+    tap_obj.hide_viewport = False
+    tap_obj.hide_render = False
+    if hasattr(tap_obj, "hide_set"):
+        try:
+            tap_obj.hide_set(False)
+        except Exception:
+            pass
+    tap_obj.show_wire = True
+    tap_obj.show_all_edges = True
+
+    # Material: sleek cyan semi-transparent glass with subtle emission glow for high visibility
     mat_name = "DEM_Source_Tap_Material"
-    mat = bpy.data.materials.get(mat_name)
-    if not mat:
+    mat = bpy.data.materials.get(mat_name) if hasattr(bpy, "data") and hasattr(bpy.data, "materials") else None
+    if not mat and hasattr(bpy, "data") and hasattr(bpy.data, "materials") and hasattr(bpy.data.materials, "new"):
         mat = bpy.data.materials.new(mat_name)
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
@@ -3329,20 +3436,24 @@ def create_or_update_particle_source_plane(context, jar_obj=None, location=None,
         n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
         n_bsdf.location = (0, 0)
         if "Base Color" in n_bsdf.inputs:
-            n_bsdf.inputs["Base Color"].default_value = (0.15, 0.75, 0.95, 0.7)
+            n_bsdf.inputs["Base Color"].default_value = (0.10, 0.70, 0.95, 0.85)
         if "Roughness" in n_bsdf.inputs:
-            n_bsdf.inputs["Roughness"].default_value = 0.15
+            n_bsdf.inputs["Roughness"].default_value = 0.20
         if "Metallic" in n_bsdf.inputs:
-            n_bsdf.inputs["Metallic"].default_value = 0.40
+            n_bsdf.inputs["Metallic"].default_value = 0.30
         if "Transmission Weight" in n_bsdf.inputs:
-            n_bsdf.inputs["Transmission Weight"].default_value = 0.65
+            n_bsdf.inputs["Transmission Weight"].default_value = 0.25
         elif "Transmission" in n_bsdf.inputs:
-            n_bsdf.inputs["Transmission"].default_value = 0.65
+            n_bsdf.inputs["Transmission"].default_value = 0.25
         if "Alpha" in n_bsdf.inputs:
-            n_bsdf.inputs["Alpha"].default_value = 0.7
+            n_bsdf.inputs["Alpha"].default_value = 0.85
+        if "Emission Color" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Color"].default_value = (0.05, 0.45, 0.80, 1.0)
+        if "Emission Strength" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Strength"].default_value = 0.8
         mat.node_tree.links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
         if hasattr(mat, "blend_method"):
-            mat.blend_method = "BLEND"
+            mat.blend_method = "HASHED"
         if hasattr(mat, "shadow_method"):
             mat.shadow_method = "NONE"
 
@@ -3355,12 +3466,12 @@ def create_or_update_particle_source_plane(context, jar_obj=None, location=None,
     # Position tap inlet relative to jar chamber
     if location is not None:
         tap_obj.location = location
+        tap_obj.scale = Vector((1.0, 1.0, 1.0)) if Vector else (1.0, 1.0, 1.0)
     elif jar_obj:
         cavity_info = geom.get("cavity_info") if geom else None
         if cavity_info and "local_inlet" in cavity_info:
             local_top = Vector(cavity_info["local_inlet"])
-            r_cav = float(cavity_info.get("cavity_radius_sim", r_jar))
-            tap_obj.scale = (r_cav * 0.70, r_cav * 0.70, 0.005)
+            tap_obj.scale = Vector((1.0, 1.0, 1.0)) if Vector else (1.0, 1.0, 1.0)
         else:
             axis_c = "Z"
             if geom:
@@ -3386,9 +3497,20 @@ def create_or_update_particle_source_plane(context, jar_obj=None, location=None,
                 cz = float(loc.z if hasattr(loc, "z") else loc[2])
                 local_top = Vector((cx, cy, cz + h_jar * 0.5))
 
+            tap_obj.scale = Vector((1.0, 1.0, 1.0)) if Vector else (1.0, 1.0, 1.0)
+
         world_pos = jar_obj.matrix_world @ local_top
         tap_obj.location = world_pos
         tap_obj.rotation_euler = jar_obj.rotation_euler.copy()
+
+    # Activate and select in view layer
+    if hasattr(context, "view_layer") and hasattr(context.view_layer, "objects"):
+        try:
+            context.view_layer.objects.active = tap_obj
+            if hasattr(tap_obj, "select_set"):
+                tap_obj.select_set(True)
+        except Exception:
+            pass
 
     if props:
         props.dem_source_plane_obj = tap_obj
@@ -3412,15 +3534,30 @@ class SCIENCE_BLOCKS_OT_create_particle_source_plane(bpy.types.Operator):
         jar_obj = None
         tree = get_effective_node_tree(context, props)
         active_node = None
-        if tree:
+
+        # Check context active node first (e.g. when invoked from ScienceBlocksYadeNode or ScienceBlocksDEMSolverNode)
+        target_node = getattr(context, "active_node", None) or getattr(context, "node", None)
+        if target_node and getattr(target_node, "bl_idname", "") in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+            active_node = target_node
+        elif tree:
             for n in tree.nodes:
                 if n.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
                     active_node = n
                     break
+
         jar_obj, _ = resolve_simulation_objects(context, props, solver_node=active_node)
         tap_obj = create_or_update_particle_source_plane(context, jar_obj=jar_obj)
 
         if tap_obj:
+            # If the solver node has a linked Particles Input socket, synchronize its target object
+            if active_node and hasattr(active_node, "inputs"):
+                sock_tap = active_node.inputs.get("Particles Input") or active_node.inputs.get("Source Tap / Plane")
+                if sock_tap and getattr(sock_tap, "is_linked", False):
+                    for link in getattr(sock_tap, "links", []):
+                        from_node = getattr(link, "from_node", None)
+                        if from_node and hasattr(from_node, "target_object"):
+                            from_node.target_object = tap_obj
+
             create_or_update_inflow_direction_arrow(context, source_plane_obj=tap_obj, jar_obj=jar_obj)
             self.report({"INFO"}, f"Science Blocks: Placed source tap '{tap_obj.name}' above jar chamber.")
             return {"FINISHED"}
@@ -3881,6 +4018,13 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             colormap_mode=props.dem_viewport_colormap,
         )
 
+        # Persist DEM collision telemetry directly in .blend file Text datablock
+        try:
+            if hasattr(dem_solver, "save_dem_cache_to_blend"):
+                dem_solver.save_dem_cache_to_blend(res, context)
+        except Exception:
+            pass
+
         # Update isolated side chamber particles if side view is enabled
         if props.show_side_jar_view or props.side_jar_auto_show_on_select:
             try:
@@ -4245,7 +4389,9 @@ class SCIENCE_BLOCKS_OT_generate_scientific_report(bpy.types.Operator):
 
         from . import report_generator
 
-        res = dem_solver.last_dem_result
+        res = getattr(dem_solver, "last_dem_result", None)
+        if not res and hasattr(dem_solver, "get_or_restore_dem_result"):
+            res = dem_solver.get_or_restore_dem_result(context)
         if not res or not getattr(props, "dem_is_simulated", False):
             self.report({"WARNING"}, "No DEM simulation results found. Please run the DEM simulation first.")
             return {"CANCELLED"}
@@ -5468,41 +5614,65 @@ def get_or_create_sci_jar_material(props) -> bpy.types.Material:
             if hasattr(mat, "blend_method"):
                 mat.blend_method = "OPAQUE"
 
-    # Optional Visible Edge Lines (Wireframe Outlines)
+    # Optional Visible Edge Lines & Freestyle Outermost Silhouette Outline
     edge_lines = getattr(props, "sci_jar_edge_lines", False) if props else False
     if edge_lines:
         try:
-            n_wire = nodes.new("ShaderNodeWireframe")
-            n_wire.location = (150, 180)
-            if hasattr(n_wire, "use_pixel_size"):
-                n_wire.use_pixel_size = True
-            if "Size" in n_wire.inputs:
-                n_wire.inputs["Size"].default_value = float(getattr(props, "sci_jar_edge_width", 1.2))
+            # 1. Freestyle Silhouette Outline via LayerWeight (Facing) + Math (Less Than)
+            n_lw = nodes.new("ShaderNodeLayerWeight")
+            n_lw.location = (150, 220)
+            if "Blend" in n_lw.inputs:
+                n_lw.inputs["Blend"].default_value = 0.5
 
+            edge_w = float(getattr(props, "sci_jar_edge_width", 1.2))
+            thresh = max(0.01, min(0.35, 0.025 * edge_w))
+
+            n_math = nodes.new("ShaderNodeMath")
+            n_math.location = (320, 220)
+            n_math.operation = "LESS_THAN"
+            n_math.inputs[1].default_value = thresh
+
+            # Link Facing -> Math Value
+            facing_out = n_lw.outputs.get("Facing") or (n_lw.outputs[1] if len(n_lw.outputs) > 1 else n_lw.outputs[0])
+            if facing_out:
+                links.new(facing_out, n_math.inputs[0])
+
+            # Edge Opacity Scaling
+            edge_opacity = float(getattr(props, "sci_jar_edge_opacity", 1.0))
+            n_mult = nodes.new("ShaderNodeMath")
+            n_mult.location = (480, 220)
+            n_mult.operation = "MULTIPLY"
+            n_mult.inputs[1].default_value = max(0.0, min(1.0, edge_opacity))
+            math_val = n_math.outputs.get("Value") or (n_math.outputs[0] if n_math.outputs else None)
+            if math_val:
+                links.new(math_val, n_mult.inputs[0])
+
+            # Outermost Edge Line Emission Shader
             n_edge = nodes.new("ShaderNodeEmission")
-            n_edge.location = (150, -180)
-            edge_col = getattr(props, "sci_jar_edge_color", (0.10, 0.12, 0.16))
+            n_edge.location = (480, -180)
+            edge_col = getattr(props, "sci_jar_edge_color", (0.0, 0.0, 0.0))
             if "Color" in n_edge.inputs:
                 n_edge.inputs["Color"].default_value = (edge_col[0], edge_col[1], edge_col[2], 1.0)
             if "Strength" in n_edge.inputs:
                 n_edge.inputs["Strength"].default_value = 1.0
 
+            # Mix Shader: Blends Base BSDF with Edge Emission along outermost silhouette
             n_mix = nodes.new("ShaderNodeMixShader")
-            n_mix.location = (350, 0)
-            n_out.location = (550, 0)
+            n_mix.location = (680, 0)
+            n_out.location = (880, 0)
 
             # Clear direct link from BSDF to n_out Surface
             for link in list(links):
                 if getattr(link, "to_node", None) == n_out:
                     links.remove(link)
 
-            wire_fac = n_wire.outputs.get("Fac") or (n_wire.outputs[0] if n_wire.outputs else None)
+            mult_val = n_mult.outputs.get("Value") or (n_mult.outputs[0] if n_mult.outputs else None)
             bsdf_surf = n_bsdf.outputs.get("BSDF") or (n_bsdf.outputs[0] if n_bsdf.outputs else None)
             edge_surf = n_edge.outputs.get("Emission") or (n_edge.outputs[0] if n_edge.outputs else None)
             mix_surf = n_mix.outputs.get("Shader") or (n_mix.outputs[0] if n_mix.outputs else None)
 
-            if wire_fac:
-                links.new(wire_fac, n_mix.inputs[0])
+            if mult_val:
+                links.new(mult_val, n_mix.inputs[0])
             if bsdf_surf:
                 links.new(bsdf_surf, n_mix.inputs[1])
             if edge_surf:
@@ -5633,6 +5803,259 @@ def get_or_create_sci_sphere_material(props) -> bpy.types.Material:
         mat.blend_method = "OPAQUE"
 
     return mat
+
+
+def create_or_update_chamber_edge_lines(context, target_obj, props) -> "bpy.types.Object":
+    """Extracts and maintains an edge feature overlay object for the chamber displaying
+    strictly edges with dihedral angle less than 180 degrees (e.g. rim, caps, corners, ridges),
+    while completely hiding flat surfaces and smooth cylinder vertical facets.
+    """
+    if bpy is None or target_obj is None:
+        return None
+
+    edge_lines = getattr(props, "sci_jar_edge_lines", False) if props else False
+    edge_obj_name = f"{target_obj.name}_Edge_Lines"
+    edge_obj = bpy.data.objects.get(edge_obj_name) if hasattr(bpy, "data") and hasattr(bpy.data, "objects") else None
+
+    # If disabled or target object has no mesh data, hide/cleanup and return
+    if not edge_lines or not getattr(target_obj, "data", None):
+        if edge_obj:
+            if hasattr(edge_obj, "hide_viewport"):
+                edge_obj.hide_viewport = True
+            if hasattr(edge_obj, "hide_render"):
+                edge_obj.hide_render = True
+        return None
+
+    threshold_deg = float(getattr(props, "sci_jar_edge_threshold", 160.0))
+    edge_col = getattr(props, "sci_jar_edge_color", (0.0, 0.0, 0.0))
+    opacity = float(getattr(props, "sci_jar_edge_opacity", 1.0))
+
+    # Minimum face angle between normals (radians)
+    # Dihedral angle = 180 - face_angle => face_angle > 180 - threshold_deg
+    min_face_angle = math.radians(max(0.1, 180.0 - threshold_deg))
+
+    sharp_edge_coords = []
+
+    # 1. Primary Extraction using bmesh
+    try:
+        import bmesh
+        bm = bmesh.new()
+        bm.from_mesh(target_obj.data)
+        bm.edges.ensure_lookup_table()
+
+        for e in bm.edges:
+            # Boundary edges (e.g. open cylinder aperture or cutaway rim)
+            if len(e.link_faces) == 1:
+                sharp_edge_coords.append((tuple(e.verts[0].co), tuple(e.verts[1].co)))
+            elif len(e.link_faces) == 2:
+                try:
+                    f_angle = e.calc_face_angle()
+                    if f_angle >= min_face_angle:
+                        sharp_edge_coords.append((tuple(e.verts[0].co), tuple(e.verts[1].co)))
+                except Exception:
+                    pass
+            elif len(e.link_faces) > 2:
+                sharp_edge_coords.append((tuple(e.verts[0].co), tuple(e.verts[1].co)))
+        bm.free()
+    except Exception:
+        pass
+
+    # 2. Fallback extraction using pure polygon / edge geometry
+    if not sharp_edge_coords and hasattr(target_obj.data, "polygons") and hasattr(target_obj.data, "vertices"):
+        mesh = target_obj.data
+        if len(mesh.polygons) > 0 and len(mesh.vertices) > 0:
+            def _get_v_co(v_obj):
+                if hasattr(v_obj, "co"):
+                    return tuple(v_obj.co)
+                return tuple(v_obj)
+
+            edge_to_normals = {}
+            for poly in mesh.polygons:
+                v_indices = list(poly.vertices) if hasattr(poly, "vertices") else []
+                n_pts = len(v_indices)
+                p_norm = getattr(poly, "normal", None)
+                if p_norm is None and n_pts >= 3:
+                    try:
+                        v0 = np.array(_get_v_co(mesh.vertices[v_indices[0]]))
+                        v1 = np.array(_get_v_co(mesh.vertices[v_indices[1]]))
+                        v2 = np.array(_get_v_co(mesh.vertices[v_indices[2]]))
+                        cross = np.cross(v1 - v0, v2 - v0)
+                        norm_len = np.linalg.norm(cross)
+                        p_norm = cross / max(1e-6, norm_len)
+                    except Exception:
+                        p_norm = None
+                for i in range(n_pts):
+                    idx1 = v_indices[i]
+                    idx2 = v_indices[(i + 1) % n_pts]
+                    e_key = (min(idx1, idx2), max(idx1, idx2))
+                    if e_key not in edge_to_normals:
+                        edge_to_normals[e_key] = []
+                    if p_norm is not None:
+                        edge_to_normals[e_key].append(p_norm)
+
+            for (idx1, idx2), norms in edge_to_normals.items():
+                if len(norms) == 1:
+                    c1 = _get_v_co(mesh.vertices[idx1])
+                    c2 = _get_v_co(mesh.vertices[idx2])
+                    sharp_edge_coords.append((c1, c2))
+                elif len(norms) == 2:
+                    try:
+                        n0 = np.array(norms[0].data if hasattr(norms[0], "data") else norms[0])
+                        n1 = np.array(norms[1].data if hasattr(norms[1], "data") else norms[1])
+                        dot = float(np.clip(np.dot(n0, n1), -1.0, 1.0))
+                        ang = math.acos(dot)
+                        if ang >= min_face_angle:
+                            c1 = _get_v_co(mesh.vertices[idx1])
+                            c2 = _get_v_co(mesh.vertices[idx2])
+                            sharp_edge_coords.append((c1, c2))
+                    except Exception:
+                        pass
+                elif len(norms) > 2:
+                    c1 = _get_v_co(mesh.vertices[idx1])
+                    c2 = _get_v_co(mesh.vertices[idx2])
+                    sharp_edge_coords.append((c1, c2))
+
+    # 3. Build deduplicated vertex and edge indices
+    unique_verts = []
+    coord_to_idx = {}
+    edge_indices = []
+    seen_edges = set()
+
+    for p1, p2 in sharp_edge_coords:
+        k1 = (round(float(p1[0]), 5), round(float(p1[1]), 5), round(float(p1[2]), 5))
+        k2 = (round(float(p2[0]), 5), round(float(p2[1]), 5), round(float(p2[2]), 5))
+        if k1 == k2:
+            continue
+        if k1 not in coord_to_idx:
+            coord_to_idx[k1] = len(unique_verts)
+            unique_verts.append((k1[0], k1[1], k1[2]))
+        if k2 not in coord_to_idx:
+            coord_to_idx[k2] = len(unique_verts)
+            unique_verts.append((k2[0], k2[1], k2[2]))
+        i1 = coord_to_idx[k1]
+        i2 = coord_to_idx[k2]
+        if i1 != i2:
+            e_pair = (min(i1, i2), max(i1, i2))
+            if e_pair not in seen_edges:
+                seen_edges.add(e_pair)
+                edge_indices.append(e_pair)
+
+    mesh_name = f"{target_obj.name}_Edge_Lines_Mesh"
+    edge_mesh = bpy.data.meshes.get(mesh_name) if hasattr(bpy, "data") and hasattr(bpy.data, "meshes") else None
+    if edge_mesh:
+        if hasattr(edge_mesh, "clear_geometry"):
+            try:
+                edge_mesh.clear_geometry()
+            except Exception:
+                pass
+        else:
+            try:
+                bpy.data.meshes.remove(edge_mesh, do_unlink=True)
+                edge_mesh = bpy.data.meshes.new(mesh_name)
+            except Exception:
+                pass
+    elif hasattr(bpy, "data") and hasattr(bpy.data, "meshes"):
+        edge_mesh = bpy.data.meshes.new(mesh_name)
+
+    if edge_mesh and hasattr(edge_mesh, "from_pydata"):
+        try:
+            edge_mesh.from_pydata(unique_verts, edge_indices, [])
+            if hasattr(edge_mesh, "validate"):
+                edge_mesh.validate(verbose=False)
+            if hasattr(edge_mesh, "update"):
+                edge_mesh.update()
+        except Exception:
+            pass
+
+    if not edge_obj and hasattr(bpy, "data") and hasattr(bpy.data, "objects"):
+        edge_obj = bpy.data.objects.new(edge_obj_name, edge_mesh)
+        target_colls = getattr(target_obj, "users_collection", [])
+        coll = target_colls[0] if target_colls else (
+            bpy.data.collections.get("Master Collection")
+            or bpy.data.collections.get("Collection")
+            or (context.scene.collection if (context and hasattr(context, "scene")) else None)
+        )
+        if coll and hasattr(coll, "objects") and hasattr(coll.objects, "link"):
+            try:
+                coll.objects.link(edge_obj)
+            except Exception:
+                pass
+    elif edge_obj:
+        edge_obj.data = edge_mesh
+        if hasattr(edge_obj, "users_collection") and not edge_obj.users_collection:
+            target_colls = getattr(target_obj, "users_collection", [])
+            coll = target_colls[0] if target_colls else (
+                getattr(context, "scene", None) and getattr(context.scene, "collection", None)
+            )
+            if coll and hasattr(coll, "objects") and hasattr(coll.objects, "link"):
+                try:
+                    coll.objects.link(edge_obj)
+                except Exception:
+                    pass
+
+    if not edge_obj:
+        return None
+
+    # Parent to target chamber
+    edge_obj.parent = target_obj
+    if hasattr(target_obj, "matrix_world") and hasattr(edge_obj, "matrix_world"):
+        try:
+            edge_obj.matrix_world = target_obj.matrix_world.copy()
+        except Exception:
+            pass
+
+    if hasattr(edge_obj, "hide_viewport"):
+        edge_obj.hide_viewport = False
+    if hasattr(edge_obj, "hide_render"):
+        edge_obj.hide_render = True
+    if hasattr(edge_obj, "show_wire"):
+        edge_obj.show_wire = True
+    if hasattr(edge_obj, "show_all_edges"):
+        edge_obj.show_all_edges = True
+    if hasattr(edge_obj, "color"):
+        edge_obj.color = (edge_col[0], edge_col[1], edge_col[2], opacity)
+
+    # Exclude from Line Art and Freestyle to prevent bad_optional_access crash in Blender 5.2
+    if hasattr(edge_obj, "lineart"):
+        try:
+            edge_obj.lineart.usage = 'EXCLUDE'
+        except Exception:
+            pass
+
+    # Edge line material
+    mat_name = "SB_Chamber_Edge_Line_Material"
+    edge_mat = bpy.data.materials.get(mat_name) if hasattr(bpy, "data") and hasattr(bpy.data, "materials") else None
+    if not edge_mat and hasattr(bpy, "data") and hasattr(bpy.data, "materials"):
+        edge_mat = bpy.data.materials.new(mat_name)
+
+    if edge_mat and hasattr(edge_mat, "use_nodes"):
+        edge_mat.use_nodes = True
+        nodes = edge_mat.node_tree.nodes
+        links = edge_mat.node_tree.links
+        nodes.clear()
+        n_out = nodes.new("ShaderNodeOutputMaterial")
+        n_out.location = (300, 0)
+        n_em = nodes.new("ShaderNodeEmission")
+        n_em.location = (0, 0)
+        if "Color" in n_em.inputs:
+            n_em.inputs["Color"].default_value = (edge_col[0], edge_col[1], edge_col[2], 1.0)
+        if "Strength" in n_em.inputs:
+            n_em.inputs["Strength"].default_value = 1.0
+        links.new(n_em.outputs["Emission"], n_out.inputs["Surface"])
+
+        if hasattr(edge_mat, "blend_method"):
+            edge_mat.blend_method = "BLEND" if opacity < 0.98 else "OPAQUE"
+        if hasattr(edge_mat, "shadow_method"):
+            edge_mat.shadow_method = "NONE"
+
+    if edge_obj and hasattr(edge_obj, "data") and edge_obj.data and hasattr(edge_obj.data, "materials"):
+        if edge_mat:
+            if not edge_obj.data.materials:
+                edge_obj.data.materials.append(edge_mat)
+            else:
+                edge_obj.data.materials[0] = edge_mat
+
+    return edge_obj
 
 
 def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
@@ -5799,27 +6222,30 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
 
     # Grinding Jars (main & side)
     edge_lines = getattr(props, "sci_jar_edge_lines", False) if props else False
-    edge_col = getattr(props, "sci_jar_edge_color", (0.10, 0.12, 0.16)) if props else (0.10, 0.12, 0.16)
+    edge_col = getattr(props, "sci_jar_edge_color", (0.0, 0.0, 0.0)) if props else (0.0, 0.0, 0.0)
+    edge_opacity = float(getattr(props, "sci_jar_edge_opacity", 1.0)) if props else 1.0
 
     jar_obj = props.jar_chamber_obj or bpy.data.objects.get("Jar_Chamber")
     if jar_obj:
         assign_material_to_object(jar_obj, jar_mat)
         if hasattr(jar_obj, "show_wire"):
-            jar_obj.show_wire = edge_lines
+            jar_obj.show_wire = False
         if hasattr(jar_obj, "show_all_edges"):
-            jar_obj.show_all_edges = edge_lines
+            jar_obj.show_all_edges = False
         if hasattr(jar_obj, "color"):
-            jar_obj.color = (edge_col[0], edge_col[1], edge_col[2], 1.0)
+            jar_obj.color = (edge_col[0], edge_col[1], edge_col[2], edge_opacity)
+        create_or_update_chamber_edge_lines(context, jar_obj, props)
 
     side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
     if side_jar:
         assign_material_to_object(side_jar, jar_mat)
         if hasattr(side_jar, "show_wire"):
-            side_jar.show_wire = edge_lines
+            side_jar.show_wire = False
         if hasattr(side_jar, "show_all_edges"):
-            side_jar.show_all_edges = edge_lines
+            side_jar.show_all_edges = False
         if hasattr(side_jar, "color"):
-            side_jar.color = (edge_col[0], edge_col[1], edge_col[2], 1.0)
+            side_jar.color = (edge_col[0], edge_col[1], edge_col[2], edge_opacity)
+        create_or_update_chamber_edge_lines(context, side_jar, props)
 
     # Carrier / Sun Wheel Plate
     sun_obj = props.sun_wheel_obj or bpy.data.objects.get("Sun_Wheel_Plate")
@@ -5856,7 +6282,10 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
     # 5. Dynamic Recolor for Milling Media Particles
     try:
         from . import colormaps
-        colormaps.recolor_dem_particles_in_scene(context, props.sci_media_palette)
+        if active_colormap == "SOLID":
+            colormaps.recolor_dem_particles_in_scene(context, props.sci_media_palette)
+        else:
+            colormaps.update_dem_shader_palette(props.sci_media_palette, shader_mode=active_colormap, context=context)
     except Exception:
         pass
 
@@ -5949,14 +6378,18 @@ class SCIENCE_BLOCKS_OT_set_chamber_edge_color(bpy.types.Operator):
         if props:
             props.sci_jar_edge_lines = True
             if self.color_preset == "BLACK":
-                props.sci_jar_edge_color = (0.05, 0.05, 0.05)
+                props.sci_jar_edge_color = (0.0, 0.0, 0.0)
+                props.sci_jar_edge_opacity = 1.0
             elif self.color_preset == "WHITE":
                 props.sci_jar_edge_color = (1.0, 1.0, 1.0)
+                props.sci_jar_edge_opacity = 1.0
             elif self.color_preset == "SLATE":
                 props.sci_jar_edge_color = (0.28, 0.32, 0.38)
+                props.sci_jar_edge_opacity = 0.85
             elif self.color_preset == "ACCENT":
                 acc = getattr(props, "sci_accent_color", (0.08, 0.44, 0.88))
                 props.sci_jar_edge_color = (acc[0], acc[1], acc[2])
+                props.sci_jar_edge_opacity = 1.0
         apply_scientific_paper_style(context)
         self.report({"INFO"}, f"Science Blocks: Set chamber edge line color to {self.color_preset}.")
         return {"FINISHED"}
@@ -6030,8 +6463,21 @@ class SCIENCE_BLOCKS_OT_update_particle_colors(bpy.types.Operator):
             return {"CANCELLED"}
         try:
             from . import colormaps
-            cnt = colormaps.recolor_dem_particles_in_scene(context, props.sci_media_palette)
-            self.report({"INFO"}, f"Science Blocks: Shaded {cnt} particles with {props.sci_media_palette}.")
+            mode = getattr(props, "dem_viewport_colormap", "VELOCITY")
+            pal = getattr(props, "sci_media_palette", "TURBO")
+            if mode == "SOLID":
+                cnt = colormaps.recolor_dem_particles_in_scene(context, pal)
+            else:
+                colormaps.update_dem_shader_palette(pal, shader_mode=mode, context=context)
+                cnt = colormaps.assign_dem_shader_to_particles(context, shader_mode=mode)
+
+            try:
+                from .properties import _sync_output_nodes_from_panel
+                _sync_output_nodes_from_panel(context, colormap_mode=mode, palette=pal)
+            except Exception:
+                pass
+
+            self.report({"INFO"}, f"Science Blocks: Shaded {cnt} particles with {pal}.")
         except Exception as e:
             self.report({"WARNING"}, f"Particle recoloring note: {str(e)}")
         return {"FINISHED"}
@@ -6044,28 +6490,71 @@ class SCIENCE_BLOCKS_OT_apply_particle_colormap(bpy.types.Operator):
     bl_description = "Recolors already-baked particles in post-processing based on Velocity, Contact Force, or Energy"
 
     colormap: bpy.props.StringProperty(name="Colormap Mode", default="")
+    palette: bpy.props.StringProperty(name="Palette", default="")
 
     def execute(self, context):
         props = getattr(context.scene, "science_blocks_props", None)
         mode = self.colormap.strip() if self.colormap else ""
+        pal = self.palette.strip() if self.palette else ""
 
-        if not mode and props and props.active_node_tree:
-            for node in props.active_node_tree.nodes:
-                if node.bl_idname == "ScienceBlocksOutputNode":
-                    mode = getattr(node, "colormap_mode", "VELOCITY")
-                    break
+        # If not passed via operator properties, inspect active node in context
+        active_node = getattr(context, "active_node", None) or getattr(context, "node", None)
+        if active_node and getattr(active_node, "bl_idname", "") == "ScienceBlocksOutputNode":
+            if not mode:
+                mode = getattr(active_node, "colormap_mode", "")
+            if not pal:
+                pal = getattr(active_node, "palette", "")
 
+        # Check active node tree in space_data
+        if not mode or not pal:
+            if hasattr(context, "space_data") and getattr(context.space_data, "node_tree", None):
+                for node in context.space_data.node_tree.nodes:
+                    if getattr(node, "bl_idname", "") == "ScienceBlocksOutputNode":
+                        if not mode:
+                            mode = getattr(node, "colormap_mode", "")
+                        if not pal:
+                            pal = getattr(node, "palette", "")
+                        break
+
+        # Check props.active_node_tree
+        if not mode or not pal:
+            if props and getattr(props, "active_node_tree", None):
+                for node in props.active_node_tree.nodes:
+                    if getattr(node, "bl_idname", "") == "ScienceBlocksOutputNode":
+                        if not mode:
+                            mode = getattr(node, "colormap_mode", "")
+                        if not pal:
+                            pal = getattr(node, "palette", "")
+                        break
+
+        # Fallbacks to scene properties
         if not mode and props:
             mode = getattr(props, "dem_viewport_colormap", "VELOCITY")
         if not mode:
             mode = "VELOCITY"
 
-        count = dem_solver.apply_particle_colormap_postprocess(context, colormap_mode=mode)
+        if not pal and props:
+            pal = getattr(props, "sci_media_palette", "TURBO")
+        if not pal:
+            pal = "TURBO"
+
+        # Synchronize back to props and nodes
+        if props:
+            props.dem_viewport_colormap = mode
+            props.sci_media_palette = pal
+
+        try:
+            from .properties import _sync_output_nodes_from_panel
+            _sync_output_nodes_from_panel(context, colormap_mode=mode, palette=pal)
+        except Exception:
+            pass
+
+        count = dem_solver.apply_particle_colormap_postprocess(context, colormap_mode=mode, palette=pal)
         if count == 0:
             self.report({"WARNING"}, "No baked simulation data found. Please bake DEM physics first!")
             return {"CANCELLED"}
 
-        self.report({"INFO"}, f"Science Blocks: Applied '{mode}' colormap post-processing to {count} particles.")
+        self.report({"INFO"}, f"Science Blocks: Applied '{mode}' ({pal}) colormap post-processing to {count} particles.")
         return {"FINISHED"}
 
 
@@ -6091,6 +6580,13 @@ class SCIENCE_BLOCKS_OT_set_particle_shader(bpy.types.Operator):
                 colormaps.assign_dem_shader_to_particles(context, shader_mode=mode)
             except Exception:
                 pass
+
+        try:
+            from .properties import _sync_output_nodes_from_panel
+            _sync_output_nodes_from_panel(context, colormap_mode=mode)
+        except Exception:
+            pass
+
         self.report({"INFO"}, f"Science Blocks: Media Shader set to '{mode}'. Edit colors in Shader Editor.")
         return {"FINISHED"}
 
@@ -6161,22 +6657,19 @@ class SCIENCE_BLOCKS_OT_apply_shader_palette_preset(bpy.types.Operator):
         props = getattr(context.scene, "science_blocks_props", None)
         mode = getattr(props, "dem_viewport_colormap", "VELOCITY") if props else "VELOCITY"
         pal = self.palette.upper() if self.palette else "VIRIDIS"
+        if props:
+            props.sci_media_palette = pal
 
         try:
             from . import colormaps
-            mat = colormaps.get_dem_shader_for_mode(mode)
-            if mat and mat.use_nodes:
-                ramp_node = None
-                for n in mat.node_tree.nodes:
-                    if n.type == "VALTORGB":
-                        ramp_node = n
-                        break
-                if ramp_node:
-                    stops = colormaps.get_palette_stops(pal, num_stops=5)
-                    colormaps.configure_color_ramp(ramp_node, stops)
-                    colormaps.create_or_update_analytical_color_strip(context, mode=mode)
-                    self.report({"INFO"}, f"Science Blocks: Loaded '{pal}' preset into {mat.name} ColorRamp.")
-                    return {"FINISHED"}
+            colormaps.update_dem_shader_palette(pal, shader_mode=mode, context=context)
+            try:
+                from .properties import _sync_output_nodes_from_panel
+                _sync_output_nodes_from_panel(context, palette=pal)
+            except Exception:
+                pass
+            self.report({"INFO"}, f"Science Blocks: Loaded '{pal}' preset into ColorRamp.")
+            return {"FINISHED"}
         except Exception as e:
             self.report({"WARNING"}, f"Could not apply preset: {e}")
 
@@ -6597,7 +7090,10 @@ def compute_and_apply_surface_impact_heatmap(
             from . import dem_solver
         except (ImportError, ValueError):
             import dem_solver
-        res = getattr(dem_solver, "last_dem_result", None)
+        if hasattr(dem_solver, "get_or_restore_dem_result"):
+            res = dem_solver.get_or_restore_dem_result(context)
+        else:
+            res = getattr(dem_solver, "last_dem_result", None)
 
     if res is None:
         return {"status": "ERROR", "message": "No DEM simulation result in memory. Bake simulation first."}
