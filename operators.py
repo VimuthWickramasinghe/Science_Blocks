@@ -7151,7 +7151,12 @@ def compute_and_apply_surface_impact_heatmap(
                     g_weight = math.exp(-0.5 * ((dist / sigma) ** 2))
                     accum[idx] += w_val * g_weight
             else:
-                co, idx, dist = kd.find_nearest(pt)
+                if hasattr(kd, "find"):
+                    co, idx, dist = kd.find(pt)
+                elif hasattr(kd, "find_nearest"):
+                    co, idx, dist = kd.find_nearest(pt)
+                else:
+                    co, idx, dist = None, None, 0.0
                 if idx is not None:
                     accum[idx] += w_val
     else:
@@ -7225,7 +7230,12 @@ def compute_and_apply_surface_impact_heatmap(
                         for sco, sidx, sdist in hits:
                             side_accum[sidx] += weights[j] * math.exp(-0.5 * ((sdist / sigma) ** 2))
                     else:
-                        sco, sidx, sdist = side_kd.find_nearest(pt)
+                        if hasattr(side_kd, "find"):
+                            sco, sidx, sdist = side_kd.find(pt)
+                        elif hasattr(side_kd, "find_nearest"):
+                            sco, sidx, sdist = side_kd.find_nearest(pt)
+                        else:
+                            sco, sidx, sdist = None, None, 0.0
                         if sidx is not None:
                             side_accum[sidx] += weights[j]
                 side_norm = np.clip((side_accum / ref_max) ** pwr, 0.0, 1.0)

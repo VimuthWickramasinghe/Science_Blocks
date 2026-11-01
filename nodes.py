@@ -382,9 +382,13 @@ class ScienceBlocksRPMValueNode(bpy.types.Node):
         elif self.mode == "SINE":
             return self.rpm_constant + self.sine_amplitude * math.sin(2.0 * math.pi * self.sine_frequency * t_rot)
         elif self.mode == "CUSTOM_EXPR":
+            expr = (self.custom_expression or "").strip()
+            if not expr or expr == "." or not any(c.isalnum() for c in expr):
+                return 0.0
             safe_dict = {"math": math, "sin": math.sin, "cos": math.cos, "pi": math.pi, "t": t_rot}
             try:
-                return float(eval(self.custom_expression, {"__builtins__": {}}, safe_dict))
+                code = compile(expr, "<rpm_custom_expression>", "eval")
+                return float(eval(code, {"__builtins__": {}}, safe_dict))
             except Exception:
                 return 0.0
         return self.rpm_constant
