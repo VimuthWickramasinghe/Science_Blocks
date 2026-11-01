@@ -73,6 +73,8 @@ class PlanetaryDEMResult:
         self.impact_forces = np.zeros((frames, ball_count), dtype=np.float32)
         self.ball_radii = np.zeros(ball_count, dtype=np.float64)
         self.ball_masses = np.zeros(ball_count, dtype=np.float64)
+        self.spawn_times = np.zeros(ball_count, dtype=np.float64)
+        self.spawn_frames = np.zeros(ball_count, dtype=np.int32)
 
         # Performance & Telemetry Summary
         self.total_impacts = 0
@@ -172,17 +174,26 @@ def generate_non_overlapping_source_particles(
     source_center: tuple = (0.0, 0.0, 0.40),
     source_normal: tuple = (0.0, 0.0, -1.0),
     source_radius: float = 0.15,
+    tangent_u: tuple = None,
+    tangent_v: tuple = None,
+    size_u: float = None,
+    size_v: float = None,
     min_clearance_factor: float = 1.15,
+    planar_only: bool = False,
+    return_capacity: bool = False,
 ) -> np.ndarray:
     """Generates strictly non-overlapping initial particle positions from a source tap / plane.
 
-    Uses hexagonal close-packed (HCP) multi-layer planar emission:
-    - Centers spheres across the source plane disc/rectangle with clearance gap >= 15% diameter.
-    - If ball_count exceeds single-layer capacity, stacks subsequent layers backwards along -normal.
-    - Guaranteed ZERO pairwise overlap at initial generation time.
+    Supports:
+    1. Fluid-style planar surface emission (planar_only=True): positions sampled strictly on the
+       surface of the assigned plane or tap, with zero normal offset.
+    2. Rectangular planes (tangent_u, tangent_v, size_u, size_v) or circular radial discs.
+    3. Multi-layer volumetric packing along +normal when planar_only=False (legacy mode).
+    4. Guaranteed ZERO pairwise overlap across all generated initial slots.
     """
     if ball_count <= 0:
-        return np.zeros((0, 3), dtype=np.float64)
+        empty = np.zeros((0, 3), dtype=np.float64)
+        return (empty, 0) if return_capacity else empty
 
     max_r = float(np.max(radii)) if len(radii) else 0.012
     d_step = max_r * 2.0 * max(1.05, float(min_clearance_factor))
@@ -195,48 +206,104 @@ def generate_non_overlapping_source_particles(
     else:
         n = n / n_len
 
-    ref_vec = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(n[0]) < 0.85 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    u = np.cross(ref_vec, n)
-    u_len = np.linalg.norm(u)
-    u = u / (u_len if u_len > 1e-9 else 1.0)
-    v = np.cross(n, u)
-    v_len = np.linalg.norm(v)
-    v = v / (v_len if v_len > 1e-9 else 1.0)
+    if tangent_u is not None:
+        u = np.array(tangent_u, dtype=np.float64)
+        u = u - np.dot(u, n) * n
+        u_len = np.linalg.norm(u)
+        if u_len > 1e-6:
+            u = u / u_len
+        else:
+            ref_vec = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(n[0]) < 0.85 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            u = np.cross(ref_vec, n)
+            u = u / np.linalg.norm(u)
+    else:
+        ref_vec = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(n[0]) < 0.85 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        u = np.cross(ref_vec, n)
+        u = u / np.linalg.norm(u)
+
+    if tangent_v is not None:
+        v = np.array(tangent_v, dtype=np.float64)
+        v = v - np.dot(v, n) * n - np.dot(v, u) * u
+        v_len = np.linalg.norm(v)
+        if v_len > 1e-6:
+            v = v / v_len
+        else:
+            v = np.cross(n, u)
+            v = v / np.linalg.norm(v)
+    else:
+        v = np.cross(n, u)
+        v = v / np.linalg.norm(v)
 
     c0 = np.array(source_center, dtype=np.float64)
-    r_tap = max(d_step * 1.5, float(source_radius))
-
-    # Generate candidate (u, v) offsets on hexagonal grid
-    grid_span = int(math.ceil(r_tap / d_step)) + 2
     in_plane_offsets = []
 
-    for j in range(-grid_span, grid_span + 1):
-        v_coord = j * d_step * (math.sqrt(3.0) / 2.0)
-        u_off = (d_step * 0.5) if (j % 2 != 0) else 0.0
-        for i in range(-grid_span, grid_span + 1):
-            u_coord = i * d_step + u_off
-            dist_sq = u_coord**2 + v_coord**2
-            if dist_sq <= r_tap**2:
-                in_plane_offsets.append((u_coord, v_coord, dist_sq))
+    if size_u is not None and size_v is not None and float(size_u) > 1e-4 and float(size_v) > 1e-4:
+        # User-assigned rectangular mesh plane
+        # Inset boundary by max_r so spheres stay completely inside the plane surface
+        u_half = max(0.0, float(size_u) * 0.5 - max_r)
+        v_half = max(0.0, float(size_v) * 0.5 - max_r)
 
-    # Sort concentric inward to outward so inner tap slots fill first
+        num_u = max(1, int(math.floor(2.0 * u_half / d_step)) + 1) if u_half > 1e-5 else 1
+        num_v = max(1, int(math.floor(2.0 * v_half / d_step)) + 1) if v_half > 1e-5 else 1
+
+        u_coords = np.linspace(-u_half, u_half, num_u) if num_u > 1 else np.array([0.0])
+        v_coords = np.linspace(-v_half, v_half, num_v) if num_v > 1 else np.array([0.0])
+
+        for vc in v_coords:
+            for uc in u_coords:
+                in_plane_offsets.append((float(uc), float(vc), float(uc**2 + vc**2)))
+    else:
+        # Radial disc / circular tap
+        r_tap = max(d_step * 1.5, float(source_radius))
+        r_eff = max(0.0, r_tap - max_r)
+        grid_span = int(math.ceil(r_tap / d_step)) + 2
+
+        for j in range(-grid_span, grid_span + 1):
+            v_coord = j * d_step * (math.sqrt(3.0) / 2.0)
+            u_off = (d_step * 0.5) if (j % 2 != 0) else 0.0
+            for i in range(-grid_span, grid_span + 1):
+                u_coord = i * d_step + u_off
+                dist_sq = u_coord**2 + v_coord**2
+                if dist_sq <= (r_eff**2 if r_eff > 1e-5 else r_tap**2):
+                    in_plane_offsets.append((u_coord, v_coord, dist_sq))
+
+    if not in_plane_offsets:
+        in_plane_offsets.append((0.0, 0.0, 0.0))
+
+    # Sort concentric inward to outward so inner slots fill first
     in_plane_offsets.sort(key=lambda item: item[2])
     slots_per_layer = max(1, len(in_plane_offsets))
 
     positions = []
-    idx = 0
-    while len(positions) < ball_count:
-        layer_idx = idx // slots_per_layer
-        slot_idx = idx % slots_per_layer
-        u_c, v_c, _ = in_plane_offsets[slot_idx]
+    if planar_only:
+        # Fluid-style planar surface emission:
+        # All particles start strictly on the 2D surface of the plane.
+        # When ball_count exceeds slots_per_layer, slots are reused across emission waves
+        # since earlier particles fall downward under gravity during the inflow duration.
+        rng = np.random.RandomState(42)
+        perm = rng.permutation(slots_per_layer)
 
-        # Stack subsequent layers along +normal (downstream into the chamber)
-        layer_offset = n * (layer_idx * d_step)
-        pt = c0 + u_c * u + v_c * v + layer_offset
-        positions.append(pt)
-        idx += 1
+        for i in range(ball_count):
+            slot_idx = perm[i % slots_per_layer] if ball_count > slots_per_layer else i
+            u_c, v_c, _ = in_plane_offsets[slot_idx]
+            pt = c0 + u_c * u + v_c * v
+            positions.append(pt)
+    else:
+        # Multi-layer 3D stacking along +normal
+        idx = 0
+        while len(positions) < ball_count:
+            layer_idx = idx // slots_per_layer
+            slot_idx = idx % slots_per_layer
+            u_c, v_c, _ = in_plane_offsets[slot_idx]
+            layer_offset = n * (layer_idx * d_step)
+            pt = c0 + u_c * u + v_c * v + layer_offset
+            positions.append(pt)
+            idx += 1
 
-    return np.array(positions, dtype=np.float64)
+    pos_arr = np.array(positions, dtype=np.float64)
+    if return_capacity:
+        return pos_arr, slots_per_layer
+    return pos_arr
 
 
 def velocity_to_rainbow_rgb(v_mag: float, v_max: float = 6.0) -> tuple:
@@ -713,17 +780,29 @@ def solve_planetary_dem(
     env_mode = (kwargs.get("envelope_shape") or ("BOX" if shape_mode == "BOX" else "CYLINDER")).upper()
 
     cavity_info = kwargs.get("cavity_info")
+    inflow_rate_factor = float(kwargs.get("inflow_rate_factor", 1.0))
+    if inflow_rate_factor <= 0.0:
+        inflow_rate_factor = 1.0
+
     if use_source_plane:
         # Non-overlapping emission from 3D Source Tap / Plane inlet
         if source_plane_center is not None:
             tap_center = np.array(source_plane_center, dtype=np.float64)
             tap_normal = np.array(source_plane_normal or ([0.0, -1.0, 0.0] if is_horiz_z else [0.0, 0.0, -1.0]), dtype=np.float64)
             tap_radius = float(source_plane_radius or 0.15)
+            tap_tan_u = kwargs.get("source_plane_tangent_u")
+            tap_tan_v = kwargs.get("source_plane_tangent_v")
+            tap_size_u = kwargs.get("source_plane_size_u")
+            tap_size_v = kwargs.get("source_plane_size_v")
         elif cavity_info is not None and "inlet_pos_sim" in cavity_info:
             # Auto-position tap inlet at opening of detected interior cavity / inward extrusion
             tap_center = np.array(cavity_info["inlet_pos_sim"], dtype=np.float64)
             tap_normal = np.array([0.0, 0.0, -1.0], dtype=np.float64)
             tap_radius = min(float(cavity_info.get("cavity_radius_sim", 0.15)) * 0.70, 0.18)
+            tap_tan_u = None
+            tap_tan_v = None
+            tap_size_u = None
+            tap_size_v = None
         else:
             # Auto-position tap inlet at top of chamber
             if is_horiz_z:
@@ -736,6 +815,10 @@ def solve_planetary_dem(
                 tap_center = np.array([0.0, 0.0, half_h * 0.85], dtype=np.float64)
                 tap_normal = np.array([0.0, 0.0, -1.0], dtype=np.float64)
             tap_radius = min(effective_wall_r * 0.65, 0.18)
+            tap_tan_u = None
+            tap_tan_v = None
+            tap_size_u = None
+            tap_size_v = None
 
         pos = generate_non_overlapping_source_particles(
             ball_count=ball_count,
@@ -743,7 +826,12 @@ def solve_planetary_dem(
             source_center=tap_center,
             source_normal=tap_normal,
             source_radius=tap_radius,
+            tangent_u=tap_tan_u,
+            tangent_v=tap_tan_v,
+            size_u=tap_size_u,
+            size_v=tap_size_v,
             min_clearance_factor=1.15,
+            planar_only=True,
         )
     else:
         # Legacy random placement inside container volume
@@ -793,11 +881,24 @@ def solve_planetary_dem(
     omega = np.zeros_like(pos)
     theta = np.zeros_like(pos)
 
-    # -------------------------------------------------------------------------
-    # Pre-simulation Gravity Settling (Pack particles into a resting floor bed)
-    # -------------------------------------------------------------------------
-    if progress_callback:
-        progress_callback(2.0, "Pre-simulation settling: introducing non-overlapping particles into resting bed...")
+    # Fluid-style dynamic inflow scheduling across settle_delay_s
+    if use_source_plane and settle_delay_s > 0.05:
+        # Base inflow duration leaves a settling buffer for the last particles to settle into bed
+        base_inflow_t = max(0.05, min(settle_delay_s * 0.75, settle_delay_s - 0.25))
+        # Inflow speed multiplier speeds up (shorter duration) or slows down (longer duration) feed rate
+        t_inflow = min(settle_delay_s * 0.88, max(0.05, base_inflow_t / inflow_rate_factor))
+
+        if ball_count > 1:
+            t_spawn = np.linspace(0.0, t_inflow, ball_count, dtype=np.float64)
+        else:
+            t_spawn = np.zeros(ball_count, dtype=np.float64)
+    else:
+        t_spawn = np.zeros(ball_count, dtype=np.float64)
+
+    f_spawn = np.round(t_spawn * fps).astype(np.int32)
+    res.spawn_times = t_spawn
+    res.spawn_frames = f_spawn
+    spawn_positions = np.copy(pos)
 
     if ball_count > 1:
         iu0, iu1 = np.triu_indices(ball_count, k=1)
@@ -808,132 +909,137 @@ def solve_planetary_dem(
         min_dist_arr = np.array([], dtype=float)
         min_dist_sq_arr = np.array([], dtype=float)
 
-    dt_settle = max(0.004, dt * 2.0)
-    settle_steps = 180 if use_source_plane else 60
+    # Pre-simulation Gravity Settling (Pack particles into a resting floor bed for legacy volumetric placement only)
+    if not use_source_plane:
+        if progress_callback:
+            progress_callback(2.0, "Pre-simulation settling: introducing non-overlapping particles into resting bed...")
 
-    for step in range(settle_steps):
-        # Apply initial resting gravity downward along effective vertical axis
-        vel[:, settle_g_axis] -= gravity * dt_settle
-        pos += vel * dt_settle
+        dt_settle = max(0.004, dt * 2.0)
+        settle_steps = 60
 
-        # Floor and container boundary collision
-        if bvh_tree is not None:
-            # Exact 3D facet contact for meshes, modeled ridges, inward extrusions, and cavities
-            for idx in range(ball_count):
-                p_tuple = (float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2]))
-                p_vec = mathutils.Vector(p_tuple) if mathutils is not None else p_tuple
-                loc, face_normal, f_idx, dist = bvh_tree.find_nearest(p_vec)
-                r_i = radii[idx]
-                if loc is not None and dist < r_i:
-                    overlap = r_i - dist
-                    loc_arr = np.array([loc[0], loc[1], loc[2]], dtype=np.float64)
-                    delta = pos[idx] - loc_arr
-                    d_len = float(np.linalg.norm(delta))
-                    if d_len > 1e-7:
-                        n_vec = delta / d_len
-                    else:
-                        fn = np.array([face_normal[0], face_normal[1], face_normal[2]], dtype=np.float64) if face_normal is not None else np.array([0.0, 0.0, 1.0])
-                        fn_norm = np.linalg.norm(fn)
-                        n_vec = fn / fn_norm if fn_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
-                    pos[idx] += n_vec * overlap
-                    v_dot_n = float(np.dot(vel[idx], n_vec))
-                    if v_dot_n < 0:
-                        vel[idx] -= (1.0 + 0.15) * v_dot_n * n_vec
-                        vel[idx] *= 0.65
+        for step in range(settle_steps):
+            # Apply initial resting gravity downward along effective vertical axis
+            vel[:, settle_g_axis] -= gravity * dt_settle
+            pos += vel * dt_settle
 
-            # Outer boundary safety confinement
-            if env_mode == "CYLINDER":
-                r_sq = pos[:, r_ax1]**2 + pos[:, r_ax2]**2
-                rad_bound = effective_wall_r - radii
-                out = r_sq > (rad_bound**2)
-                if np.any(out):
-                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
-                    sc = rad_bound[out] / r_val
-                    pos[out, r_ax1] *= sc
-                    pos[out, r_ax2] *= sc
-                pos[:, end_ax] = np.clip(pos[:, end_ax], -half_h + radii, half_h - radii)
-            else:
+            # Floor and container boundary collision
+            if bvh_tree is not None:
+                # Exact 3D facet contact for meshes, modeled ridges, inward extrusions, and cavities
+                for idx in range(ball_count):
+                    p_tuple = (float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2]))
+                    p_vec = mathutils.Vector(p_tuple) if mathutils is not None else p_tuple
+                    loc, face_normal, f_idx, dist = bvh_tree.find_nearest(p_vec)
+                    r_i = radii[idx]
+                    if loc is not None and dist < r_i:
+                        overlap = r_i - dist
+                        loc_arr = np.array([loc[0], loc[1], loc[2]], dtype=np.float64)
+                        delta = pos[idx] - loc_arr
+                        d_len = float(np.linalg.norm(delta))
+                        if d_len > 1e-7:
+                            n_vec = delta / d_len
+                        else:
+                            fn = np.array([face_normal[0], face_normal[1], face_normal[2]], dtype=np.float64) if face_normal is not None else np.array([0.0, 0.0, 1.0])
+                            fn_norm = np.linalg.norm(fn)
+                            n_vec = fn / fn_norm if fn_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
+                        pos[idx] += n_vec * overlap
+                        v_dot_n = float(np.dot(vel[idx], n_vec))
+                        if v_dot_n < 0:
+                            vel[idx] -= (1.0 + 0.15) * v_dot_n * n_vec
+                            vel[idx] *= 0.65
+
+                # Outer boundary safety confinement
+                if env_mode == "CYLINDER":
+                    r_sq = pos[:, r_ax1]**2 + pos[:, r_ax2]**2
+                    rad_bound = effective_wall_r - radii
+                    out = r_sq > (rad_bound**2)
+                    if np.any(out):
+                        r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                        sc = rad_bound[out] / r_val
+                        pos[out, r_ax1] *= sc
+                        pos[out, r_ax2] *= sc
+                    pos[:, end_ax] = np.clip(pos[:, end_ax], -half_h + radii, half_h - radii)
+                else:
+                    pos[:, 0] = np.clip(pos[:, 0], -hx + radii, hx - radii)
+                    pos[:, 1] = np.clip(pos[:, 1], -hy + radii, hy - radii)
+                    pos[:, 2] = np.clip(pos[:, 2], -hz + radii, hz - radii)
+            elif shape_mode == "BOX":
+                hit_f = pos[:, settle_g_axis] < (-half_extents[settle_g_axis] + radii)
+                if np.any(hit_f):
+                    pos[hit_f, settle_g_axis] = -half_extents[settle_g_axis] + radii[hit_f]
+                    vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.15
+                    vel[hit_f, (settle_g_axis + 1) % 3] *= 0.70
+                    vel[hit_f, (settle_g_axis + 2) % 3] *= 0.70
                 pos[:, 0] = np.clip(pos[:, 0], -hx + radii, hx - radii)
                 pos[:, 1] = np.clip(pos[:, 1], -hy + radii, hy - radii)
                 pos[:, 2] = np.clip(pos[:, 2], -hz + radii, hz - radii)
-        elif shape_mode == "BOX":
-            hit_f = pos[:, settle_g_axis] < (-half_extents[settle_g_axis] + radii)
-            if np.any(hit_f):
-                pos[hit_f, settle_g_axis] = -half_extents[settle_g_axis] + radii[hit_f]
-                vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.15
-                vel[hit_f, (settle_g_axis + 1) % 3] *= 0.70
-                vel[hit_f, (settle_g_axis + 2) % 3] *= 0.70
-            pos[:, 0] = np.clip(pos[:, 0], -hx + radii, hx - radii)
-            pos[:, 1] = np.clip(pos[:, 1], -hy + radii, hy - radii)
-            pos[:, 2] = np.clip(pos[:, 2], -hz + radii, hz - radii)
-        else:
-            floor_limit = -(effective_wall_r - radii) if (is_horiz_z or axis_c in ("X", "Y")) else -(half_h - radii)
-            hit_f = pos[:, settle_g_axis] < floor_limit
-            if np.any(hit_f):
-                pos[hit_f, settle_g_axis] = floor_limit[hit_f] if isinstance(floor_limit, np.ndarray) else floor_limit
-                vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.15
-                vel[hit_f, (settle_g_axis + 1) % 3] *= 0.70
-                vel[hit_f, (settle_g_axis + 2) % 3] *= 0.70
+            else:
+                floor_limit = -(effective_wall_r - radii) if (is_horiz_z or axis_c in ("X", "Y")) else -(half_h - radii)
+                hit_f = pos[:, settle_g_axis] < floor_limit
+                if np.any(hit_f):
+                    pos[hit_f, settle_g_axis] = floor_limit[hit_f] if isinstance(floor_limit, np.ndarray) else floor_limit
+                    vel[hit_f, settle_g_axis] = -vel[hit_f, settle_g_axis] * 0.15
+                    vel[hit_f, (settle_g_axis + 1) % 3] *= 0.70
+                    vel[hit_f, (settle_g_axis + 2) % 3] *= 0.70
 
-            # Keep radial confinement during settling
-            if axis_c == "Y":
-                r_sq = pos[:, 0]**2 + pos[:, 2]**2
-                rad_bound = effective_wall_r - radii
-                out = r_sq > (rad_bound**2)
-                if np.any(out):
-                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
-                    sc = rad_bound[out] / r_val
-                    pos[out, 0] *= sc
-                    pos[out, 2] *= sc
-                pos[:, 1] = np.clip(pos[:, 1], -half_h + radii, half_h - radii)
-            elif axis_c == "X":
-                r_sq = pos[:, 1]**2 + pos[:, 2]**2
-                rad_bound = effective_wall_r - radii
-                out = r_sq > (rad_bound**2)
-                if np.any(out):
-                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
-                    sc = rad_bound[out] / r_val
-                    pos[out, 1] *= sc
-                    pos[out, 2] *= sc
-                pos[:, 0] = np.clip(pos[:, 0], -half_h + radii, half_h - radii)
-            else:  # Z
-                r_sq = pos[:, 0]**2 + pos[:, 1]**2
-                rad_bound = effective_wall_r - radii
-                out = r_sq > (rad_bound**2)
-                if np.any(out):
-                    r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
-                    sc = rad_bound[out] / r_val
-                    pos[out, 0] *= sc
-                    pos[out, 1] *= sc
-                pos[:, 2] = np.clip(pos[:, 2], -half_h + radii, half_h - radii)
+                # Keep radial confinement during settling
+                if axis_c == "Y":
+                    r_sq = pos[:, 0]**2 + pos[:, 2]**2
+                    rad_bound = effective_wall_r - radii
+                    out = r_sq > (rad_bound**2)
+                    if np.any(out):
+                        r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                        sc = rad_bound[out] / r_val
+                        pos[out, 0] *= sc
+                        pos[out, 2] *= sc
+                    pos[:, 1] = np.clip(pos[:, 1], -half_h + radii, half_h - radii)
+                elif axis_c == "X":
+                    r_sq = pos[:, 1]**2 + pos[:, 2]**2
+                    rad_bound = effective_wall_r - radii
+                    out = r_sq > (rad_bound**2)
+                    if np.any(out):
+                        r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                        sc = rad_bound[out] / r_val
+                        pos[out, 1] *= sc
+                        pos[out, 2] *= sc
+                    pos[:, 0] = np.clip(pos[:, 0], -half_h + radii, half_h - radii)
+                else:  # Z
+                    r_sq = pos[:, 0]**2 + pos[:, 1]**2
+                    rad_bound = effective_wall_r - radii
+                    out = r_sq > (rad_bound**2)
+                    if np.any(out):
+                        r_val = np.sqrt(np.maximum(1e-9, r_sq[out]))
+                        sc = rad_bound[out] / r_val
+                        pos[out, 0] *= sc
+                        pos[out, 1] *= sc
+                    pos[:, 2] = np.clip(pos[:, 2], -half_h + radii, half_h - radii)
 
-        # Fast ball-ball repulsion during pre-settle
-        if ball_count > 1:
-            diffs = pos[iu0] - pos[iu1]
-            d2 = diffs[:, 0]**2 + diffs[:, 1]**2 + diffs[:, 2]**2
-            hit_m = d2 < min_dist_sq_arr
-            if np.any(hit_m):
-                indices = np.where(hit_m)[0]
-                for k in indices:
-                    i, j = iu0[k], iu1[k]
-                    d = math.sqrt(max(1e-9, d2[k]))
-                    overlap = min_dist_arr[k] - d
-                    n = diffs[k] / d
-                    pos[i] += n * (overlap * 0.5)
-                    pos[j] -= n * (overlap * 0.5)
-                    vel[i] *= 0.85
-                    vel[j] *= 0.85
+            # Fast ball-ball repulsion during pre-settle
+            if ball_count > 1:
+                diffs = pos[iu0] - pos[iu1]
+                d2 = diffs[:, 0]**2 + diffs[:, 1]**2 + diffs[:, 2]**2
+                hit_m = d2 < min_dist_sq_arr
+                if np.any(hit_m):
+                    indices = np.where(hit_m)[0]
+                    for k in indices:
+                        i, j = iu0[k], iu1[k]
+                        d = math.sqrt(max(1e-9, d2[k]))
+                        overlap = min_dist_arr[k] - d
+                        n = diffs[k] / d
+                        pos[i] += n * (overlap * 0.5)
+                        pos[j] -= n * (overlap * 0.5)
+                        vel[i] *= 0.85
+                        vel[j] *= 0.85
 
-        # In flight: slight air resistance; in the final stages of settling, rapidly damp residual motion
-        if step < settle_steps - 40:
-            vel *= 0.985
-        else:
-            vel *= 0.88
+            # In flight: slight air resistance; in the final stages of settling, rapidly damp residual motion
+            if step < settle_steps - 40:
+                vel *= 0.985
+            else:
+                vel *= 0.88
 
-    # Ensure resting bed starts with zero velocity, zero angular velocity, and zero rotation
-    vel.fill(0.0)
-    omega.fill(0.0)
-    theta.fill(0.0)
+        # Ensure resting bed starts with zero velocity, zero angular velocity, and zero rotation
+        vel.fill(0.0)
+        omega.fill(0.0)
+        theta.fill(0.0)
 
     impact_count = 0
     impact_energies = []
@@ -993,6 +1099,16 @@ def solve_planetary_dem(
         impacts_in_this_frame = 0
 
         for _ in range(substeps_per_frame):
+            active_mask = (current_time >= (t_spawn - 1e-9))
+            any_active = np.any(active_mask)
+
+            # Pin unspawned particles at source plane inlet
+            if not np.all(active_mask):
+                pos[~active_mask] = spawn_positions[~active_mask]
+                vel[~active_mask] = 0.0
+                omega[~active_mask] = 0.0
+                theta[~active_mask] = 0.0
+
             # Compute accelerations (respects settle_delay_s, rotation_axis, and variable linear ramp)
             acc_kin = compute_planetary_accelerations(
                 pos, vel, omega_sun, omega_jar, r_sun, current_time,
@@ -1006,11 +1122,20 @@ def solve_planetary_dem(
                 sun_rpm_end=sun_rpm_end, sun_ramp_duration=sun_ramp_duration,
             )
 
-            if integrator == "VELOCITY_VERLET":
-                pos += vel * dt + 0.5 * acc_kin * (dt**2)
-            else:
-                vel += acc_kin * dt
-                pos += vel * dt
+            if not np.all(active_mask):
+                acc_kin[~active_mask] = 0.0
+
+            if any_active:
+                if integrator == "VELOCITY_VERLET":
+                    pos[active_mask] += vel[active_mask] * dt + 0.5 * acc_kin[active_mask] * (dt**2)
+                else:
+                    vel[active_mask] += acc_kin[active_mask] * dt
+                    pos[active_mask] += vel[active_mask] * dt
+
+                # In live settling phase:
+                # Mild aerodynamic damping helps falling particles dissipate kinetic energy and settle into resting bed
+                if current_time < (settle_delay_s - 1e-5):
+                    vel[active_mask] *= 0.996
 
             current_time += dt
 
@@ -1035,12 +1160,13 @@ def solve_planetary_dem(
             else:
                 w_jar_vec = np.array([0.0, 0.0, w_jar_act])
 
-            if abs(w_jar_act) > 1e-4:
-                w_gyro = -np.cross(w_jar_vec, omega)
-                omega += w_gyro * dt
+            if abs(w_jar_act) > 1e-4 and any_active:
+                w_gyro = -np.cross(w_jar_vec, omega[active_mask])
+                omega[active_mask] += w_gyro * dt
 
             # Integrated angular orientation (continuous Euler angles in radians)
-            theta += omega * dt
+            if any_active:
+                theta[active_mask] += omega[active_mask] * dt
 
             # -------------------------------------------------------------
             # Wall Collisions: Generalized for BOX, CYLINDER, or MESH
@@ -1049,7 +1175,7 @@ def solve_planetary_dem(
                 # 6-Plane Box Boundaries (X, Y, Z)
                 for ax, h_val in ((0, hx), (1, hy), (2, hz)):
                     # Min boundary (-h_val)
-                    hit_min = pos[:, ax] < (-h_val + radii)
+                    hit_min = (pos[:, ax] < (-h_val + radii)) & active_mask
                     if np.any(hit_min):
                         in_indices = np.where(hit_min)[0]
                         n_vec = np.zeros(3)
@@ -1078,7 +1204,7 @@ def solve_planetary_dem(
                                 record_wall_impact(idx, loc_wall, n_vec, jn, e_imp, abs(vel[idx, ax]))
 
                     # Max boundary (+h_val)
-                    hit_max = pos[:, ax] > (h_val - radii)
+                    hit_max = (pos[:, ax] > (h_val - radii)) & active_mask
                     if np.any(hit_max):
                         in_indices = np.where(hit_max)[0]
                         n_vec = np.zeros(3)
@@ -1110,7 +1236,7 @@ def solve_planetary_dem(
                 # Radial wall & endcaps (dynamically aligned to rotation/cylinder axis)
                 radial_dist = np.sqrt(pos[:, r_ax1] ** 2 + pos[:, r_ax2] ** 2)
                 wall_overlap = radial_dist - (cyl_r - radii)
-                hitting_wall = wall_overlap > 0.0
+                hitting_wall = (wall_overlap > 0.0) & active_mask
 
                 if np.any(hitting_wall):
                     indices = np.where(hitting_wall)[0]
@@ -1150,7 +1276,7 @@ def solve_planetary_dem(
                             v_norm_c = abs(vel[idx, r_ax1] * norm1 + vel[idx, r_ax2] * norm2)
                             record_wall_impact(idx, loc_wall, n_vec, jn, e_imp, v_norm_c)
 
-                bottom_hit = pos[:, end_ax] < (-cyl_half_len + radii)
+                bottom_hit = (pos[:, end_ax] < (-cyl_half_len + radii)) & active_mask
                 if np.any(bottom_hit):
                     in_indices = np.where(bottom_hit)[0]
                     n_vec = np.zeros(3, dtype=np.float64)
@@ -1178,7 +1304,7 @@ def solve_planetary_dem(
                             loc_wall[end_ax] = -cyl_half_len
                             record_wall_impact(idx, loc_wall, n_vec, jn, e_imp, abs(vel[idx, end_ax]))
 
-                top_hit = pos[:, end_ax] > (cyl_half_len - radii)
+                top_hit = (pos[:, end_ax] > (cyl_half_len - radii)) & active_mask
                 if np.any(top_hit):
                     in_indices = np.where(top_hit)[0]
                     n_vec = np.zeros(3, dtype=np.float64)
@@ -1211,7 +1337,8 @@ def solve_planetary_dem(
                 # 3D MESH / CAD Container (Modeled Ridges, Lifter Bars, Baffles)
                 # -------------------------------------------------------------
                 if bvh_tree is not None:
-                    for idx in range(ball_count):
+                    active_indices = np.where(active_mask)[0]
+                    for idx in active_indices:
                         p_tuple = (float(pos[idx, 0]), float(pos[idx, 1]), float(pos[idx, 2]))
                         p_vec = mathutils.Vector(p_tuple) if mathutils is not None else p_tuple
                         loc, face_normal, f_idx, dist = bvh_tree.find_nearest(p_vec)
@@ -1269,28 +1396,31 @@ def solve_planetary_dem(
                 if env_mode == "CYLINDER":
                     r_dist = np.sqrt(pos[:, r_ax1] ** 2 + pos[:, r_ax2] ** 2)
                     wall_excess = r_dist - (cyl_r - radii)
-                    escaped = wall_excess > 0.0
+                    escaped = (wall_excess > 0.0) & active_mask
                     if np.any(escaped):
                         esc_idx = np.where(escaped)[0]
                         for ei in esc_idx:
                             rd = max(1e-6, r_dist[ei])
                             pos[ei, r_ax1] -= (pos[ei, r_ax1] / rd) * wall_excess[ei]
                             pos[ei, r_ax2] -= (pos[ei, r_ax2] / rd) * wall_excess[ei]
-                    pos[:, end_ax] = np.clip(pos[:, end_ax], -cyl_half_len + radii, cyl_half_len - radii)
+                    if np.any(active_mask):
+                        pos[active_mask, end_ax] = np.clip(pos[active_mask, end_ax], -cyl_half_len + radii[active_mask], cyl_half_len - radii[active_mask])
                 else:
                     # BOX containment: Cartesian extents [-hx, hx], [-hy, hy], [-hz, hz]
                     # Allows particles to freely enter corners without circular radial clamping
-                    pos[:, 0] = np.clip(pos[:, 0], -hx + radii, hx - radii)
-                    pos[:, 1] = np.clip(pos[:, 1], -hy + radii, hy - radii)
-                    pos[:, 2] = np.clip(pos[:, 2], -hz + radii, hz - radii)
+                    if np.any(active_mask):
+                        pos[active_mask, 0] = np.clip(pos[active_mask, 0], -hx + radii[active_mask], hx - radii[active_mask])
+                        pos[active_mask, 1] = np.clip(pos[active_mask, 1], -hy + radii[active_mask], hy - radii[active_mask])
+                        pos[active_mask, 2] = np.clip(pos[active_mask, 2], -hz + radii[active_mask], hz - radii[active_mask])
 
             # -------------------------------------------------------------
             # Particle-Particle Collisions (Media Impacts)
             # -------------------------------------------------------------
-            if ball_count > 1:
+            if ball_count > 1 and np.count_nonzero(active_mask) > 1:
                 diffs = pos[iu0] - pos[iu1]
                 d2 = diffs[:, 0]**2 + diffs[:, 1]**2 + diffs[:, 2]**2
-                hit_mask = d2 < min_dist_sq_arr
+                pair_active = active_mask[iu0] & active_mask[iu1]
+                hit_mask = (d2 < min_dist_sq_arr) & pair_active
                 if np.any(hit_mask):
                     hit_k_indices = np.where(hit_mask)[0]
                     for hit_k in hit_k_indices:
@@ -1363,7 +1493,7 @@ def solve_planetary_dem(
                                 rolling_friction=rolling_friction,
                             )
 
-            if integrator == "VELOCITY_VERLET":
+            if integrator == "VELOCITY_VERLET" and any_active:
                 # Step 2: Final velocity update via Velocity Verlet
                 acc_kin_new = compute_planetary_accelerations(
                     pos, vel, omega_sun, omega_jar, r_sun, current_time,
@@ -1376,7 +1506,13 @@ def solve_planetary_dem(
                     sun_rpm_mode=sun_rpm_mode, sun_rpm_start=sun_rpm_start,
                     sun_rpm_end=sun_rpm_end, sun_ramp_duration=sun_ramp_duration,
                 )
-                vel += 0.5 * (acc_kin + acc_kin_new) * dt
+                if not np.all(active_mask):
+                    acc_kin_new[~active_mask] = 0.0
+                vel[active_mask] += 0.5 * (acc_kin[active_mask] + acc_kin_new[active_mask]) * dt
+
+        if not np.all(active_mask):
+            frame_forces[~active_mask] = 0.0
+            frame_impact_forces[~active_mask] = 0.0
 
         # Frame summary recording
         res.forces[f, :] = frame_forces
@@ -1473,7 +1609,10 @@ def instantiate_dem_particles_in_blender(
     coll = bpy.data.collections.get(collection_name)
     if not coll:
         coll = bpy.data.collections.new(collection_name)
-        context.scene.collection.children.link(coll)
+        if hasattr(context.scene.collection.children, "link"):
+            context.scene.collection.children.link(coll)
+        elif hasattr(context.scene.collection.children, "append"):
+            context.scene.collection.children.append(coll)
 
     coll.hide_viewport = False
     coll.hide_render = False
@@ -1572,16 +1711,67 @@ def instantiate_dem_particles_in_blender(
 
     # Create individual particles parented to rotating jar
     ball_objects = []
+    spawn_frames = getattr(result, "spawn_frames", None)
+    if spawn_frames is None or len(spawn_frames) != num_balls:
+        spawn_frames = np.zeros(num_balls, dtype=np.int32)
+
     for i in range(num_balls):
         ball_copy = ref_ball.copy()
         ball_copy.name = f"DEM_Media_{i+1:03d}"
         ball_copy.parent = jar_obj
         # Exact PSD physical scaling compensating for parent scale
         r_i = float(radii[i])
-        ball_copy.scale = (r_i / parent_scale[0], r_i / parent_scale[1], r_i / parent_scale[2])
+        full_scale = (r_i / parent_scale[0], r_i / parent_scale[1], r_i / parent_scale[2])
+        ball_copy.scale = full_scale
         ball_copy.color = (0.85, 0.88, 0.92, 1.0)
         coll.objects.link(ball_copy)
         ball_objects.append(ball_copy)
+
+        # Fluid-style dynamic appearance:
+        # Hide unspawned particle prior to its spawn frame, then pop into existence
+        f_sp = int(spawn_frames[i]) + 1  # Blender 1-based frame
+        if f_sp > 1:
+            tiny_scale = (1e-4, 1e-4, 1e-4)
+            ball_copy.scale = tiny_scale
+            ball_copy.hide_viewport = True
+            ball_copy.hide_render = True
+            ball_copy.keyframe_insert(data_path="scale", frame=1)
+            try:
+                ball_copy.keyframe_insert(data_path="hide_viewport", frame=1)
+                ball_copy.keyframe_insert(data_path="hide_render", frame=1)
+            except Exception:
+                pass
+
+            if f_sp > 2:
+                ball_copy.scale = tiny_scale
+                ball_copy.hide_viewport = True
+                ball_copy.hide_render = True
+                ball_copy.keyframe_insert(data_path="scale", frame=f_sp - 1)
+                try:
+                    ball_copy.keyframe_insert(data_path="hide_viewport", frame=f_sp - 1)
+                    ball_copy.keyframe_insert(data_path="hide_render", frame=f_sp - 1)
+                except Exception:
+                    pass
+
+            ball_copy.scale = full_scale
+            ball_copy.hide_viewport = False
+            ball_copy.hide_render = False
+            ball_copy.keyframe_insert(data_path="scale", frame=f_sp)
+            try:
+                ball_copy.keyframe_insert(data_path="hide_viewport", frame=f_sp)
+                ball_copy.keyframe_insert(data_path="hide_render", frame=f_sp)
+            except Exception:
+                pass
+        else:
+            ball_copy.scale = full_scale
+            ball_copy.hide_viewport = False
+            ball_copy.hide_render = False
+            ball_copy.keyframe_insert(data_path="scale", frame=1)
+            try:
+                ball_copy.keyframe_insert(data_path="hide_viewport", frame=1)
+                ball_copy.keyframe_insert(data_path="hide_render", frame=1)
+            except Exception:
+                pass
 
     # Hide reference prototype object
     ref_ball.hide_viewport = True
@@ -1627,6 +1817,11 @@ def instantiate_dem_particles_in_blender(
                 ball.keyframe_insert(data_path="rotation_euler", frame=frame_num)
 
             if bake_colors:
+                if f < spawn_frames[i]:
+                    ball.color = (0.0, 0.0, 0.0, 0.0)
+                    ball.keyframe_insert(data_path="color", frame=frame_num)
+                    continue
+
                 vel_vec = result.velocities[f, i, :]
                 v_mag = float(np.linalg.norm(vel_vec))
                 v_norm = min(1.0, max(0.0, v_mag / max(1e-4, max_v)))

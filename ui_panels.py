@@ -246,12 +246,14 @@ def draw_step_2_kinematics(layout, context, props):
     # Fluid-Style Inflow Surface / Particle Tap Control
     box_tap = col.box()
     r_tap = box_tap.row(align=True)
-    r_tap.prop(props, "dem_use_source_plane", text="Inflow Plane (Fluid Emitter)", icon="SNAP_GRID")
+    r_tap.prop(props, "dem_use_source_plane", text="Particles 3D Source (Inflow)", icon="SNAP_GRID")
     if getattr(props, "dem_use_source_plane", True):
         c_tap = box_tap.column(align=True)
         r_sel = c_tap.row(align=True)
-        r_sel.prop(props, "dem_source_plane_obj", text="Inflow Plane")
+        r_sel.prop(props, "dem_source_plane_obj", text="Particles 3D Source")
         r_sel.operator("science_blocks.create_particle_source_plane", text="", icon="ADD")
+        arrow_icon = "HIDE_OFF" if getattr(props, "dem_show_inflow_arrow", True) else "HIDE_ON"
+        r_sel.prop(props, "dem_show_inflow_arrow", text="", icon=arrow_icon)
 
         r_flow = c_tap.row(align=True)
         r_flow.prop(props, "dem_settle_delay_s", text="Settle Time (s)")
@@ -378,6 +380,27 @@ def draw_scientific_styling_panel(layout, context, props):
     row_jc.prop(props, "sci_jar_opacity", text="Opacity")
     row_jc.prop(props, "sci_jar_metallic", text="Metallic")
     c_obj.prop(props, "sci_jar_roughness", text="Roughness")
+
+    c_obj.separator(factor=0.2)
+    box_edge = c_obj.box()
+    row_edge = box_edge.row(align=True)
+    row_edge.prop(props, "sci_jar_edge_lines", text="Visible Edge Lines", icon="MOD_WIREFRAME")
+    if getattr(props, "sci_jar_edge_lines", False):
+        col_edge = box_edge.column(align=True)
+        r_ecol = col_edge.row(align=True)
+        r_ecol.prop(props, "sci_jar_edge_color", text="Line Color")
+        r_ecol.prop(props, "sci_jar_edge_width", text="Width (px)")
+
+        r_qedge = col_edge.row(align=True)
+        r_qedge.scale_y = 0.95
+        op_eb = r_qedge.operator("science_blocks.set_chamber_edge_color", text="Black", icon="SHADING_SOLID")
+        op_eb.color_preset = "BLACK"
+        op_ew = r_qedge.operator("science_blocks.set_chamber_edge_color", text="White", icon="SNAP_FACE")
+        op_ew.color_preset = "WHITE"
+        op_es = r_qedge.operator("science_blocks.set_chamber_edge_color", text="Slate", icon="IMAGE_PLANE")
+        op_es.color_preset = "SLATE"
+        op_ea = r_qedge.operator("science_blocks.set_chamber_edge_color", text="Accent", icon="COLOR")
+        op_ea.color_preset = "ACCENT"
 
     c_obj.separator(factor=0.25)
     # Sun Wheel Carrier Plate

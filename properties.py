@@ -45,6 +45,8 @@ def update_jar_finish_preset(self, context):
         self.sci_jar_opacity = 0.28
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.12
+        self.sci_jar_edge_color = (0.10, 0.12, 0.16)
+        self.sci_jar_edge_width = 1.2
     elif finish == "STAINLESS_STEEL":
         self.sci_jar_color = (0.84, 0.86, 0.88)
         self.sci_jar_opacity = 1.0
@@ -91,6 +93,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.28
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.12
+        self.sci_jar_edge_color = (0.10, 0.12, 0.16)
+        self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "STEEL"
         self.sci_sphere_color = (0.85, 0.88, 0.92)
         self.sci_sphere_metallic = 0.95
@@ -110,6 +114,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.60
         self.sci_jar_metallic = 0.0
         self.sci_jar_roughness = 0.22
+        self.sci_jar_edge_color = (0.25, 0.28, 0.32)
+        self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "CERAMIC"
         self.sci_sphere_color = (0.95, 0.95, 0.92)
         self.sci_sphere_metallic = 0.0
@@ -129,6 +135,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 1.0
         self.sci_jar_metallic = 0.92
         self.sci_jar_roughness = 0.18
+        self.sci_jar_edge_color = (0.05, 0.05, 0.08)
+        self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "STEEL"
         self.sci_sphere_color = (0.90, 0.92, 0.95)
         self.sci_sphere_metallic = 0.98
@@ -148,6 +156,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.30
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.15
+        self.sci_jar_edge_color = (0.0, 0.85, 0.95)
+        self.sci_jar_edge_width = 1.5
         self.sci_sphere_preset = "TUNGSTEN"
         self.sci_sphere_color = (0.24, 0.26, 0.28)
         self.sci_sphere_metallic = 0.88
@@ -167,6 +177,8 @@ def update_scientific_preset(self, context):
         self.sci_jar_opacity = 0.25
         self.sci_jar_metallic = 0.10
         self.sci_jar_roughness = 0.12
+        self.sci_jar_edge_color = (0.10, 0.12, 0.16)
+        self.sci_jar_edge_width = 1.2
         self.sci_sphere_preset = "STEEL"
         self.sci_sphere_color = (0.85, 0.88, 0.92)
         self.sci_sphere_metallic = 0.95
@@ -196,6 +208,19 @@ def update_gravity_arrow_orientation(self, context):
         nodes.evaluate_kinematics_frame(scene)
     except Exception:
         pass
+
+
+def update_inflow_direction_arrow(self, context):
+    """Callback triggered whenever inflow plane, use-source-plane, or inflow arrow visibility is changed."""
+    try:
+        from . import operators
+        operators.create_or_update_inflow_direction_arrow(context, props=self)
+    except Exception:
+        try:
+            import operators
+            operators.create_or_update_inflow_direction_arrow(context, props=self)
+        except Exception:
+            pass
 
 
 class ScienceBlocksProperties(bpy.types.PropertyGroup):
@@ -308,6 +333,30 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         default=0.15,
         min=0.0,
         max=1.0,
+        update=update_scientific_styling,
+    )
+    sci_jar_edge_lines: BoolProperty(
+        name="Visible Edge Lines",
+        description="Display visible edge lines / technical wireframe outlines on the chamber wall",
+        default=False,
+        update=update_scientific_styling,
+    )
+    sci_jar_edge_color: FloatVectorProperty(
+        name="Edge Line Color",
+        subtype="COLOR",
+        size=3,
+        default=(0.10, 0.12, 0.16),
+        min=0.0,
+        max=1.0,
+        description="Color of the chamber edge lines / wireframe outlines",
+        update=update_scientific_styling,
+    )
+    sci_jar_edge_width: FloatProperty(
+        name="Edge Line Width",
+        description="Thickness of the chamber edge lines in pixels",
+        default=1.2,
+        min=0.2,
+        max=10.0,
         update=update_scientific_styling,
     )
 
@@ -1058,14 +1107,22 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         subtype="FILE_PATH",
     )
     dem_source_plane_obj: PointerProperty(
-        name="Source Tap / Plane",
+        name="Particles 3D Source",
         type=bpy.types.Object,
-        description="Source tap or planar inlet object that introduces particles into the jar without overlap",
+        description="Custom 3D object, source tap or planar inlet that introduces particles into the jar without overlap",
+        update=update_inflow_direction_arrow,
     )
     dem_use_source_plane: BoolProperty(
-        name="Use Source Tap",
-        description="Feed particles into the jar through a non-overlapping planar source tap",
+        name="Use Particles 3D Source",
+        description="Feed particles into the jar through a custom 3D source object or planar source tap",
         default=True,
+        update=update_inflow_direction_arrow,
+    )
+    dem_show_inflow_arrow: BoolProperty(
+        name="Show Inflow Arrow",
+        description="Display 3D arrow in viewport indicating particle inflow direction from the source plane into the chamber",
+        default=True,
+        update=update_inflow_direction_arrow,
     )
     dem_inflow_rate_factor: FloatProperty(
         name="Inflow Feed Speed",

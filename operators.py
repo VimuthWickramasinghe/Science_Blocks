@@ -9,10 +9,12 @@ import math
 import struct
 import mathutils
 try:
-    from mathutils import Vector, Matrix
+    from mathutils import Vector, Matrix, Euler, Quaternion
 except ImportError:
     Vector = getattr(mathutils, "Vector", None)
     Matrix = getattr(mathutils, "Matrix", None)
+    Euler = getattr(mathutils, "Euler", None)
+    Quaternion = getattr(mathutils, "Quaternion", None)
 import bmesh
 import subprocess
 import shutil
@@ -2683,21 +2685,36 @@ def resolve_source_plane_object(context, props=None, solver_node=None, jar_obj=N
     if props:
         source_obj = getattr(props, "dem_source_plane_obj", None)
 
-    # Priority 2: Target solver node's "Source Tap / Plane" input socket
+    # Priority 2: Target solver node's "Particles Input" or "Source Tap / Plane" input socket
     if not source_obj and solver_node and hasattr(solver_node, "inputs"):
-        sock_tap = solver_node.inputs.get("Source Tap / Plane")
+        sock_tap = solver_node.inputs.get("Particles Input") or solver_node.inputs.get("Source Tap / Plane")
         if sock_tap and getattr(sock_tap, "is_linked", False):
             source_obj = resolve_object_from_socket(sock_tap)
 
     # Priority 3: Inspect other solver nodes in active tree
     tree = get_effective_node_tree(context, props) if (context or props) else None
     if not source_obj and tree:
-        for node in tree.nodes:
+        for node in getattr(tree, "nodes", []):
             if node.bl_idname in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
-                sock = node.inputs.get("Source Tap / Plane")
+                sock = node.inputs.get("Particles Input") or node.inputs.get("Source Tap / Plane")
                 if sock and getattr(sock, "is_linked", False):
                     source_obj = resolve_object_from_socket(sock)
                     if source_obj:
+                        break
+
+    # Priority 3.5: Inspect dedicated Particle Source nodes or 3D Object nodes configured for PARTICLES in active tree
+    if not source_obj and tree:
+        for node in getattr(tree, "nodes", []):
+            if getattr(node, "bl_idname", "") == "ScienceBlocksParticleSourceNode":
+                target = getattr(node, "target_object", None)
+                if target:
+                    source_obj = target
+                    break
+            elif getattr(node, "bl_idname", "") == "ScienceBlocksObjectNode":
+                if getattr(node, "object_role", "") == "PARTICLES":
+                    target = getattr(node, "target_object", None)
+                    if target:
+                        source_obj = target
                         break
 
     # Priority 4: Object named 'Particle_Tap_Inlet' or 'Source_Tap' in scene
@@ -2827,6 +2844,396 @@ def extract_source_plane_geometry(source_plane_obj, jar_obj, effective_gravity=(
         return None
 
 
+def get_or_create_inflow_arrow_mesh() -> bpy.types.Mesh:
+    """Generate or retrieve a 3D arrow mesh indicating particle inflow direction from the source plane."""
+    mesh_name = "DEM_Inflow_Arrow_Mesh"
+    mesh = bpy.data.meshes.get(mesh_name) if hasattr(bpy, "data") and hasattr(bpy.data, "meshes") else None
+    if mesh:
+        return mesh
+
+    mesh = bpy.data.meshes.new(mesh_name)
+    if hasattr(bmesh, "new") and hasattr(bmesh, "ops"):
+        bm = bmesh.new()
+
+        # Cylindrical shaft along -Z:
+        # Starts at z = 0 (touching plane), extends down to z = -0.22, radius = 0.018
+        shaft_matrix = mathutils.Matrix.Translation((0, 0, -0.11))
+        bmesh.ops.create_cone(
+            bm,
+            cap_ends=True,
+            segments=16,
+            radius1=0.018,
+            radius2=0.018,
+            depth=0.22,
+            matrix=shaft_matrix,
+        )
+
+        # Conical arrowhead along -Z:
+        # Base at z = -0.22 (radius 0.048), tip at z = -0.34 (radius 0.0)
+        # Center of cone is at z = -0.28, depth = 0.12
+        # In bmesh.ops.create_cone:
+        # radius1 is at z = -depth/2 (-0.06 -> z = -0.34), radius2 is at z = +depth/2 (+0.06 -> z = -0.22)
+        head_matrix = mathutils.Matrix.Translation((0, 0, -0.28))
+        bmesh.ops.create_cone(
+            bm,
+            cap_ends=True,
+            segments=16,
+            radius1=0.0,
+            radius2=0.048,
+            depth=0.12,
+            matrix=head_matrix,
+        )
+
+        bm.to_mesh(mesh)
+        bm.free()
+    elif hasattr(mesh, "from_pydata"):
+        # Fallback for headless / mock environments without bmesh
+        mesh.from_pydata([(0, 0, 0), (0, 0, -0.22), (0, 0, -0.34)], [], [])
+    return mesh
+
+
+def get_or_create_inflow_arrow_material() -> bpy.types.Material:
+    """Creates a vivid glowing fluorescent teal/cyan material for the inflow direction arrow."""
+    mat_name = "DEM_Inflow_Arrow_Material"
+    mat = bpy.data.materials.get(mat_name) if hasattr(bpy, "data") and hasattr(bpy.data, "materials") else None
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        n_out = nodes.new("ShaderNodeOutputMaterial")
+        n_out.location = (300, 0)
+        n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        n_bsdf.location = (0, 0)
+
+        # Fluorescent cyan/teal
+        cyan_color = (0.05, 0.90, 1.0, 1.0)
+        if "Base Color" in n_bsdf.inputs:
+            n_bsdf.inputs["Base Color"].default_value = cyan_color
+        if "Emission Color" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Color"].default_value = cyan_color
+        elif "Emission" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission"].default_value = cyan_color
+        if "Emission Strength" in n_bsdf.inputs:
+            n_bsdf.inputs["Emission Strength"].default_value = 1.6
+        if "Roughness" in n_bsdf.inputs:
+            n_bsdf.inputs["Roughness"].default_value = 0.15
+
+        links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+    return mat
+
+
+def _safe_normalize_vector(vec):
+    """Safely normalizes a 3D vector across standard mathutils or custom vector mock types."""
+    if hasattr(vec, "normalized"):
+        return vec.normalized()
+    l = getattr(vec, "length", None)
+    if l is None:
+        l = math.sqrt(sum(float(vec[i])**2 for i in range(3)))
+    if l > 1e-9:
+        if hasattr(vec, "normalize"):
+            c = vec.copy() if hasattr(vec, "copy") else Vector(vec)
+            c.normalize()
+            return c
+        return Vector((float(vec[0]) / l, float(vec[1]) / l, float(vec[2]) / l))
+    return Vector((0.0, 0.0, -1.0))
+
+
+def _safe_negate_vector(vec):
+    """Safely negates a 3D vector across standard mathutils or custom vector mock types."""
+    try:
+        return -vec
+    except Exception:
+        return Vector((-float(vec[0]), -float(vec[1]), -float(vec[2])))
+
+
+def create_or_update_inflow_direction_arrow(
+    context=None,
+    source_plane_obj=None,
+    jar_obj=None,
+    show=None,
+    props=None,
+):
+    """Creates, positions, and orients a 3D arrow indicating the particle inflow direction from the source plane into the chamber."""
+    if bpy is None:
+        return None
+
+    if context is None:
+        context = getattr(bpy, "context", None)
+
+    scene = getattr(context, "scene", None) if context else (bpy.data.scenes[0] if (hasattr(bpy, "data") and hasattr(bpy.data, "scenes") and len(bpy.data.scenes) > 0) else None)
+    if props is None:
+        props = getattr(scene, "science_blocks_props", None) if scene else None
+
+    # Determine visibility preference
+    if show is None:
+        if props:
+            show = bool(getattr(props, "dem_show_inflow_arrow", True) and getattr(props, "dem_use_source_plane", True))
+        else:
+            show = True
+
+    # Resolve source plane if not provided
+    if source_plane_obj is None:
+        if props:
+            source_plane_obj = getattr(props, "dem_source_plane_obj", None)
+            if source_plane_obj is None:
+                resolved = resolve_source_plane_object(context, props=props)
+                # Only use fallback if a node was linked or active selection, not if explicitly cleared
+                if resolved and resolved.name in ("Particle_Tap_Inlet", "Source_Tap") and getattr(props, "dem_source_plane_obj", None) is None:
+                    sock_linked = False
+                    tree = get_effective_node_tree(context, props)
+                    if tree:
+                        for n in getattr(tree, "nodes", []):
+                            if getattr(n, "bl_idname", "") in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+                                s = (n.inputs.get("Particles Input") or n.inputs.get("Source Tap / Plane")) if hasattr(n, "inputs") else None
+                                if s and getattr(s, "is_linked", False):
+                                    sock_linked = True
+                                    break
+                            elif getattr(n, "bl_idname", "") == "ScienceBlocksParticleSourceNode":
+                                if getattr(n, "target_object", None):
+                                    sock_linked = True
+                                    break
+                            elif getattr(n, "bl_idname", "") == "ScienceBlocksObjectNode":
+                                if getattr(n, "object_role", "") == "PARTICLES" and getattr(n, "target_object", None):
+                                    sock_linked = True
+                                    break
+                    if sock_linked:
+                        source_plane_obj = resolved
+                else:
+                    source_plane_obj = resolved
+        else:
+            source_plane_obj = resolve_source_plane_object(context, props=props)
+
+    arrow_name = "Particle_Inflow_Direction_Arrow"
+    arrow = bpy.data.objects.get(arrow_name) if hasattr(bpy, "data") and hasattr(bpy.data, "objects") else None
+
+    # If hidden or no source plane exists, hide existing arrow and return
+    if (not show) or (source_plane_obj is None):
+        if arrow:
+            arrow.hide_viewport = True
+            arrow.hide_render = True
+        return arrow
+
+    # Resolve jar chamber if not provided
+    if not jar_obj:
+        jar_obj = (getattr(props, "jar_chamber_obj", None) if props else None) or (bpy.data.objects.get("Jar_Chamber") if hasattr(bpy, "data") and hasattr(bpy.data, "objects") else None)
+
+    mesh = get_or_create_inflow_arrow_mesh()
+    mat = get_or_create_inflow_arrow_material()
+
+    if not arrow:
+        arrow = bpy.data.objects.new(arrow_name, mesh)
+        coll_name = "Science_Blocks_DEM"
+        coll = bpy.data.collections.get(coll_name) if hasattr(bpy, "data") and hasattr(bpy.data, "collections") else None
+        if not coll and scene and hasattr(scene, "collection"):
+            coll = bpy.data.collections.new(coll_name)
+            if hasattr(scene.collection, "children"):
+                if hasattr(scene.collection.children, "link"):
+                    scene.collection.children.link(coll)
+                elif hasattr(scene.collection.children, "append"):
+                    scene.collection.children.append(coll)
+        target_coll = coll if coll else (scene.collection if (scene and hasattr(scene, "collection")) else None)
+        if target_coll and hasattr(target_coll, "objects"):
+            if hasattr(target_coll.objects, "link"):
+                target_coll.objects.link(arrow)
+            elif hasattr(target_coll.objects, "append"):
+                target_coll.objects.append(arrow)
+    else:
+        if arrow.data != mesh:
+            arrow.data = mesh
+
+    # Assign shader material
+    if hasattr(arrow, "data") and hasattr(arrow.data, "materials"):
+        if not arrow.data.materials:
+            arrow.data.materials.append(mat)
+        else:
+            arrow.data.materials[0] = mat
+
+    # Calculate world center and dimension/radius of source plane
+    if (
+        hasattr(source_plane_obj, "data")
+        and source_plane_obj.data
+        and hasattr(source_plane_obj.data, "vertices")
+        and len(source_plane_obj.data.vertices) >= 3
+    ):
+        verts_w = [source_plane_obj.matrix_world @ v.co for v in source_plane_obj.data.vertices]
+        v_sum = [0.0, 0.0, 0.0]
+        for v in verts_w:
+            v_sum[0] += float(v[0])
+            v_sum[1] += float(v[1])
+            v_sum[2] += float(v[2])
+        n_v = float(len(verts_w))
+        center_w = Vector((v_sum[0] / n_v, v_sum[1] / n_v, v_sum[2] / n_v))
+        dists = [(v - center_w).length for v in verts_w]
+        radius = max(0.04, max(dists)) if dists else 0.15
+    else:
+        center_w = source_plane_obj.matrix_world.translation.copy() if hasattr(source_plane_obj.matrix_world, "translation") else Vector(source_plane_obj.location)
+        dims = getattr(source_plane_obj, "dimensions", None)
+        radius = max(0.04, max(getattr(dims, "x", 0.3), getattr(dims, "y", 0.3)) * 0.5) if dims else 0.15
+
+    # Compute normal vector in world coordinates
+    normal_w = Vector((0.0, 0.0, -1.0))
+    found_norm = False
+
+    # Try polygons
+    if (
+        hasattr(source_plane_obj, "data")
+        and source_plane_obj.data
+        and hasattr(source_plane_obj.data, "polygons")
+        and len(source_plane_obj.data.polygons) > 0
+    ):
+        loc_n_arr = [0.0, 0.0, 0.0]
+        for p in source_plane_obj.data.polygons:
+            loc_n_arr[0] += float(p.normal[0])
+            loc_n_arr[1] += float(p.normal[1])
+            loc_n_arr[2] += float(p.normal[2])
+        loc_n = Vector(loc_n_arr)
+        if loc_n.length > 1e-4:
+            m3 = source_plane_obj.matrix_world.to_3x3() if hasattr(source_plane_obj.matrix_world, "to_3x3") else Matrix().to_3x3()
+            normal_w = _safe_normalize_vector(m3 @ loc_n)
+            found_norm = True
+
+    # Try SVD on vertices if polygon sum was zero (e.g. side rings) or no polygons
+    if not found_norm and (
+        hasattr(source_plane_obj, "data")
+        and source_plane_obj.data
+        and hasattr(source_plane_obj.data, "vertices")
+        and len(source_plane_obj.data.vertices) >= 3
+    ):
+        if np is not None:
+            try:
+                coords = np.array([[v[0] - center_w[0], v[1] - center_w[1], v[2] - center_w[2]] for v in verts_w], dtype=np.float64)
+                _, _, vh = np.linalg.svd(coords)
+                u_vec = _safe_normalize_vector(Vector(vh[0]))
+                v_vec = _safe_normalize_vector(Vector(vh[1]))
+                n_cross = u_vec.cross(v_vec)
+                if n_cross.length > 1e-4:
+                    normal_w = _safe_normalize_vector(n_cross)
+                    found_norm = True
+            except Exception:
+                pass
+
+        if not found_norm:
+            v0 = verts_w[0]
+            v1 = verts_w[1]
+            v2 = verts_w[2]
+            n_cross = (v1 - v0).cross(v2 - v0)
+            if n_cross.length > 1e-4:
+                normal_w = _safe_normalize_vector(n_cross)
+                found_norm = True
+
+    if not found_norm:
+        m3 = source_plane_obj.matrix_world.to_3x3() if hasattr(source_plane_obj.matrix_world, "to_3x3") else Matrix().to_3x3()
+        normal_w = _safe_normalize_vector(m3 @ Vector((0.0, 0.0, 1.0)))
+
+    # Orient normal into the chamber interior
+    if jar_obj:
+        if hasattr(jar_obj, "bound_box") and jar_obj.bound_box:
+            bb_w = [jar_obj.matrix_world @ Vector(v) for v in jar_obj.bound_box]
+            bb_sum = [0.0, 0.0, 0.0]
+            for v in bb_w:
+                bb_sum[0] += float(v[0])
+                bb_sum[1] += float(v[1])
+                bb_sum[2] += float(v[2])
+            n_bb = float(len(bb_w))
+            jar_center = Vector((bb_sum[0] / n_bb, bb_sum[1] / n_bb, bb_sum[2] / n_bb))
+        else:
+            jar_center = jar_obj.matrix_world.translation.copy() if hasattr(jar_obj.matrix_world, "translation") else Vector(jar_obj.location)
+
+        to_jar = jar_center - center_w
+        to_jar_l = to_jar.length
+        to_jar_dir = _safe_normalize_vector(to_jar) if to_jar_l > 1e-6 else Vector((0.0, 0.0, -1.0))
+        dot_to_jar = normal_w.dot(to_jar_dir) if hasattr(normal_w, "dot") else float(np.dot([normal_w[0], normal_w[1], normal_w[2]], [to_jar_dir[0], to_jar_dir[1], to_jar_dir[2]]))
+        if to_jar_l > 1e-3 and abs(dot_to_jar) > 0.15:
+            if dot_to_jar < 0:
+                normal_w = _safe_negate_vector(normal_w)
+        else:
+            g_vec = Vector((0.0, 0.0, -1.0))
+            dot_g = normal_w.dot(g_vec) if hasattr(normal_w, "dot") else float(np.dot([normal_w[0], normal_w[1], normal_w[2]], [0.0, 0.0, -1.0]))
+            if dot_g < 0:
+                normal_w = _safe_negate_vector(normal_w)
+    else:
+        g_vec = Vector((0.0, 0.0, -1.0))
+        dot_g = normal_w.dot(g_vec) if hasattr(normal_w, "dot") else float(np.dot([normal_w[0], normal_w[1], normal_w[2]], [0.0, 0.0, -1.0]))
+        if dot_g < 0:
+            normal_w = _safe_negate_vector(normal_w)
+
+    # Calculate orientation and scale
+    v_ref = Vector((0.0, 0.0, -1.0))
+    rot_diff = None
+    if hasattr(v_ref, "rotation_difference"):
+        try:
+            rot_diff = v_ref.rotation_difference(normal_w)
+        except Exception:
+            pass
+
+    if rot_diff is None and np is not None:
+        try:
+            v1 = np.array([0.0, 0.0, -1.0])
+            v2 = np.array([float(normal_w[0]), float(normal_w[1]), float(normal_w[2])])
+            v2_norm = v2 / max(1e-9, np.linalg.norm(v2))
+            dot_v = float(np.dot(v1, v2_norm))
+            if dot_v > 0.999999:
+                rot_diff = Quaternion((1.0, 0.0, 0.0, 0.0)) if Quaternion else None
+            elif dot_v < -0.999999:
+                rot_diff = Quaternion((0.0, 1.0, 0.0, 0.0)) if Quaternion else None
+            else:
+                axis = np.cross(v1, v2_norm)
+                q = np.array([1.0 + dot_v, axis[0], axis[1], axis[2]])
+                q = q / np.linalg.norm(q)
+                rot_diff = Quaternion(q) if Quaternion else None
+        except Exception:
+            pass
+
+    rot_euler = rot_diff.to_euler("XYZ") if (rot_diff and hasattr(rot_diff, "to_euler")) else (Euler((0.0, 0.0, 0.0)) if Euler else (0.0, 0.0, 0.0))
+    scale_factor = max(0.4, min(2.5, radius / 0.15))
+    scale_vec = Vector((scale_factor, scale_factor, scale_factor))
+
+    # Form target world matrix if supported
+    target_mat = None
+    try:
+        rot_m4 = rot_diff.to_matrix().to_4x4()
+        scale_m4 = Matrix.Diagonal((*scale_vec, 1.0))
+        target_mat = Matrix.Translation(center_w) @ rot_m4 @ scale_m4
+    except Exception:
+        target_mat = None
+
+    if target_mat is not None and hasattr(source_plane_obj, "matrix_world") and hasattr(target_mat, "decompose"):
+        try:
+            arrow.parent = source_plane_obj
+            arrow.matrix_parent_inverse = Matrix.Identity(4)
+            m_plane_inv = source_plane_obj.matrix_world.inverted()
+            local_mat = m_plane_inv @ target_mat
+            arrow.matrix_local = local_mat
+            loc, rot_q, sc = local_mat.decompose()
+            arrow.location = loc
+            arrow.rotation_mode = "XYZ"
+            arrow.rotation_euler = rot_q.to_euler("XYZ")
+            arrow.scale = sc
+        except Exception:
+            arrow.parent = source_plane_obj
+            arrow.matrix_world = target_mat
+            arrow.location = center_w
+            arrow.rotation_mode = "XYZ"
+            arrow.rotation_euler = rot_euler
+            arrow.scale = scale_vec
+    else:
+        arrow.parent = source_plane_obj
+        if target_mat is not None:
+            arrow.matrix_world = target_mat
+        arrow.location = center_w
+        arrow.rotation_mode = "XYZ"
+        arrow.rotation_euler = rot_euler
+        arrow.scale = scale_vec
+
+    arrow.hide_viewport = False
+    arrow.hide_render = False
+
+    return arrow
+
+
 def create_or_update_particle_source_plane(context, jar_obj=None, location=None, radius=None, geom=None):
     """Creates or positions a stylized 3D Particle Source Tap / Inlet object above the jar opening."""
     if bpy is None or context is None:
@@ -2884,6 +3291,20 @@ def create_or_update_particle_source_plane(context, jar_obj=None, location=None,
         mesh.update()
 
         tap_obj = bpy.data.objects.new(tap_name, mesh)
+        if coll and hasattr(coll, "objects"):
+            if hasattr(coll.objects, "link"):
+                coll.objects.link(tap_obj)
+            elif hasattr(coll.objects, "append"):
+                coll.objects.append(tap_obj)
+        elif hasattr(context.scene, "collection") and hasattr(context.scene.collection, "objects"):
+            if hasattr(context.scene.collection.objects, "link"):
+                context.scene.collection.objects.link(tap_obj)
+            elif hasattr(context.scene.collection.objects, "append"):
+                context.scene.collection.objects.append(tap_obj)
+
+    # An object can remain in bpy.data.objects after being unlinked from the scene.
+    # Re-link it so pressing the operator restores the inlet as well as its arrow.
+    if not getattr(tap_obj, "users_collection", ()):
         if coll and hasattr(coll, "objects"):
             if hasattr(coll.objects, "link"):
                 coll.objects.link(tap_obj)
@@ -2973,13 +3394,16 @@ def create_or_update_particle_source_plane(context, jar_obj=None, location=None,
         props.dem_source_plane_obj = tap_obj
         props.dem_use_source_plane = True
 
+    # Immediately create and orient the particle inflow direction arrow
+    create_or_update_inflow_direction_arrow(context, source_plane_obj=tap_obj, jar_obj=jar_obj)
+
     return tap_obj
 
 
 class SCIENCE_BLOCKS_OT_create_particle_source_plane(bpy.types.Operator):
     """Create or position a 3D Source Tap / Inlet object above the jar opening for non-overlapping particle emission."""
     bl_idname = "science_blocks.create_particle_source_plane"
-    bl_label = "Place Source Tap Plane"
+    bl_label = "Place Particle Inflow Source Plane"
     bl_description = "Create or position a 3D Source Tap Inlet object above the jar opening for non-overlapping particle emission"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -2997,6 +3421,7 @@ class SCIENCE_BLOCKS_OT_create_particle_source_plane(bpy.types.Operator):
         tap_obj = create_or_update_particle_source_plane(context, jar_obj=jar_obj)
 
         if tap_obj:
+            create_or_update_inflow_direction_arrow(context, source_plane_obj=tap_obj, jar_obj=jar_obj)
             self.report({"INFO"}, f"Science Blocks: Placed source tap '{tap_obj.name}' above jar chamber.")
             return {"FINISHED"}
         else:
@@ -3327,6 +3752,8 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
         # Resolve 3D Source Tap / Inlet object
         source_plane_obj = resolve_source_plane_object(context, props, solver_node=active_node, jar_obj=jar_obj)
         use_source_plane = getattr(props, "dem_use_source_plane", True)
+        if source_plane_obj:
+            create_or_update_inflow_direction_arrow(context, source_plane_obj=source_plane_obj, jar_obj=jar_obj)
 
         source_plane_center = None
         source_plane_normal = None
@@ -3414,6 +3841,7 @@ class SCIENCE_BLOCKS_OT_run_dem_simulation(bpy.types.Operator):
             "source_plane_center": source_plane_center,
             "source_plane_normal": source_plane_normal,
             "source_plane_radius": source_plane_radius,
+
             "cavity_info": cavity_info,
             "rpm_mode": rpm_mode,
             "jar_rpm_start": jar_rpm_start,
@@ -5040,6 +5468,50 @@ def get_or_create_sci_jar_material(props) -> bpy.types.Material:
             if hasattr(mat, "blend_method"):
                 mat.blend_method = "OPAQUE"
 
+    # Optional Visible Edge Lines (Wireframe Outlines)
+    edge_lines = getattr(props, "sci_jar_edge_lines", False) if props else False
+    if edge_lines:
+        try:
+            n_wire = nodes.new("ShaderNodeWireframe")
+            n_wire.location = (150, 180)
+            if hasattr(n_wire, "use_pixel_size"):
+                n_wire.use_pixel_size = True
+            if "Size" in n_wire.inputs:
+                n_wire.inputs["Size"].default_value = float(getattr(props, "sci_jar_edge_width", 1.2))
+
+            n_edge = nodes.new("ShaderNodeEmission")
+            n_edge.location = (150, -180)
+            edge_col = getattr(props, "sci_jar_edge_color", (0.10, 0.12, 0.16))
+            if "Color" in n_edge.inputs:
+                n_edge.inputs["Color"].default_value = (edge_col[0], edge_col[1], edge_col[2], 1.0)
+            if "Strength" in n_edge.inputs:
+                n_edge.inputs["Strength"].default_value = 1.0
+
+            n_mix = nodes.new("ShaderNodeMixShader")
+            n_mix.location = (350, 0)
+            n_out.location = (550, 0)
+
+            # Clear direct link from BSDF to n_out Surface
+            for link in list(links):
+                if getattr(link, "to_node", None) == n_out:
+                    links.remove(link)
+
+            wire_fac = n_wire.outputs.get("Fac") or (n_wire.outputs[0] if n_wire.outputs else None)
+            bsdf_surf = n_bsdf.outputs.get("BSDF") or (n_bsdf.outputs[0] if n_bsdf.outputs else None)
+            edge_surf = n_edge.outputs.get("Emission") or (n_edge.outputs[0] if n_edge.outputs else None)
+            mix_surf = n_mix.outputs.get("Shader") or (n_mix.outputs[0] if n_mix.outputs else None)
+
+            if wire_fac:
+                links.new(wire_fac, n_mix.inputs[0])
+            if bsdf_surf:
+                links.new(bsdf_surf, n_mix.inputs[1])
+            if edge_surf:
+                links.new(edge_surf, n_mix.inputs[2])
+            if mix_surf:
+                links.new(mix_surf, n_out.inputs["Surface"])
+        except Exception:
+            pass
+
     return mat
 
 
@@ -5326,13 +5798,28 @@ def apply_scientific_paper_style(context, preset_name: str = None) -> bool:
     sphere_mat = get_or_create_sci_sphere_material(props)
 
     # Grinding Jars (main & side)
+    edge_lines = getattr(props, "sci_jar_edge_lines", False) if props else False
+    edge_col = getattr(props, "sci_jar_edge_color", (0.10, 0.12, 0.16)) if props else (0.10, 0.12, 0.16)
+
     jar_obj = props.jar_chamber_obj or bpy.data.objects.get("Jar_Chamber")
     if jar_obj:
         assign_material_to_object(jar_obj, jar_mat)
+        if hasattr(jar_obj, "show_wire"):
+            jar_obj.show_wire = edge_lines
+        if hasattr(jar_obj, "show_all_edges"):
+            jar_obj.show_all_edges = edge_lines
+        if hasattr(jar_obj, "color"):
+            jar_obj.color = (edge_col[0], edge_col[1], edge_col[2], 1.0)
 
     side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
     if side_jar:
         assign_material_to_object(side_jar, jar_mat)
+        if hasattr(side_jar, "show_wire"):
+            side_jar.show_wire = edge_lines
+        if hasattr(side_jar, "show_all_edges"):
+            side_jar.show_all_edges = edge_lines
+        if hasattr(side_jar, "color"):
+            side_jar.color = (edge_col[0], edge_col[1], edge_col[2], 1.0)
 
     # Carrier / Sun Wheel Plate
     sun_obj = props.sun_wheel_obj or bpy.data.objects.get("Sun_Wheel_Plate")
@@ -5437,6 +5924,41 @@ class SCIENCE_BLOCKS_OT_set_chamber_finish(bpy.types.Operator):
                 pass
         apply_scientific_paper_style(context)
         self.report({"INFO"}, f"Science Blocks: Set chamber finish to {self.finish}.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_set_chamber_edge_color(bpy.types.Operator):
+    """Quickly set chamber edge line color preset (Black, White, Slate, Accent)."""
+    bl_idname = "science_blocks.set_chamber_edge_color"
+    bl_label = "Set Chamber Edge Line Color"
+    bl_description = "Quickly set chamber edge line color preset (Black, White, Slate, Accent)"
+
+    color_preset: bpy.props.EnumProperty(
+        name="Color Preset",
+        items=[
+            ("BLACK", "Deep Black", "Crisp high-contrast black line"),
+            ("WHITE", "Pure White", "Clean white outline for dark/translucent casing"),
+            ("SLATE", "Slate Grey", "Muted technical slate grey outline"),
+            ("ACCENT", "Accent Tint", "Match kinematic accent color"),
+        ],
+        default="BLACK",
+    )
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props:
+            props.sci_jar_edge_lines = True
+            if self.color_preset == "BLACK":
+                props.sci_jar_edge_color = (0.05, 0.05, 0.05)
+            elif self.color_preset == "WHITE":
+                props.sci_jar_edge_color = (1.0, 1.0, 1.0)
+            elif self.color_preset == "SLATE":
+                props.sci_jar_edge_color = (0.28, 0.32, 0.38)
+            elif self.color_preset == "ACCENT":
+                acc = getattr(props, "sci_accent_color", (0.08, 0.44, 0.88))
+                props.sci_jar_edge_color = (acc[0], acc[1], acc[2])
+        apply_scientific_paper_style(context)
+        self.report({"INFO"}, f"Science Blocks: Set chamber edge line color to {self.color_preset}.")
         return {"FINISHED"}
 
 

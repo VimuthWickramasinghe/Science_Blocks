@@ -106,11 +106,36 @@ class ScienceBlocksYadeNode(bpy.types.Node):
 
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Jar Chamber")
-        self.inputs.new("ScienceBlocksObjectSocket", "Source Tap / Plane")
+        self.inputs.new("ScienceBlocksObjectSocket", "Particles Input")
         self.inputs.new("ScienceBlocksRPMSocket", "Drive RPM")
         self.inputs.new("ScienceBlocksPhysicsSocket", "Media Physics")
         self.outputs.new("ScienceBlocksSimSocket", "Milling Particles")
         self.outputs.new("ScienceBlocksDataSocket", "Collision Data")
+
+    def update(self):
+        try:
+            sock = (self.inputs.get("Particles Input") or self.inputs.get("Source Tap / Plane")) if hasattr(self, "inputs") else None
+            if sock:
+                try:
+                    from ...operators import resolve_object_from_socket, create_or_update_inflow_direction_arrow
+                except Exception:
+                    from operators import resolve_object_from_socket, create_or_update_inflow_direction_arrow
+
+                if getattr(sock, "is_linked", False):
+                    obj = resolve_object_from_socket(sock)
+                    if obj and hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene"):
+                        props = getattr(bpy.context.scene, "science_blocks_props", None)
+                        if props:
+                            props.dem_source_plane_obj = obj
+                            props.dem_use_source_plane = True
+                        create_or_update_inflow_direction_arrow(bpy.context, source_plane_obj=obj)
+                else:
+                    if hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene"):
+                        props = getattr(bpy.context.scene, "science_blocks_props", None)
+                        if props and getattr(props, "dem_source_plane_obj", None) is None:
+                            create_or_update_inflow_direction_arrow(bpy.context, source_plane_obj=None, show=False)
+        except Exception:
+            pass
 
     def draw_buttons(self, context, layout):
         col = layout.column(align=True)
@@ -199,8 +224,8 @@ class ScienceBlocksYadeNode(bpy.types.Node):
         if "Media Physics" not in self.inputs or not self.inputs["Media Physics"].is_linked:
             col.prop(self, "ball_radius_mm", text="Ball Radius (mm)")
 
-        # Source Tap / Plane status and placement
-        sock_tap = self.inputs.get("Source Tap / Plane")
+        # Particles Input / Source Tap status and placement
+        sock_tap = self.inputs.get("Particles Input") or self.inputs.get("Source Tap / Plane")
         from_tap = None
         if sock_tap and sock_tap.is_linked:
             try:
@@ -222,12 +247,12 @@ class ScienceBlocksYadeNode(bpy.types.Node):
                 tap_in_scene = "Particle_Tap_Inlet" in bpy.data.objects
 
         if from_tap:
-            row_tap.label(text=f"Tap: {from_tap.name}", icon="SNAP_GRID")
+            row_tap.label(text=f"Particles: {from_tap.name}", icon="SNAP_GRID")
         elif tap_in_scene:
             row_tap.label(text="Tap: Particle_Tap_Inlet", icon="CHECKMARK")
         else:
             row_tap.label(text="Source: Auto Top Tap", icon="CON_LOCLIKE")
-        row_tap.operator("science_blocks.create_particle_source_plane", text="Place Tap", icon="ADD")
+        row_tap.operator("science_blocks.create_particle_source_plane", text="Place Particle Inflow", icon="ADD")
 
         col.separator(factor=0.3)
         props = getattr(context.scene, "science_blocks_props", None)

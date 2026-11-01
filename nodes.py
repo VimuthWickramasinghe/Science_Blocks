@@ -33,6 +33,36 @@ class ScienceBlocksNodeTree(bpy.types.NodeTree):
     bl_label = "Science Blocks Nodes"
     bl_icon = "PHYSICS"
 
+    def update(self):
+        try:
+            super().update()
+        except Exception:
+            pass
+        try:
+            for node in self.nodes:
+                if getattr(node, "bl_idname", "") in ("ScienceBlocksYadeNode", "ScienceBlocksDEMSolverNode"):
+                    sock = (node.inputs.get("Particles Input") or node.inputs.get("Source Tap / Plane")) if hasattr(node, "inputs") else None
+                    if sock and getattr(sock, "is_linked", False):
+                        from_node = sock.links[0].from_node if getattr(sock, "links", None) else None
+                        if from_node and getattr(from_node, "bl_idname", "") == "ScienceBlocksObjectNode":
+                            if getattr(from_node, "object_role", "") == "OBJECT":
+                                from_node.object_role = "PARTICLES"
+
+                        try:
+                            from .operators import resolve_object_from_socket, create_or_update_inflow_direction_arrow
+                        except Exception:
+                            from operators import resolve_object_from_socket, create_or_update_inflow_direction_arrow
+                        obj = resolve_object_from_socket(sock)
+                        if obj and hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene"):
+                            props = getattr(bpy.context.scene, "science_blocks_props", None)
+                            if props:
+                                props.dem_source_plane_obj = obj
+                                props.dem_use_source_plane = True
+                            create_or_update_inflow_direction_arrow(bpy.context, source_plane_obj=obj)
+                        break
+        except Exception:
+            pass
+
 
 # ===========================================================================
 # 2. Custom Node Sockets
@@ -129,8 +159,41 @@ class ScienceBlocksDataSocket(bpy.types.NodeSocket):
 
 
 # ===========================================================================
-# 3. 3D Model Input Node (General 3D Object)
+# 3. 3D Model Input Node (General 3D Object & Particle Source)
 # ===========================================================================
+
+def _on_object_node_target_updated(self, context):
+    if getattr(self, "object_role", "") == "PARTICLES" and getattr(self, "target_object", None):
+        if context and hasattr(context, "scene"):
+            props = getattr(context.scene, "science_blocks_props", None)
+            if props:
+                props.dem_source_plane_obj = self.target_object
+                props.dem_use_source_plane = True
+        try:
+            from .operators import create_or_update_inflow_direction_arrow
+            create_or_update_inflow_direction_arrow(context, source_plane_obj=self.target_object)
+        except Exception:
+            try:
+                from operators import create_or_update_inflow_direction_arrow
+                create_or_update_inflow_direction_arrow(context, source_plane_obj=self.target_object)
+            except Exception:
+                pass
+
+
+def _on_object_node_role_updated(self, context):
+    role = getattr(self, "object_role", "")
+    if role == "PARTICLES":
+        if getattr(self, "target_object", None):
+            _on_object_node_target_updated(self, context)
+        if hasattr(self, "label") and not self.label:
+            self.label = "Particles Input"
+    elif role == "JAR":
+        if hasattr(self, "label") and not self.label:
+            self.label = "Chamber Input"
+    elif role == "SUN_WHEEL":
+        if hasattr(self, "label") and not self.label:
+            self.label = "Sun Wheel Input"
+
 
 class ScienceBlocksObjectNode(bpy.types.Node):
     """3D Model Input Node (Passes scene objects to movement/simulation nodes)."""
@@ -142,6 +205,7 @@ class ScienceBlocksObjectNode(bpy.types.Node):
         name="Object",
         type=bpy.types.Object,
         description="Select scene object from 3D Viewport",
+        update=_on_object_node_target_updated,
     )
     object_role: EnumProperty(
         name="Role",
@@ -149,8 +213,10 @@ class ScienceBlocksObjectNode(bpy.types.Node):
             ("OBJECT", "3D Scene Object", "Generic scene object", "OBJECT_DATAMODE", 0),
             ("SUN_WHEEL", "Sun Wheel (Carrier)", "Carrier drive mechanism", "SETTINGS", 1),
             ("JAR", "Grinding Jar (Chamber)", "Container chamber or driven object", "SNAP_VOLUME", 2),
+            ("PARTICLES", "Particles Input (Source / Tap)", "Inflow surface or planar source object that introduces particles into the jar", "SNAP_GRID", 3),
         ],
         default="OBJECT",
+        update=_on_object_node_role_updated,
     )
 
     def get_target_object(self):
@@ -164,6 +230,29 @@ class ScienceBlocksObjectNode(bpy.types.Node):
         col = layout.column(align=True)
         col.prop(self, "target_object", text="")
         col.prop(self, "object_role", text="")
+        if self.object_role == "PARTICLES":
+            if self.target_object:
+                row = col.row(align=True)
+                row.label(text=f"Inflow: {self.target_object.name}", icon="SNAP_GRID")
+                props = getattr(context.scene, "science_blocks_props", None) if (context and hasattr(context, "scene")) else None
+                if props:
+                    arrow_icon = "HIDE_OFF" if getattr(props, "dem_show_inflow_arrow", True) else "HIDE_ON"
+                    row.prop(props, "dem_show_inflow_arrow", text="", icon=arrow_icon)
+            else:
+                col.label(text="Assign Inflow 3D Object", icon="INFO")
+
+
+class ScienceBlocksParticleSourceNode(ScienceBlocksObjectNode):
+    """Dedicated 3D Object Input Node for particle inflow emission."""
+    bl_idname = "ScienceBlocksParticleSourceNode"
+    bl_label = "Particles 3D Input"
+    bl_icon = "PARTICLES"
+
+    def init(self, context):
+        super().init(context)
+        self.object_role = "PARTICLES"
+        if self.outputs and len(self.outputs) > 0:
+            self.outputs[0].name = "Particles Source"
 
 
 # ===========================================================================
@@ -744,12 +833,37 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Sun Mechanism")
         self.inputs.new("ScienceBlocksObjectSocket", "Jar Chamber")
-        self.inputs.new("ScienceBlocksObjectSocket", "Source Tap / Plane")
+        self.inputs.new("ScienceBlocksObjectSocket", "Particles Input")
         self.inputs.new("ScienceBlocksRPMSocket", "Drive RPM")
         self.inputs.new("ScienceBlocksRPMSocket", "Jar RPM")
         self.inputs.new("ScienceBlocksPhysicsSocket", "Ball Physics")
         self.outputs.new("ScienceBlocksSimSocket", "Milling Particles")
         self.outputs.new("ScienceBlocksDataSocket", "Impact Telemetry")
+
+    def update(self):
+        try:
+            sock = (self.inputs.get("Particles Input") or self.inputs.get("Source Tap / Plane")) if hasattr(self, "inputs") else None
+            if sock:
+                try:
+                    from .operators import resolve_object_from_socket, create_or_update_inflow_direction_arrow
+                except Exception:
+                    from operators import resolve_object_from_socket, create_or_update_inflow_direction_arrow
+
+                if getattr(sock, "is_linked", False):
+                    obj = resolve_object_from_socket(sock)
+                    if obj and hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene"):
+                        props = getattr(bpy.context.scene, "science_blocks_props", None)
+                        if props:
+                            props.dem_source_plane_obj = obj
+                            props.dem_use_source_plane = True
+                        create_or_update_inflow_direction_arrow(bpy.context, source_plane_obj=obj)
+                else:
+                    if hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene"):
+                        props = getattr(bpy.context.scene, "science_blocks_props", None)
+                        if props and getattr(props, "dem_source_plane_obj", None) is None:
+                            create_or_update_inflow_direction_arrow(bpy.context, source_plane_obj=None, show=False)
+        except Exception:
+            pass
 
     def draw_buttons(self, context, layout):
         col = layout.column(align=True)
@@ -802,8 +916,8 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
                 if getattr(self, "stl_scale", 1.0) == 0.001:
                     r_scale.label(text="mm -> m")
 
-        # Source Tap / Plane status and placement
-        sock_tap = self.inputs.get("Source Tap / Plane")
+        # Particles Input / Source Tap status and placement
+        sock_tap = self.inputs.get("Particles Input") or self.inputs.get("Source Tap / Plane")
         from_tap = None
         if sock_tap and sock_tap.is_linked:
             try:
@@ -825,11 +939,11 @@ class ScienceBlocksDEMSolverNode(bpy.types.Node):
                 tap_in_scene = "Particle_Tap_Inlet" in bpy.data.objects
 
         if from_tap:
-            row_tap.label(text=f"Tap: {from_tap.name}", icon="SNAP_GRID")
+            row_tap.label(text=f"Particles: {from_tap.name}", icon="SNAP_GRID")
         elif tap_in_scene:
             row_tap.label(text="Tap: Particle_Tap_Inlet", icon="CHECKMARK")
         else:
-            row_tap.label(text="Source: Auto Top Tap", icon="CON_LOCLIKE")
+            row_tap.label(text="Particles: Auto Top Tap", icon="CON_LOCLIKE")
         row_tap.operator("science_blocks.create_particle_source_plane", text="Place Tap", icon="ADD")
 
         col.separator(factor=0.3)
@@ -1939,6 +2053,7 @@ node_categories = [
         "3D Scene Objects",
         items=[
             NodeItem("ScienceBlocksObjectNode"),
+            NodeItem("ScienceBlocksParticleSourceNode"),
             NodeItem("ScienceBlocksChamberHeatmapNode"),
         ],
     ),
@@ -1947,6 +2062,7 @@ node_categories = [
         "DEM Simulation",
         items=[
             NodeItem("ScienceBlocksDEMSolverNode"),
+            NodeItem("ScienceBlocksParticleSourceNode"),
             NodeItem("ScienceBlocksPhysicsNode"),
             NodeItem("ScienceBlocksSensorNode"),
             NodeItem("ScienceBlocksOutputNode"),
