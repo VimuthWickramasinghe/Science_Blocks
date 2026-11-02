@@ -6540,8 +6540,14 @@ class SCIENCE_BLOCKS_OT_apply_particle_colormap(bpy.types.Operator):
 
         # Synchronize back to props and nodes
         if props:
-            props.dem_viewport_colormap = mode
-            props.sci_media_palette = pal
+            try:
+                props.dem_viewport_colormap = mode
+            except Exception:
+                pass
+            try:
+                props.sci_media_palette = pal
+            except Exception:
+                pass
 
         try:
             from .properties import _sync_output_nodes_from_panel
@@ -7004,13 +7010,396 @@ def get_or_create_chamber_heatmap_material(emission_glow: float = 0.40) -> bpy.t
     return mat
 
 
-def _apply_colors_to_mesh(mesh, colors):
+def get_or_create_live_chamber_collision_material(
+    palette: str = "TURBO",
+    base_opacity: float = 0.30,
+    emission_glow: float = 1.8,
+    tint_color=(0.82, 0.88, 0.94, 1.0),
+) -> bpy.types.Material:
+    """Creates or updates a publication-grade shader displaying the live animated chamber surface collision heatmap.
+    
+    The chamber wall has a base opacity of 0.30 (semi-transparent see-through container)
+    so internal tumbling media spheres remain visible. Where collisions occur, the color shifts
+    vibrantly according to the scientific colormap and the opacity dynamically scales up to 1.0 (fully opaque)
+    with emissive PBR glow without any washed-out transparency.
+    """
+    if bpy is None:
+        return None
+
+    mat_name = "SB_Live_Chamber_Collision_Material"
+    mat = bpy.data.materials.get(mat_name)
+    if not mat:
+        mat = bpy.data.materials.new(mat_name)
+    mat.use_nodes = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    # 1. Material Output Node
+    n_out = nodes.new("ShaderNodeOutputMaterial")
+    n_out.location = (650, 0)
+
+    # 2. Principled BSDF Node
+    n_bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    n_bsdf.location = (300, 0)
+    links.new(n_bsdf.outputs["BSDF"], n_out.inputs["Surface"])
+
+    # 3. Geometry Attribute Node reading 'SB_Live_Collision'
+    n_attr = nodes.new("ShaderNodeAttribute")
+    n_attr.location = (-450, 0)
+    n_attr.attribute_name = "SB_Live_Collision"
+    if hasattr(n_attr, "attribute_type"):
+        n_attr.attribute_type = 'GEOMETRY'
+
+    # Extract sockets
+    col_socket = n_attr.outputs.get("Color")
+    fac_socket = n_attr.outputs.get("Fac") or n_attr.outputs.get("Factor") or n_attr.outputs.get("Alpha")
+    if fac_socket is None and col_socket is not None:
+        fac_socket = col_socket
+
+    # 4. Map Range Node: Maps Fac (0.0 -> 1.0) to Alpha (base_opacity -> 1.0)
+    # Resting surface has base_opacity (0.30) for see-through clarity.
+    # Collision contacts scale to 1.00 (100% fully opaque without transparency!).
+    n_map_alpha = nodes.new("ShaderNodeMapRange")
+    n_map_alpha.location = (-100, -180)
+    n_map_alpha.label = "Live_Opacity_Map"
+    n_map_alpha.clamp = True
+
+    if fac_socket:
+        links.new(fac_socket, n_map_alpha.inputs[0])
+
+    if "From Min" in n_map_alpha.inputs:
+        n_map_alpha.inputs["From Min"].default_value = 0.0
+        n_map_alpha.inputs["From Max"].default_value = 1.0
+        n_map_alpha.inputs["To Min"].default_value = float(base_opacity)
+        n_map_alpha.inputs["To Max"].default_value = 1.0
+    else:
+        if len(n_map_alpha.inputs) > 1: n_map_alpha.inputs[1].default_value = 0.0
+        if len(n_map_alpha.inputs) > 2: n_map_alpha.inputs[2].default_value = 1.0
+        if len(n_map_alpha.inputs) > 3: n_map_alpha.inputs[3].default_value = float(base_opacity)
+        if len(n_map_alpha.inputs) > 4: n_map_alpha.inputs[4].default_value = 1.0
+
+    if "Alpha" in n_bsdf.inputs:
+        links.new(n_map_alpha.outputs[0], n_bsdf.inputs["Alpha"])
+
+    # 5. Base Color Mix: Blends container rest tint into vivid colormap color
+    tint = tuple(tint_color) if len(tint_color) == 4 else (tint_color[0], tint_color[1], tint_color[2], 1.0)
+    try:
+        n_mix = nodes.new("ShaderNodeMix")
+        n_mix.location = (-100, 150)
+        n_mix.data_type = 'RGBA'
+        if fac_socket:
+            links.new(fac_socket, n_mix.inputs["Factor"])
+        if "A" in n_mix.inputs:
+            n_mix.inputs["A"].default_value = tint
+        elif len(n_mix.inputs) > 6:
+            n_mix.inputs[6].default_value = tint
+        if col_socket:
+            if "B" in n_mix.inputs:
+                links.new(col_socket, n_mix.inputs["B"])
+            elif len(n_mix.inputs) > 7:
+                links.new(col_socket, n_mix.inputs[7])
+        out_col = n_mix.outputs[2] if len(n_mix.outputs) > 2 else n_mix.outputs["Result"]
+        links.new(out_col, n_bsdf.inputs["Base Color"])
+    except Exception:
+        n_mix = nodes.new("ShaderNodeMixRGB")
+        n_mix.location = (-100, 150)
+        if fac_socket:
+            links.new(fac_socket, n_mix.inputs["Fac"])
+        n_mix.inputs["Color1"].default_value = tint
+        if col_socket:
+            links.new(col_socket, n_mix.inputs["Color2"])
+        links.new(n_mix.outputs["Color"], n_bsdf.inputs["Base Color"])
+
+    # 6. Emission Color
+    em_target = "Emission Color" if "Emission Color" in n_bsdf.inputs else ("Emission" if "Emission" in n_bsdf.inputs else None)
+    if em_target and col_socket:
+        links.new(col_socket, n_bsdf.inputs[em_target])
+
+    # 7. Math Multiply for Emission Strength: Hot spots glow brightly
+    n_math_em = nodes.new("ShaderNodeMath")
+    n_math_em.location = (-100, 340)
+    n_math_em.operation = 'MULTIPLY'
+    n_math_em.label = "Live_Glow_Mult"
+    if fac_socket:
+        links.new(fac_socket, n_math_em.inputs[0])
+    n_math_em.inputs[1].default_value = float(emission_glow)
+
+    if "Emission Strength" in n_bsdf.inputs:
+        links.new(n_math_em.outputs["Value"], n_bsdf.inputs["Emission Strength"])
+
+    # 8. PBR Properties
+    if "Roughness" in n_bsdf.inputs:
+        n_bsdf.inputs["Roughness"].default_value = 0.18
+    if "Metallic" in n_bsdf.inputs:
+        n_bsdf.inputs["Metallic"].default_value = 0.05
+    if "IOR" in n_bsdf.inputs:
+        n_bsdf.inputs["IOR"].default_value = 1.45
+
+    # 9. Viewport Transparency Settings
+    if hasattr(mat, "blend_method"):
+        mat.blend_method = "BLEND"
+    if hasattr(mat, "surface_render_method"):
+        try:
+            mat.surface_render_method = "BLENDED"
+        except Exception:
+            pass
+    if hasattr(mat, "shadow_method"):
+        mat.shadow_method = "HASHED"
+    if hasattr(mat, "show_transparent_back"):
+        mat.show_transparent_back = True
+    if hasattr(mat, "use_backface_culling"):
+        mat.use_backface_culling = False
+
+    return mat
+
+
+def sync_live_chamber_material_settings(context=None):
+    """Updates live chamber collision material parameters (base opacity, emission glow, tint) dynamically."""
+    if bpy is None:
+        return
+    mat = bpy.data.materials.get("SB_Live_Chamber_Collision_Material")
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        return
+    scene = getattr(context, "scene", None) if context else getattr(bpy.context, "scene", None)
+    props = getattr(scene, "science_blocks_props", None) if scene else None
+    base_opac = getattr(props, "live_chamber_base_opacity", 0.30) if props else 0.30
+    glow = getattr(props, "live_chamber_glow", 1.8) if props else 1.8
+
+    nodes = mat.node_tree.nodes
+    for n in nodes:
+        if getattr(n, "label", "") == "Live_Opacity_Map" or n.bl_idname == "ShaderNodeMapRange":
+            if "To Min" in n.inputs:
+                n.inputs["To Min"].default_value = float(base_opac)
+            elif len(n.inputs) > 3:
+                n.inputs[3].default_value = float(base_opac)
+        elif getattr(n, "label", "") == "Live_Glow_Mult":
+            if len(n.inputs) > 1:
+                n.inputs[1].default_value = float(glow)
+
+
+_live_collision_accum = {}
+_cached_mesh_kdtree = {}
+
+
+def update_live_chamber_collision_frame(scene):
+    """Computes live animated chamber surface collision heatmap for the current timeline frame."""
+    if bpy is None or scene is None:
+        return
+    props = getattr(scene, "science_blocks_props", None)
+    if not props or not getattr(props, "show_live_chamber_collision", False):
+        return
+
+    # 1. Resolve Target Chamber Object
+    target_obj = getattr(props, "jar_chamber_obj", None)
+    if not target_obj:
+        try:
+            target_obj, _ = resolve_simulation_objects(None, props)
+        except Exception:
+            pass
+    if not target_obj:
+        target_obj = bpy.data.objects.get("Jar_Chamber") or bpy.data.objects.get("Cube")
+    if not target_obj or not hasattr(target_obj, "data") or target_obj.data is None:
+        return
+
+    mesh = target_obj.data
+    num_verts = len(mesh.vertices)
+    if num_verts == 0:
+        return
+
+    # 2. KD-Tree for Mesh Vertices in World Space
+    kd_key = (mesh.name, num_verts)
+    kd = _cached_mesh_kdtree.get(kd_key)
+    world_mat = target_obj.matrix_world if hasattr(target_obj, "matrix_world") else None
+    if kd is None and mathutils is not None and hasattr(mathutils, "kdtree"):
+        try:
+            kd = mathutils.kdtree.KDTree(num_verts)
+            for i, v in enumerate(mesh.vertices):
+                v_world = world_mat @ v.co if world_mat is not None and hasattr(world_mat, "__matmul__") else v.co
+                kd.insert(v_world, i)
+            kd.balance()
+            _cached_mesh_kdtree[kd_key] = kd
+        except Exception:
+            kd = None
+
+    # 3. Frame & Time
+    frame = scene.frame_current
+    fps = max(1.0, float(scene.render.fps) / max(1.0, float(scene.render.fps_base)))
+    t_curr = max(0.0, float(frame - getattr(scene, "frame_start", 1)) / fps)
+
+    # 4. Instantaneous Intensity Array
+    instant_accum = np.zeros(num_verts, dtype=np.float64)
+    sigma = 0.015  # 15mm Gaussian splat radius
+    r_max = 3.0 * sigma
+
+    # Source A: Check DEM simulation wall impacts in active temporal window
+    try:
+        from . import dem_solver
+    except (ImportError, ValueError):
+        try:
+            import dem_solver
+        except ImportError:
+            dem_solver = None
+
+    res = None
+    if dem_solver:
+        if hasattr(dem_solver, "get_or_restore_dem_result"):
+            res = dem_solver.get_or_restore_dem_result(scene)
+        else:
+            res = getattr(dem_solver, "last_dem_result", None)
+
+    if res is not None and getattr(res, "wall_impact_locations", None) and getattr(res, "wall_impact_times", None):
+        impact_times = res.wall_impact_times
+        impact_locs = res.wall_impact_locations
+        impact_forces = getattr(res, "wall_impact_forces", None) or [1.0] * len(impact_times)
+        max_f = max(1e-4, max(impact_forces)) if impact_forces else 1.0
+
+        dt_window = 4.0 / fps
+        tau_decay = 2.5 / fps
+
+        for idx_imp, t_imp in enumerate(impact_times):
+            age = t_curr - t_imp
+            if -0.5 / fps <= age <= dt_window:
+                time_decay = math.exp(-max(0.0, age) / tau_decay)
+                f_norm = min(1.0, max(0.1, impact_forces[idx_imp] / max_f))
+                w = f_norm * time_decay
+                pt = mathutils.Vector(impact_locs[idx_imp]) if mathutils else impact_locs[idx_imp]
+                if kd is not None:
+                    hits = kd.find_range(pt, r_max)
+                    if hits:
+                        for co, vidx, dist in hits:
+                            gw = math.exp(-0.5 * ((dist / sigma) ** 2))
+                            instant_accum[vidx] += w * gw
+                    else:
+                        co, vidx, dist = kd.find(pt) if hasattr(kd, "find") else (None, None, 0.0)
+                        if vidx is not None:
+                            instant_accum[vidx] += w
+                else:
+                    if world_mat is not None and hasattr(world_mat, "__matmul__"):
+                        vert_cos = np.array([world_mat @ v.co for v in mesh.vertices], dtype=np.float64)
+                    else:
+                        vert_cos = np.array([v.co for v in mesh.vertices], dtype=np.float64)
+                    pt_arr = np.array(pt, dtype=np.float64)
+                    dists = np.linalg.norm(vert_cos - pt_arr, axis=1)
+                    mask = dists <= r_max
+                    if np.any(mask):
+                        instant_accum[mask] += w * np.exp(-0.5 * ((dists[mask] / sigma) ** 2))
+                    else:
+                        instant_accum[int(np.argmin(dists))] += w
+
+    # Source B: Direct geometric proximity to ball objects in scene
+    ball_objs = [
+        o for o in scene.objects
+        if (o.name.startswith("DEM_Ball_") or o.name.startswith("Ball_") or o.name.startswith("DEM_Media_"))
+        and not o.name.startswith(("Reference_", "DEM_Media_Side_"))
+        and not getattr(o, "hide_viewport", False)
+    ]
+    if ball_objs:
+        for b_obj in ball_objs:
+            p_world = b_obj.matrix_world.translation if hasattr(b_obj.matrix_world, "translation") else b_obj.location
+            b_r = 0.005
+            if hasattr(b_obj, "dimensions"):
+                max_dim = max(b_obj.dimensions) if hasattr(b_obj.dimensions, "__iter__") else float(b_obj.dimensions)
+                if max_dim > 0:
+                    b_r = max_dim * 0.5
+            skin = max(0.004, b_r * 0.5)
+            r_query = b_r + skin
+            if kd is not None:
+                hits = kd.find_range(p_world, r_query)
+                for co, vidx, dist in hits:
+                    penetration = max(0.0, 1.0 - (max(0.0, dist - b_r) / skin))
+                    instant_accum[vidx] += penetration * 1.5
+
+    # 5. Temporal Decay / Afterglow Smoothing
+    decay = getattr(props, "live_chamber_decay", 0.75)
+    mesh_key = target_obj.name
+    prev_accum = _live_collision_accum.get(mesh_key)
+    if prev_accum is not None and len(prev_accum) == num_verts:
+        final_accum = np.maximum(instant_accum, prev_accum * decay)
+    else:
+        final_accum = instant_accum
+    _live_collision_accum[mesh_key] = final_accum
+
+    # 6. Colormap Evaluation
+    palette = getattr(props, "live_chamber_palette", "TURBO")
+    try:
+        from .colormaps import evaluate_scientific_colormap
+    except (ImportError, ValueError):
+        try:
+            from colormaps import evaluate_scientific_colormap
+        except ImportError:
+            import colormaps
+            evaluate_scientific_colormap = colormaps.evaluate_scientific_colormap
+
+    norm_vals = np.clip(final_accum, 0.0, 1.0)
+    colors = []
+    for i in range(num_verts):
+        nv = float(norm_vals[i])
+        if nv > 0.001:
+            rgb = evaluate_scientific_colormap(palette, nv, v_max=1.0)
+            colors.append((rgb[0], rgb[1], rgb[2], nv))
+        else:
+            colors.append((0.0, 0.0, 0.0, 0.0))
+
+    # 7. Apply to Mesh
+    _apply_colors_to_mesh(mesh, colors, attr_name="SB_Live_Collision")
+
+    # 8. Ensure Material Assignment and Polygon Material Index
+    base_opac = getattr(props, "live_chamber_base_opacity", 0.30)
+    glow = getattr(props, "live_chamber_glow", 1.8)
+    mat = get_or_create_live_chamber_collision_material(
+        palette=palette,
+        base_opacity=base_opac,
+        emission_glow=glow,
+        tint_color=getattr(props, "sci_jar_color", (0.82, 0.88, 0.94)),
+    )
+    if mat.name not in target_obj.data.materials:
+        target_obj.data.materials.append(mat)
+    slot_to_use = 0
+    for slot_idx, slot in enumerate(target_obj.material_slots):
+        if slot.material == mat:
+            slot_to_use = slot_idx
+            break
+    target_obj.active_material_index = slot_to_use
+    if hasattr(target_obj.data, "polygons"):
+        for p in target_obj.data.polygons:
+            p.material_index = slot_to_use
+
+    # 9. Mirror to Side Jar if visible
+    if getattr(props, "show_side_jar_view", False):
+        side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
+        if side_jar and hasattr(side_jar, "data") and side_jar.data:
+            side_mesh = side_jar.data
+            if len(side_mesh.vertices) == num_verts:
+                _apply_colors_to_mesh(side_mesh, colors, attr_name="SB_Live_Collision")
+                if mat.name not in side_jar.data.materials:
+                    side_jar.data.materials.append(mat)
+                side_slot = 0
+                for s_idx, slot in enumerate(side_jar.material_slots):
+                    if slot.material == mat:
+                        side_slot = s_idx
+                        break
+                side_jar.active_material_index = side_slot
+                if hasattr(side_jar.data, "polygons"):
+                    for sp in side_jar.data.polygons:
+                        sp.material_index = side_slot
+
+
+def _apply_colors_to_mesh(mesh, colors, attr_name="SB_Surface_Impact"):
     """Applies per-vertex RGBA colors to mesh color attributes or legacy vertex colors."""
-    attr_name = "SB_Surface_Impact"
     num_verts = len(mesh.vertices)
 
     # Blender 3.2+ color_attributes API
     if hasattr(mesh, "color_attributes"):
+        # Clean up stray duplicate attributes (e.g. SB_Surface_Impact.001, .002)
+        for ca_item in list(mesh.color_attributes):
+            if ca_item.name.startswith(attr_name + "."):
+                try:
+                    mesh.color_attributes.remove(ca_item)
+                except Exception:
+                    pass
+
         ca = mesh.color_attributes.get(attr_name)
         if ca is None:
             try:
@@ -7029,7 +7418,7 @@ def _apply_colors_to_mesh(mesh, colors):
                     ca.data[loop.index].color = colors[loop.vertex_index]
             if hasattr(mesh.color_attributes, "active_color"):
                 mesh.color_attributes.active_color = ca
-            elif hasattr(mesh.color_attributes, "active"):
+            if hasattr(mesh.color_attributes, "active"):
                 mesh.color_attributes.active = ca
 
     # Blender legacy vertex_colors fallback
@@ -7078,11 +7467,16 @@ def compute_and_apply_surface_impact_heatmap(
     if target_obj is None:
         props = getattr(context.scene, "science_blocks_props", None) if context and hasattr(context, "scene") else None
         target_obj = getattr(props, "jar_chamber_obj", None) if props else None
+        if not target_obj:
+            try:
+                target_obj, _ = resolve_simulation_objects(context, props)
+            except Exception:
+                pass
         if not target_obj and bpy is not None:
             target_obj = bpy.data.objects.get("Jar_Chamber")
 
     if target_obj is None or not hasattr(target_obj, "data") or target_obj.data is None:
-        return {"status": "ERROR", "message": "Target chamber mesh object not found."}
+        return {"status": "ERROR", "message": "Target chamber mesh object not found. Connect or assign your container mesh."}
 
     res = dem_result
     if res is None:
@@ -7136,10 +7530,12 @@ def compute_and_apply_surface_impact_heatmap(
     r_max = 3.0 * sigma
     accum = np.zeros(num_verts, dtype=np.float64)
 
+    world_mat = target_obj.matrix_world if hasattr(target_obj, "matrix_world") else None
     if mathutils is not None and hasattr(mathutils, "kdtree"):
         kd = mathutils.kdtree.KDTree(num_verts)
         for i, v in enumerate(mesh.vertices):
-            kd.insert(v.co, i)
+            v_world = world_mat @ v.co if world_mat is not None and hasattr(world_mat, "__matmul__") else v.co
+            kd.insert(v_world, i)
         kd.balance()
 
         for j in range(num_impacts):
@@ -7161,7 +7557,10 @@ def compute_and_apply_surface_impact_heatmap(
                     accum[idx] += w_val
     else:
         # NumPy vectorized fallback
-        vert_cos = np.array([v.co for v in mesh.vertices], dtype=np.float64)
+        if world_mat is not None and hasattr(world_mat, "__matmul__"):
+            vert_cos = np.array([world_mat @ v.co for v in mesh.vertices], dtype=np.float64)
+        else:
+            vert_cos = np.array([v.co for v in mesh.vertices], dtype=np.float64)
         imp_cos = np.array(impact_locs, dtype=np.float64)
         for j in range(num_impacts):
             dists = np.linalg.norm(vert_cos - imp_cos[j], axis=1)
@@ -7199,20 +7598,26 @@ def compute_and_apply_surface_impact_heatmap(
     # Apply to target_obj mesh
     _apply_colors_to_mesh(mesh, colors)
 
-    # Assign heatmap material
+    # Assign heatmap material and ensure polygons render it
     mat = get_or_create_chamber_heatmap_material(emission_glow=emission_glow)
     if mat.name not in target_obj.data.materials:
         target_obj.data.materials.append(mat)
+    slot_to_use = 0
     for slot_idx, slot in enumerate(target_obj.material_slots):
         if slot.material == mat:
-            target_obj.active_material_index = slot_idx
+            slot_to_use = slot_idx
             break
+    target_obj.active_material_index = slot_to_use
+    if hasattr(target_obj.data, "polygons"):
+        for p in target_obj.data.polygons:
+            p.material_index = slot_to_use
 
     # Mirror to side jar if requested
     if apply_to_side_jar and bpy is not None:
         side_jar = bpy.data.objects.get("Jar_Chamber_SideView")
         if side_jar and hasattr(side_jar, "data") and side_jar.data:
             side_mesh = side_jar.data
+            side_world_mat = side_jar.matrix_world if hasattr(side_jar, "matrix_world") else None
             # If side_mesh has same vertex count, copy colors directly
             if len(side_mesh.vertices) == num_verts:
                 _apply_colors_to_mesh(side_mesh, colors)
@@ -7220,7 +7625,8 @@ def compute_and_apply_surface_impact_heatmap(
                 # Project onto side_mesh vertices
                 side_kd = mathutils.kdtree.KDTree(len(side_mesh.vertices))
                 for si, sv in enumerate(side_mesh.vertices):
-                    side_kd.insert(sv.co, si)
+                    sv_world = side_world_mat @ sv.co if side_world_mat is not None and hasattr(side_world_mat, "__matmul__") else sv.co
+                    side_kd.insert(sv_world, si)
                 side_kd.balance()
                 side_accum = np.zeros(len(side_mesh.vertices), dtype=np.float64)
                 for j in range(num_impacts):
@@ -7244,10 +7650,15 @@ def compute_and_apply_surface_impact_heatmap(
 
             if mat.name not in side_jar.data.materials:
                 side_jar.data.materials.append(mat)
+            side_slot_idx = 0
             for slot_idx, slot in enumerate(side_jar.material_slots):
                 if slot.material == mat:
-                    side_jar.active_material_index = slot_idx
+                    side_slot_idx = slot_idx
                     break
+            side_jar.active_material_index = side_slot_idx
+            if hasattr(side_jar.data, "polygons"):
+                for sp in side_jar.data.polygons:
+                    sp.material_index = side_slot_idx
 
     # Configure 3D viewport shading for instant visibility
     _enable_viewport_color_attribute(context, "SB_Surface_Impact")
@@ -7263,35 +7674,63 @@ def compute_and_apply_surface_impact_heatmap(
 
 def clear_surface_impact_heatmap(context, target_obj=None):
     """Clears the surface impact heatmap color attributes and restores default chamber material."""
-    if target_obj is None:
-        props = getattr(context.scene, "science_blocks_props", None) if context and hasattr(context, "scene") else None
-        target_obj = getattr(props, "jar_chamber_obj", None) if props else None
-        if not target_obj and bpy is not None:
-            target_obj = bpy.data.objects.get("Jar_Chamber")
-
-    attr_name = "SB_Surface_Impact"
     props = getattr(context.scene, "science_blocks_props", None) if context and hasattr(context, "scene") else None
+    if props:
+        props.show_live_chamber_collision = False
+
+    global _live_collision_accum
+    if isinstance(_live_collision_accum, dict):
+        _live_collision_accum.clear()
+
+    if target_obj is None:
+        target_obj = getattr(props, "jar_chamber_obj", None) if props else None
+        if not target_obj:
+            try:
+                target_obj, _ = resolve_simulation_objects(context, props)
+            except Exception:
+                pass
+        if not target_obj and bpy is not None:
+            target_obj = bpy.data.objects.get("Jar_Chamber") or bpy.data.objects.get("Cube")
+
+    attr_names = ["SB_Surface_Impact", "SB_Live_Collision"]
     orig_mat = get_or_create_sci_jar_material(props) if props else None
 
     objs_to_clear = [target_obj] if target_obj else []
     side_jar = bpy.data.objects.get("Jar_Chamber_SideView") if bpy is not None else None
-    if side_jar:
+    if side_jar and side_jar not in objs_to_clear:
         objs_to_clear.append(side_jar)
 
     for obj in objs_to_clear:
         if not obj or not hasattr(obj, "data") or not obj.data:
             continue
         mesh = obj.data
-        if hasattr(mesh, "color_attributes"):
-            ca = mesh.color_attributes.get(attr_name)
-            if ca:
-                mesh.color_attributes.remove(ca)
-        if hasattr(mesh, "vertex_colors"):
-            vc = mesh.vertex_colors.get(attr_name)
-            if vc:
-                mesh.vertex_colors.remove(vc)
-        if orig_mat:
-            if orig_mat.name not in obj.data.materials:
+        for attr_name in attr_names:
+            if hasattr(mesh, "color_attributes"):
+                ca = mesh.color_attributes.get(attr_name)
+                if ca:
+                    mesh.color_attributes.remove(ca)
+            if hasattr(mesh, "vertex_colors"):
+                vc = mesh.vertex_colors.get(attr_name)
+                if vc:
+                    mesh.vertex_colors.remove(vc)
+        # Remove or replace live collision & heatmap materials if present
+        if hasattr(obj.data, "materials"):
+            for m_idx in range(len(obj.data.materials) - 1, -1, -1):
+                m = obj.data.materials[m_idx]
+                if m and m.name in ("SB_Chamber_Heatmap_Material", "SB_Live_Chamber_Collision_Material"):
+                    if orig_mat and orig_mat.name not in [mat.name for mat in obj.data.materials if mat]:
+                        obj.data.materials[m_idx] = orig_mat
+                    elif hasattr(obj.data.materials, "pop"):
+                        try:
+                            obj.data.materials.pop(index=m_idx)
+                        except Exception:
+                            try:
+                                obj.data.materials.pop(m_idx)
+                            except Exception:
+                                pass
+        if orig_mat and hasattr(obj.data, "materials"):
+            mat_names = [mat.name for mat in obj.data.materials if mat]
+            if orig_mat.name not in mat_names:
                 obj.data.materials.append(orig_mat)
             for slot_idx, slot in enumerate(obj.material_slots):
                 if slot.material == orig_mat:
@@ -7375,6 +7814,114 @@ class SCIENCE_BLOCKS_OT_clear_surface_impact_map(bpy.types.Operator):
     def execute(self, context):
         clear_surface_impact_heatmap(context)
         self.report({"INFO"}, "Science Blocks: Chamber surface heatmap cleared.")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_apply_live_chamber_visualizer(bpy.types.Operator):
+    """Activates the real-time animated 3D collision heatmap on the chamber surface."""
+    bl_idname = "science_blocks.apply_live_chamber_visualizer"
+    bl_label = "Live 3D Collision Heatmap"
+    bl_description = "Displays live animated collisions on the chamber surface (0.3 base see-through opacity, 1.0 full opacity glowing impacts)"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props:
+            props.show_live_chamber_collision = True
+
+        target_obj = getattr(props, "jar_chamber_obj", None) if props else None
+        if not target_obj:
+            try:
+                target_obj, _ = resolve_simulation_objects(context, props)
+            except Exception:
+                pass
+        if not target_obj and bpy is not None:
+            target_obj = bpy.data.objects.get("Jar_Chamber") or bpy.data.objects.get("Cube")
+
+        if not target_obj or not hasattr(target_obj, "data") or target_obj.data is None:
+            self.report({"WARNING"}, "No chamber or container mesh found. Select or connect your chamber model.")
+            return {"CANCELLED"}
+
+        base_opac = getattr(props, "live_chamber_base_opacity", 0.30) if props else 0.30
+        pal = getattr(props, "live_chamber_palette", "TURBO") if props else "TURBO"
+        glow = getattr(props, "live_chamber_glow", 1.8) if props else 1.8
+        tint = getattr(props, "sci_jar_color", (0.82, 0.88, 0.94)) if props else (0.82, 0.88, 0.94)
+
+        mat = get_or_create_live_chamber_collision_material(
+            palette=pal,
+            base_opacity=base_opac,
+            emission_glow=glow,
+            tint_color=tint,
+        )
+
+        if mat.name not in target_obj.data.materials:
+            target_obj.data.materials.append(mat)
+        slot_to_use = 0
+        for slot_idx, slot in enumerate(target_obj.material_slots):
+            if slot.material == mat:
+                slot_to_use = slot_idx
+                break
+        target_obj.active_material_index = slot_to_use
+        if hasattr(target_obj.data, "polygons"):
+            for p in target_obj.data.polygons:
+                p.material_index = slot_to_use
+
+        # Switch Viewport to Material Preview if currently in Solid mode
+        try:
+            if context and hasattr(context, "screen") and context.screen:
+                for area in context.screen.areas:
+                    if area.type == "VIEW_3D":
+                        for space in area.spaces:
+                            if space.type == "VIEW_3D":
+                                if hasattr(space, "shading") and space.shading.type == "SOLID":
+                                    space.shading.type = "MATERIAL"
+        except Exception:
+            pass
+
+        _enable_viewport_color_attribute(context, "SB_Live_Collision")
+        update_live_chamber_collision_frame(context.scene)
+
+        self.report({"INFO"}, f"Science Blocks: Live 3D collision heatmap active on '{target_obj.name}' (0.3 base opacity, 1.0 impact opacity). Press Play (Spacebar).")
+        return {"FINISHED"}
+
+
+class SCIENCE_BLOCKS_OT_clear_live_chamber_visualizer(bpy.types.Operator):
+    """Deactivates the live 3D chamber collision visualizer and restores standard appearance."""
+    bl_idname = "science_blocks.clear_live_chamber_visualizer"
+    bl_label = "Clear Live Collision Visualizer"
+    bl_description = "Clears the live collision heatmap and resets the chamber to standard appearance"
+
+    def execute(self, context):
+        props = getattr(context.scene, "science_blocks_props", None)
+        if props:
+            props.show_live_chamber_collision = False
+
+        global _live_collision_accum
+        if isinstance(_live_collision_accum, dict):
+            _live_collision_accum.clear()
+
+        clear_surface_impact_heatmap(context)
+
+        target_obj = getattr(props, "jar_chamber_obj", None) if props else None
+        if not target_obj:
+            try:
+                target_obj, _ = resolve_simulation_objects(context, props)
+            except Exception:
+                pass
+        if not target_obj and bpy is not None:
+            target_obj = bpy.data.objects.get("Jar_Chamber") or bpy.data.objects.get("Cube")
+
+        if target_obj and hasattr(target_obj, "data") and target_obj.data:
+            mesh = target_obj.data
+            if hasattr(mesh, "color_attributes"):
+                ca = mesh.color_attributes.get("SB_Live_Collision")
+                if ca:
+                    mesh.color_attributes.remove(ca)
+            if hasattr(mesh, "vertex_colors"):
+                vc = mesh.vertex_colors.get("SB_Live_Collision")
+                if vc:
+                    mesh.vertex_colors.remove(vc)
+
+        self.report({"INFO"}, "Science Blocks: Live 3D chamber collision visualizer cleared.")
         return {"FINISHED"}
 
 

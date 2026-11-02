@@ -126,6 +126,21 @@ def update_jar_finish_preset(self, context):
     update_scientific_styling(self, context)
 
 
+def update_live_chamber_collision_settings(self, context):
+    """Callback triggered whenever live chamber collision properties (opacity, glow, palette) are adjusted."""
+    try:
+        from . import operators
+        if hasattr(operators, "sync_live_chamber_material_settings"):
+            operators.sync_live_chamber_material_settings(context)
+    except Exception:
+        try:
+            import operators
+            if hasattr(operators, "sync_live_chamber_material_settings"):
+                operators.sync_live_chamber_material_settings(context)
+        except Exception:
+            pass
+
+
 def update_sphere_finish_preset(self, context):
     """Callback when sphere finish preset is changed."""
     preset = getattr(self, "sci_sphere_preset", "STEEL")
@@ -446,6 +461,50 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
         update=update_scientific_styling,
     )
 
+    # Live Chamber Surface Collision Visualization
+    show_live_chamber_collision: BoolProperty(
+        name="Live Chamber Collision Heatmap",
+        description="Display live animated 3D collision heatmap on the chamber surface during playback and timeline scrubbing",
+        default=False,
+        update=update_live_chamber_collision_settings,
+    )
+    live_chamber_base_opacity: FloatProperty(
+        name="Base Wall Opacity",
+        description="Chamber wall opacity where no collisions are occurring (0.3 allows clear viewing of internal charge)",
+        default=0.30,
+        min=0.0,
+        max=1.0,
+        update=update_live_chamber_collision_settings,
+    )
+    live_chamber_palette: EnumProperty(
+        name="Collision Palette",
+        description="Scientific colormap palette for the live chamber collision hotspots",
+        items=[
+            ("TURBO", "Turbo (Perceptual Rainbow)", "Google AI perceptual rainbow with high readability"),
+            ("HEAT_FLAME", "Heat Flame (Thermal)", "Thermal infrared spectrum: black to orange, yellow, and white"),
+            ("VIRIDIS", "Viridis (Journal Standard)", "Perceptually uniform, colorblind-safe publication standard"),
+            ("PLASMA", "Plasma (High Contrast)", "High-contrast energetic purple to pink, orange, and yellow"),
+            ("HOT_COLD", "Hot-Cold (Diverging)", "Diverging blue to light neutral to blazing crimson"),
+        ],
+        default="TURBO",
+        update=update_live_chamber_collision_settings,
+    )
+    live_chamber_glow: FloatProperty(
+        name="Collision Glow Intensity",
+        description="Emission brightness of the collision hot spots on the chamber surface",
+        default=1.8,
+        min=0.0,
+        max=5.0,
+        update=update_live_chamber_collision_settings,
+    )
+    live_chamber_decay: FloatProperty(
+        name="Decay Afterglow",
+        description="Thermal / impact phosphorescence decay factor per frame (0.0 = instant flash, 0.75 = smooth trailing afterglow)",
+        default=0.75,
+        min=0.0,
+        max=0.98,
+    )
+
     # Sphere / Grinding Media Material Styling
     sci_sphere_preset: EnumProperty(
         name="Sphere Finish",
@@ -535,6 +594,8 @@ class ScienceBlocksProperties(bpy.types.PropertyGroup):
             ("VIRIDIS", "Viridis (Nature / Science Standard)", "Perceptually uniform, colorblind-safe standard for journal papers"),
             ("PLASMA", "Plasma (High-Energy Heatmap)", "High-contrast energetic colormap (purple to yellow)"),
             ("TURBO", "Turbo (Perceptual Rainbow)", "Smooth Google AI perceptual spectrum"),
+            ("HEAT_FLAME", "Heat Flame (Thermal)", "Thermal infrared spectrum: black to orange, yellow, and white"),
+            ("HOT_COLD", "Hot-Cold (Diverging)", "Diverging blue to light neutral to blazing crimson"),
             ("COOLWARM", "Coolwarm (Diverging CFD/DEM)", "Diverging blue to red physics colormap"),
             ("RAINBOW", "Classic Rainbow (Velocity)", "Traditional velocity rainbow map"),
             ("ENERGY", "Impact Shock Energy", "Highlight high kinetic collision shocks"),

@@ -1300,6 +1300,15 @@ class ScienceBlocksChamberHeatmapNode(bpy.types.Node):
         update=_on_heatmap_update,
     )
 
+    base_opacity: FloatProperty(
+        name="Base Opacity",
+        description="Chamber wall opacity where no collisions are occurring (0.3 allows clear viewing of internal charge)",
+        default=0.30,
+        min=0.0,
+        max=1.0,
+        update=_on_heatmap_update,
+    )
+
     def init(self, context):
         self.inputs.new("ScienceBlocksObjectSocket", "Chamber Mesh")
         self.inputs.new("ScienceBlocksSimSocket", "DEM Simulation")
@@ -1343,6 +1352,15 @@ class ScienceBlocksChamberHeatmapNode(bpy.types.Node):
             pass
 
         col.separator(factor=0.3)
+        box_live = col.box()
+        box_live.label(text="Live 3D Collision Animation:", icon="TIME")
+        row_live = box_live.row(align=True)
+        row_live.scale_y = 1.3
+        row_live.operator("science_blocks.apply_live_chamber_visualizer", text="Live 3D Collision Heatmap", icon="PLAY")
+        row_live.operator("science_blocks.clear_live_chamber_visualizer", text="Clear", icon="TRASH")
+        box_live.prop(self, "base_opacity", text="Base Opacity (0.3)", slider=True)
+
+        col.separator(factor=0.2)
         row_b = col.row(align=True)
         row_b.scale_y = 1.25
         row_b.operator("science_blocks.bake_surface_impact_map", text="Generate Heatmap", icon="COLOR")
@@ -2105,6 +2123,12 @@ def on_frame_change_post(scene):
         except (ImportError, ValueError):
             from operators import sync_side_jar_view
         sync_side_jar_view(scene)
+    if props and getattr(props, "show_live_chamber_collision", False):
+        try:
+            from .operators import update_live_chamber_collision_frame
+        except (ImportError, ValueError):
+            from operators import update_live_chamber_collision_frame
+        update_live_chamber_collision_frame(scene)
 
 
 # ===========================================================================

@@ -165,8 +165,6 @@ def draw_step_1_python_env(layout, context, props):
 
         col.separator(factor=0.3)
 
-    col.separator(factor=0.4)
-
     # Todo: Implement Google sign in code Google Sign-In & Authentication Hub (ONLY shown when Google Colab is selected!)
     # from . import google_auth
     # google_auth.draw_google_auth_card(col, context)
@@ -276,6 +274,24 @@ def draw_step_2_kinematics(layout, context, props):
         c_s.prop(props, "side_jar_spin", text="Spin Side Chamber")
         c_s.prop(props, "side_jar_display_mode", text="Display")
         c_s.prop(props, "side_jar_show_arrow", text="Show Gravity Arrow")
+
+    col.separator(factor=0.3)
+
+    # Live 3D Chamber Collision Visualizer
+    box_live = col.box()
+    box_live.label(text="Live 3D Chamber Collision Visualizer:", icon="TIME")
+    r_lbtn = box_live.row(align=True)
+    r_lbtn.scale_y = 1.25
+    r_lbtn.operator("science_blocks.apply_live_chamber_visualizer", text="Live 3D Collision Heatmap", icon="PLAY")
+    r_lbtn.operator("science_blocks.clear_live_chamber_visualizer", text="Clear", icon="TRASH")
+
+    c_lprops = box_live.column(align=True)
+    r_lopac = c_lprops.row(align=True)
+    r_lopac.prop(props, "live_chamber_base_opacity", text="Base Opacity (0.3)", slider=True)
+    r_lopac.prop(props, "live_chamber_glow", text="Glow", slider=True)
+    r_lpal = c_lprops.row(align=True)
+    r_lpal.prop(props, "live_chamber_palette", text="Palette")
+    r_lpal.prop(props, "live_chamber_decay", text="Decay", slider=True)
 
     col.separator(factor=0.4)
 
@@ -405,6 +421,17 @@ def draw_scientific_styling_panel(layout, context, props):
         op_es.color_preset = "SLATE"
         op_ea = r_qedge.operator("science_blocks.set_chamber_edge_color", text="Accent", icon="COLOR")
         op_ea.color_preset = "ACCENT"
+
+    c_obj.separator(factor=0.25)
+    box_lstyle = c_obj.box()
+    box_lstyle.label(text="Live 3D Chamber Collision View:", icon="TIME")
+    r_lst = box_lstyle.row(align=True)
+    r_lst.scale_y = 1.15
+    r_lst.operator("science_blocks.apply_live_chamber_visualizer", text="Live 3D Collision Heatmap", icon="PLAY")
+    r_lst.operator("science_blocks.clear_live_chamber_visualizer", text="Clear", icon="TRASH")
+    r_lso = box_lstyle.row(align=True)
+    r_lso.prop(props, "live_chamber_base_opacity", text="Base Opacity", slider=True)
+    r_lso.prop(props, "live_chamber_glow", text="Glow", slider=True)
 
     c_obj.separator(factor=0.25)
     # Sun Wheel Carrier Plate
